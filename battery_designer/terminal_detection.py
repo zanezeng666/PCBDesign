@@ -333,7 +333,7 @@ def _find_pad_candidates(image: np.ndarray, width_mm: float, height_mm: float) -
     adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 71, 10)
     combined = cv2.bitwise_or(metal, adaptive)
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
     contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for contour in contours:
@@ -361,10 +361,10 @@ def _find_pad_candidates(image: np.ndarray, width_mm: float, height_mm: float) -
         #   circular / hole:  circularity >= 0.55, fill >= 0.45, aspect < 2.5
         #   thin strip:       fill >= 0.50, aspect >= 2.5, circularity < 0.60
         shape_ok = (
-            (fill_ratio >= 0.60 and circularity < 0.85)
-            or (fill_ratio >= 0.70 and circularity >= 0.40)
-            or (circularity >= 0.55 and fill_ratio >= 0.45 and aspect < 2.5)
-            or (fill_ratio >= 0.50 and aspect >= 2.5 and circularity < 0.60)
+            (fill_ratio >= 0.55 and circularity < 0.88)
+            or (fill_ratio >= 0.65 and circularity >= 0.35)
+            or (circularity >= 0.50 and fill_ratio >= 0.40 and aspect < 3.0)
+            or (fill_ratio >= 0.45 and aspect >= 2.5 and circularity < 0.65)
         )
 
         center_x, center_y = x + w / 2, y + h / 2
@@ -375,7 +375,7 @@ def _find_pad_candidates(image: np.ndarray, width_mm: float, height_mm: float) -
         component_width_mm = w / width * width_mm
         component_height_mm = h / height * height_mm
 
-        min_pad_mm = 1.5
+        min_pad_mm = 1.0
         if component_width_mm < min_pad_mm and component_height_mm < min_pad_mm:
             continue
 
