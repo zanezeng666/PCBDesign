@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>电池保护板参数化设计</title>
+<style>
+:root{font-family:Inter,"Microsoft YaHei",sans-serif;color:#172033;background:#eef2f0}*{box-sizing:border-box}body{margin:0}main{max-width:1120px;margin:auto;padding:40px 24px 80px}header{padding:28px 4px}.eyebrow{letter-spacing:.18em;color:#18745a;font-size:12px;font-weight:700}h1{font-size:clamp(32px,5vw,62px);line-height:1;margin:10px 0}header>p:last-child{max-width:720px;color:#586476}.panel{background:#fff;border:1px solid #d9e0dc;border-radius:18px;padding:24px;margin:18px 0;box-shadow:0 12px 35px #1c493514}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}.grid.three{grid-template-columns:repeat(3,1fr)}label{display:flex;flex-direction:column;gap:6px;color:#50605a;font-size:13px}input,select{font:inherit;padding:10px 12px;border:1px solid #cbd5d0;border-radius:9px;background:#fbfdfc;color:#172033}button{margin-top:16px;border:0;border-radius:10px;padding:11px 16px;background:#18745a;color:#fff;font-weight:700;cursor:pointer}button.secondary{background:#dcebe6;color:#145441}.tiny{padding:3px 7px;margin:0 0 0 8px;background:#e7ece9;color:#7f1d1d;font-size:11px}.status{color:#18745a}.canvas-wrap{overflow:auto;margin-top:16px;background:#172033;border-radius:12px;padding:12px}canvas{max-width:100%;height:auto;cursor:crosshair}.toolbar{display:flex;gap:10px;align-items:end;flex-wrap:wrap}.toolbar label{min-width:130px}.toolbar label:has(input[type=checkbox]){flex-direction:row;align-items:center;margin-top:12px}ol{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;color:#44514c}pre{white-space:pre-wrap;background:#111827;color:#d1fae5;padding:16px;border-radius:12px;max-height:360px;overflow:auto}.auto-detect{display:flex;justify-content:space-between;gap:20px;align-items:center;padding:14px 16px;margin:12px 0;border:1px solid #cfe2da;border-radius:12px;background:#f4faf7}.auto-detect h3{margin:0 0 4px;font-size:16px}.auto-detect p{margin:0;color:#627069;font-size:13px}.auto-detect button{margin-top:0}.candidate-list{list-style:none;padding:0;display:grid;grid-template-columns:1fr;gap:7px}.candidate-list li{padding:9px 12px;border-left:4px solid #ff5fa2;border-radius:7px;background:#fff3f8;color:#553447}.candidate-label{display:inline-block;min-width:42px;font-weight:800;color:#b51662}.candidate-detail{color:#6b5260;font-size:12px}.tiny.accept{background:#d8f3e8;color:#145441}.tiny:disabled{opacity:.45;cursor:not-allowed}.api-bar{display:flex;align-items:center;gap:8px;padding:8px 14px;background:#fffbe6;border:1px solid #ffd700;border-radius:9px;margin-bottom:14px;font-size:13px}.api-bar input{flex:1;min-width:200px}@media(max-width:760px){.grid,.grid.three{grid-template-columns:1fr}ol{grid-template-columns:1fr}.auto-detect{align-items:flex-start;flex-direction:column}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<p class="eyebrow">LOCAL · KICAD 9 · STANDALONE</p>
+<h1>电池保护板参数化设计</h1>
+<p>正反面照片统一标定，从触点语义到候选样板输出。首次 IC 方案不会被误标为量产设计。</p>
+</header>
+<div class="api-bar">
+<label>API 地址</label>
+<input id="apiBase" value="http://127.0.0.1:8000" placeholder="http://127.0.0.1:8000">
+<span id="apiStatus" style="color:#888">检测中...</span>
+<button id="pingApi" class="secondary" style="margin-top:0;padding:6px 12px;font-size:12px">连接测试</button>
+</div>
+<section class="panel">
+<h2>1. 正反面照片标定</h2>
+<div class="grid three">
+<label>正面照片<input id="frontPhoto" type="file" accept="image/*"></label>
+<label>反面照片（可选）<input id="backPhoto" type="file" accept="image/*"></label>
+<label>标定方式<select id="calibrationMode"><option value="known_size">已知板框尺寸</option><option value="aruco">四个 ArUco 标记</option></select></label>
+<label>板宽 / mm<input id="boardWidth" type="number" value="41" min="2" step="0.1"></label>
+<label>板高 / mm<input id="boardHeight" type="number" value="7" min="2" step="0.1"></label>
+<label>ArUco 边长 / mm<input id="markerSize" type="number" value="10" min="2" step="0.1"></label>
+</div>
+<p class="status">填写 PCB 的真实长宽后，系统会识别四个板角并进行透视校正，把手机斜拍形成的梯形恢复到真实毫米坐标。无标尺照片仍需人工确认板框；要求 ≤0.2 mm 的任务应使用 ArUco 重新拍摄。</p>
+<div class="toolbar">
+<button id="calibrateFront">标定正面</button>
+<button id="calibrateBack" class="secondary">标定反面</button>
+<label>当前标注面<select id="activeSide"><option value="front">正面</option><option value="back">反面</option></select></label>
+<label>反面映射<select id="backTransform"><option value="mirror_x">左右翻转</option><option value="mirror_y">上下翻转</option><option value="rotate_180">旋转 180°</option><option value="none">不翻转</option></select></label>
+</div>
+<p id="calibrationStatus" class="status"></p>
+<div class="toolbar">
+<label><input id="editOutline" type="checkbox">在正面拖动轮廓顶点</label>
+<label><input id="outlineConfirmed" type="checkbox">我已确认双面轮廓、映射和真实尺寸</label>
+<label><input id="showAnnotation" type="checkbox">显示焊盘检测标注</label>
+</div>
+<div class="canvas-wrap"><canvas id="boardCanvas"></canvas></div>
+</section>
+<section class="panel">
+<h2>2. 电气参数</h2>
+<div class="grid three">
+<label>项目名称<input id="name" value="JLH-1S-4108"></label>
+<label>保护 IC 型号<input id="ic" value="HY2113-MB1B" placeholder="完整料号或简称"></label>
+<label>电池数量<input id="count" type="number" min="1" max="5" value="1"></label>
+<label>连接方式<select id="connection"><option value="series">串联</option><option value="parallel">并联</option></select></label>
+<label>最低/标称/最高 V<input id="voltage" value="3.0,3.7,4.2"></label>
+<label>持续/峰值 A（示例值，需确认）<input id="current" value="2,5"></label>
+<label>过流动作目标 A<input id="overcurrentTrip" type="number" value="8" step="0.1"></label>
+<label>峰值时间 s<input id="peakDuration" type="number" value="1"></label>
+<label>环境温度 °C<input id="ambient" type="number" value="25"></label>
+<label>允许温升 °C<input id="tempRise" type="number" value="40"></label>
+</div>
+</section>
+<section class="panel">
+<h2>3. 点击标注触点</h2>
+<div class="auto-detect">
+<div>
+<h3>丝印与焊盘预识别</h3>
+<p>先识别 B+、B-、P+、P-、C+、C-、NTC、N、TH、ID 文字，再匹配离文字最近的银白色焊盘区域或孔位。候选框表示完整区域，确认后才会加入设计。</p>
+</div>
+<div class="toolbar">
+<button id="detectTerminals" class="secondary">自动识别当前面</button>
+<button id="acceptAllCandidates" class="secondary">采纳全部候选</button>
+</div>
+</div>
+<ul id="candidateList" class="candidate-list"></ul>
+<div class="toolbar">
+<label>角色<select id="role"><option value="battery">电池</option><option value="charge">充电</option><option value="discharge">放电</option><option value="temperature">温度 TH</option><option value="identification">识别 ID</option><option value="auxiliary">其他辅助</option></select></label>
+<label>极性<select id="polarity"><option value="positive">正极</option><option value="negative">负极</option><option value="">无极性/信号</option></select></label>
+<label>焊盘直径/mm<input id="padSize" type="number" value="2" step="0.1"></label>
+<button id="mergeRole" class="secondary">合并角色到最近添加的同面触点</button>
+</div>
+<p>先选择板面再点击照片。反面坐标会映射到正面统一坐标；同一触点合并"充电+放电"角色即可表达共口。</p>
+<ol id="terminalList"></ol>
+<button id="create">保存项目并生成机械预览</button>
+<pre id="result"></pre>
+</section>
+</main>
+<script>
+var API_BASE = 'http://127.0.0.1:8000';
+try { var p = new URLSearchParams(location.search); if (p.get('api')) API_BASE = p.get('api'); } catch(e) {}
+var state = {outline: [], terminals: [], candidates: [], calibrations: {front: null, back: null}, images: {front: null, back: null}, annotatedImages: {front: null, back: null}, widthMm: 0, heightMm: 0, alignmentError: null};
+var $ = function(id) { return document.getElementById(id); };
+var canvas = $('boardCanvas');
+var ctx = canvas.getContext('2d');
+
+$('apiBase').value = API_BASE;
+$('pingApi').onclick = pingApi;
+$('apiBase').onchange = function() { API_BASE = this.value; pingApi(); };
+
+async function pingApi() {
+  $('apiStatus').textContent = '检测中...';
+  $('apiStatus').style.color = '#888';
+  try {
+    var r = await fetch(API_BASE + '/api/health');
+    var d = await r.json();
+    if (d.status === 'ok') { $('apiStatus').textContent = '已连接'; $('apiStatus').style.color = '#16a34a'; }
+    else { $('apiStatus').textContent = '异常'; $('apiStatus').style.color = '#ea580c'; }
+  } catch(e) { $('apiStatus').textContent = '无法连接'; $('apiStatus').style.color = '#dc2626'; }
+}
+
+$('calibrateFront').onclick = function() { calibrateSide('front'); };
+$('calibrateBack').onclick = function() { calibrateSide('back'); };
+$('activeSide').onchange = draw;
+$('showAnnotation').onchange = draw;
+$('backTransform').onchange = function() { updateAlignment(); draw(); };
+$('detectTerminals').onclick = detectCurrentSide;
+$('acceptAllCandidates').onclick = function() {
+  var side = $('activeSide').value;
+  state.candidates.filter(function(c) { return c.side === side && c.region_resolved; }).forEach(acceptCandidate);
+  state.candidates = state.candidates.filter(function(c) { return c.side !== side || !c.region_resolved; });
+  draw(); list(); listCandidates();
+};
+$('role').onchange = function() {
+  if (['temperature', 'identification', 'auxiliary'].includes($('role').value)) $('polarity').value = '';
+};
+
+async function calibrateSide(side) {
+  var file = $(side === 'front' ? 'frontPhoto' : 'backPhoto').files[0];
+  if (!file) return show('请选择' + (side === 'front' ? '正面' : '反面') + '照片');
+  var body = new FormData();
+  body.append('file', file);
+  var knownSize = $('calibrationMode').value === 'known_size';
+  var endpoint = '/api/vision/calibrate';
+  if (knownSize) {
+    endpoint = '/api/vision/calibrate-known-size';
+    body.append('width_mm', $('boardWidth').value);
+    body.append('height_mm', $('boardHeight').value);
+  } else body.append('marker_size_mm', $('markerSize').value);
+  show('正在标定' + (side === 'front' ? '正面' : '反面') + '…');
+  try {
+    var result = await api(endpoint, {method: 'POST', body: body});
+    state.calibrations[side] = result;
+    state.candidates = state.candidates.filter(function(c) { return c.side !== side; });
+    if (side === 'front') { state.outline = result.outline; state.widthMm = result.width_mm; state.heightMm = result.height_mm; }
+    var image = new Image();
+    image.onload = function() { state.images[side] = image; if ($('activeSide').value === side) draw(); updateAlignment(); };
+    image.src = 'data:image/png;base64,' + result.rectified_png_base64;
+    $('activeSide').value = side;
+    var perspective = result.perspective_method === 'detected_board_corners' ? '四角透视已校正' : result.perspective_method ? '使用旋转矩形回退' : '';
+    var warning = result.method === 'known_size_auto' ? '；自动板框必须人工确认' : '';
+    show((side === 'front' ? '正面' : '反面') + '标定完成：' + result.width_mm + ' × ' + result.height_mm + ' mm，置信度 ' + (result.confidence * 100).toFixed(1) + '%' + (perspective ? '，' + perspective : '') + warning);
+  } catch (error) { show(error.message); }
+}
+
+async function detectCurrentSide() {
+  var side = $('activeSide').value, calibration = state.calibrations[side];
+  if (!calibration) return show('请先标定' + (side === 'front' ? '正面' : '反面') + '照片');
+  var body = new FormData();
+  body.append('calibration_id', calibration.calibration_id);
+  body.append('side', side);
+  show('正在识别' + (side === 'front' ? '正面' : '反面') + '丝印与焊盘，首次加载 OCR 可能需要十几秒…');
+  try {
+    var result = await api('/api/vision/detect-terminals', {method: 'POST', body: body});
+    state.candidates = state.candidates.filter(function(c) { return c.side !== side; }).concat(result.candidates);
+    if (result.annotated_png_base64) {
+      var annotated = new Image();
+      annotated.onload = function() { state.annotatedImages[side] = annotated; draw(); };
+      annotated.src = 'data:image/png;base64,' + result.annotated_png_base64;
+    }
+    draw(); listCandidates();
+    show('识别完成：找到 ' + result.candidate_count + ' 个待确认候选（共检测到 ' + (result.all_pad_count || '?') + ' 个焊盘区域，OCR 匹配 ' + (result.matched_pad_count || '?') + ' 个）' + (result.ocr_available ? '' : '；当前未安装 OCR 组件'));
+  } catch (error) { show(error.message); }
+}
+
+function acceptCandidate(candidate) {
+  if (!candidate.region_resolved || !candidate.visible_region) return show(candidate.label + ' 尚未匹配到焊盘区域或孔位，不能采纳');
+  var baseId = candidate.id || 'PAD';
+  var id = baseId, suffix = 2;
+  while (state.terminals.some(function(t) { return t.id === id; })) id = baseId + '_' + (suffix++);
+  state.terminals.push({id: id, position: visibleToCanonical(candidate.visible_region.center, candidate.side), roles: candidate.roles, polarity: candidate.polarity, side: candidate.side, shape: candidate.shape, width_mm: candidate.width_mm, height_mm: candidate.height_mm, source_region: candidate.visible_region});
+}
+
+function listCandidates() {
+  $('candidateList').innerHTML = state.candidates.map(function(candidate, index) {
+    var region = candidate.visible_region;
+    var areaText = region ? (region.type === 'hole' ? '孔位' : '焊盘') + '区域 ' + region.bbox.width_mm + ' × ' + region.bbox.height_mm + ' mm，距离文字 ' + candidate.match_distance_mm + ' mm' : '未匹配到银白色区域或孔位';
+    return '<li><span class="candidate-label">' + candidate.label + '</span> ' + (candidate.side === 'front' ? '正面' : '反面') + ' · ' + Math.round(candidate.confidence * 100) + '%<br><span class="candidate-detail">' + areaText + '</span> <button class="tiny accept" data-accept="' + index + '" ' + (region ? '' : 'disabled') + '>确认区域并采纳</button><button class="tiny" data-dismiss="' + index + '">忽略</button></li>';
+  }).join('');
+  document.querySelectorAll('[data-accept]').forEach(function(btn) { btn.onclick = function() { var i = +btn.dataset.accept; acceptCandidate(state.candidates[i]); state.candidates.splice(i, 1); draw(); list(); listCandidates(); }; });
+  document.querySelectorAll('[data-dismiss]').forEach(function(btn) { btn.onclick = function() { state.candidates.splice(+btn.dataset.dismiss, 1); draw(); listCandidates(); }; });
+}
+
+canvas.onclick = function(event) {
+  var side = $('activeSide').value;
+  if (!state.images[side] || $('editOutline').checked) return;
+  var size = +$('padSize').value;
+  var polarity = $('polarity').value || null;
+  var position = visibleToCanonical(eventPoint(event), side);
+  state.terminals.push({id: 'T' + (state.terminals.length + 1), position: position, roles: [$('role').value], polarity: polarity, side: side, shape: 'circle', width_mm: size, height_mm: size});
+  draw(); list();
+};
+
+$('mergeRole').onclick = function() {
+  var side = $('activeSide').value, role = $('role').value, polarity = $('polarity').value || null;
+  var candidates = state.terminals.filter(function(t) { return t.side === side && t.polarity === polarity; });
+  if (!candidates.length) return show('当前板面没有相同极性的触点可合并');
+  var terminal = candidates[candidates.length - 1];
+  if (!terminal.roles.includes(role)) terminal.roles.push(role);
+  draw(); list();
+};
+
+function eventPoint(event) {
+  var rect = canvas.getBoundingClientRect(), calibration = state.calibrations[$('activeSide').value];
+  return {x_mm: ((event.clientX - rect.left) / rect.width) * calibration.width_mm, y_mm: ((event.clientY - rect.top) / rect.height) * calibration.height_mm};
+}
+function roundPoint(point) { return {x_mm: +point.x_mm.toFixed(3), y_mm: +point.y_mm.toFixed(3)}; }
+function visibleToCanonical(point, side) {
+  if (side === 'front') return roundPoint(point);
+  var calibration = state.calibrations.back;
+  var x = point.x_mm * state.widthMm / calibration.width_mm, y = point.y_mm * state.heightMm / calibration.height_mm, transform = $('backTransform').value;
+  if (transform === 'mirror_x' || transform === 'rotate_180') x = state.widthMm - x;
+  if (transform === 'mirror_y' || transform === 'rotate_180') y = state.heightMm - y;
+  return roundPoint({x_mm: x, y_mm: y});
+}
+function canonicalToVisible(point, side) {
+  if (side === 'front') return point;
+  var x = point.x_mm, y = point.y_mm, transform = $('backTransform').value;
+  if (transform === 'mirror_x' || transform === 'rotate_180') x = state.widthMm - x;
+  if (transform === 'mirror_y' || transform === 'rotate_180') y = state.heightMm - y;
+  return {x_mm: x * state.calibrations.back.width_mm / state.widthMm, y_mm: y * state.calibrations.back.height_mm / state.heightMm};
+}
+function draw() {
+  var side = $('activeSide').value, image = state.images[side], calibration = state.calibrations[side];
+  if (!image || !calibration) { ctx.clearRect(0, 0, canvas.width, canvas.height); return; }
+  canvas.width = image.width; canvas.height = image.height;
+  var annotated = $('showAnnotation').checked ? state.annotatedImages[side] : null;
+  ctx.drawImage(annotated || image, 0, 0);
+  var displayed = state.outline.map(function(p) { return canonicalToVisible(p, side); });
+  ctx.strokeStyle = '#ff3344'; ctx.lineWidth = 3; ctx.beginPath();
+  displayed.forEach(function(p, i) { var x = p.x_mm / calibration.width_mm * canvas.width, y = p.y_mm / calibration.height_mm * canvas.height; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.closePath(); ctx.stroke();
+  state.terminals.filter(function(t) { return t.side === side; }).forEach(function(terminal) {
+    var point = terminal.source_region ? terminal.source_region.center : canonicalToVisible(terminal.position, side);
+    var x = point.x_mm / calibration.width_mm * canvas.width, y = point.y_mm / calibration.height_mm * canvas.height;
+    ctx.fillStyle = terminal.polarity === 'positive' ? '#ffcc2288' : terminal.polarity === 'negative' ? '#32c7ff88' : '#d946ef88';
+    if (terminal.source_region) drawRegion(terminal.source_region, calibration, ctx.fillStyle, '#111827', false);
+    else { ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI * 2); ctx.fill(); }
+    ctx.fillStyle = '#111'; ctx.font = '18px sans-serif'; ctx.fillText(terminal.id, x + 12, y);
+  });
+  state.candidates.filter(function(c) { return c.side === side; }).forEach(function(candidate) {
+    var point = candidate.visible_region ? candidate.visible_region.center : candidate.visible_position;
+    var x = point.x_mm / calibration.width_mm * canvas.width, y = point.y_mm / calibration.height_mm * canvas.height;
+    if (candidate.visible_region) drawRegion(candidate.visible_region, calibration, '#ff5fa244', '#ff5fa2', true);
+    else { ctx.save(); ctx.strokeStyle = '#ff5fa2'; ctx.lineWidth = 4; ctx.setLineDash([10, 7]); ctx.beginPath(); ctx.arc(x, y, 15, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
+    ctx.fillStyle = '#ff5fa2'; ctx.font = 'bold 22px sans-serif'; ctx.fillText(candidate.label + '?', x + 20, y + 7);
+  });
+}
+function drawRegion(region, calibration, fillStyle, strokeStyle, dashed) {
+  var points = region.polygon;
+  if (!points || !points.length) return;
+  ctx.save(); ctx.fillStyle = fillStyle; ctx.strokeStyle = strokeStyle; ctx.lineWidth = 4; if (dashed) ctx.setLineDash([10, 7]);
+  ctx.beginPath(); points.forEach(function(p, i) { var x = p.x_mm / calibration.width_mm * canvas.width, y = p.y_mm / calibration.height_mm * canvas.height; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
+}
+function updateAlignment() {
+  var front = state.calibrations.front, back = state.calibrations.back;
+  if (!front || !back) { state.alignmentError = null; return; }
+  var transformed = back.outline.map(function(p) { return visibleToCanonical(p, 'back'); });
+  var directed = function(a, b) { return a.reduce(function(sum, p) { return sum + Math.min.apply(null, b.map(function(q) { return Math.hypot(p.x_mm - q.x_mm, p.y_mm - q.y_mm); })); }, 0) / a.length; };
+  state.alignmentError = (directed(state.outline, transformed) + directed(transformed, state.outline)) / 2;
+  var level = state.alignmentError <= 0.2 ? '良好' : state.alignmentError <= 0.5 ? '需仔细确认' : '不合格';
+  show('双面轮廓对齐误差 ' + state.alignmentError.toFixed(3) + ' mm（' + level + '）');
+}
+function list() {
+  $('terminalList').innerHTML = state.terminals.map(function(t, i) { return '<li>' + t.id + ': ' + (t.side === 'front' ? '正面' : '反面') + ' · ' + t.roles.join('+') + ' / ' + (t.polarity || 'signal') + ' · 区域 ' + t.width_mm + ' × ' + t.height_mm + ' mm，中心 ' + t.position.x_mm + ', ' + t.position.y_mm + ' mm <button class="tiny" data-remove="' + i + '">删除</button></li>'; }).join('');
+  document.querySelectorAll('[data-remove]').forEach(function(btn) { btn.onclick = function() { state.terminals.splice(+btn.dataset.remove, 1); draw(); list(); }; });
+}
+
+$('create').onclick = async function() {
+  try {
+    if (!$('outlineConfirmed').checked) throw new Error('请先确认轮廓、反面映射和真实尺寸');
+    if (!state.calibrations.front) throw new Error('必须先标定正面照片');
+    if (state.terminals.some(function(t) { return t.side === 'back'; }) && !state.calibrations.back) throw new Error('存在反面触点，必须标定反面照片');
+    if (state.alignmentError !== null && state.alignmentError > 0.5) throw new Error('正反面轮廓对齐误差超过 0.5 mm');
+    var v = $('voltage').value.split(',').map(Number), c = $('current').value.split(',').map(Number);
+    var spec = {name: $('name').value, protection_ic: $('ic').value, battery: {count: +$('count').value, connection: $('connection').value, cell_min_v: v[0], cell_nominal_v: v[1], cell_max_v: v[2]}, limits: {continuous_current_a: c[0], peak_current_a: c[1], peak_duration_s: +$('peakDuration').value, ambient_temp_c: +$('ambient').value, max_temp_rise_c: +$('tempRise').value, overcurrent_trip_a: +$('overcurrentTrip').value}, outline: {points: state.outline, source: state.calibrations.front.method || 'photo', confirmed: true}, terminals: state.terminals, photo_capture: {front_calibration_id: state.calibrations.front.calibration_id, back_calibration_id: state.calibrations.back ? state.calibrations.back.calibration_id : null, back_transform: $('backTransform').value, alignment_error_mm: state.alignmentError}};
+    var project = await api('/api/projects', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(spec)});
+    var preview = await api('/api/projects/' + project.id + '/preview', {method: 'POST'});
+    $('result').textContent = JSON.stringify({project: project, preview: preview}, null, 2);
+  } catch (error) { $('result').textContent = error.message; }
+};
+
+async function api(url, options) {
+  options = options || {};
+  var response = await fetch(API_BASE + url, options);
+  var data = await response.json();
+  if (!response.ok) throw new Error((data.error ? data.error.message : '请求失败') + '\n' + JSON.stringify(data.error ? data.error.details || {} : {}, null, 2));
+  return data;
+}
+function show(text) { $('calibrationStatus').textContent = text; }
+
+pingApi();
+</script>
+</body>
+</html>

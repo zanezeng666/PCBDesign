@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>电池保护板参数化设计</title>
+  <link rel="stylesheet" href="/static/styles.css?v=region-2">
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">LOCAL · KICAD 9</p>
+      <h1>电池保护板参数化设计</h1>
+      <p>正反面照片统一标定，从触点语义到候选样板输出。首次 IC 方案不会被误标为量产设计。</p>
+    </header>
+    <section class="panel">
+      <h2>1. 正反面照片标定</h2>
+      <div class="grid three">
+        <label>正面照片<input id="frontPhoto" type="file" accept="image/*"></label>
+        <label>反面照片（可选）<input id="backPhoto" type="file" accept="image/*"></label>
+        <label>标定方式<select id="calibrationMode"><option value="known_size">已知板框尺寸</option><option value="aruco">四个 ArUco 标记</option></select></label>
+        <label>板宽 / mm<input id="boardWidth" type="number" value="41" min="2" step="0.1"></label>
+        <label>板高 / mm<input id="boardHeight" type="number" value="7" min="2" step="0.1"></label>
+        <label>ArUco 边长 / mm<input id="markerSize" type="number" value="10" min="2" step="0.1"></label>
+      </div>
+      <p class="status">填写 PCB 的真实长宽后，系统会识别四个板角并进行透视校正，把手机斜拍形成的梯形恢复到真实毫米坐标。无标尺照片仍需人工确认板框；要求 ≤0.2 mm 的任务应使用 ArUco 重新拍摄。</p>
+      <div class="toolbar">
+        <button id="calibrateFront">标定正面</button>
+        <button id="calibrateBack" class="secondary">标定反面</button>
+        <label>当前标注面<select id="activeSide"><option value="front">正面</option><option value="back">反面</option></select></label>
+        <label>反面映射<select id="backTransform"><option value="mirror_x">左右翻转</option><option value="mirror_y">上下翻转</option><option value="rotate_180">旋转 180°</option><option value="none">不翻转</option></select></label>
+      </div>
+      <p id="calibrationStatus" class="status"></p>
+      <div class="toolbar">
+        <label><input id="editOutline" type="checkbox">在正面拖动轮廓顶点</label>
+        <label><input id="outlineConfirmed" type="checkbox">我已确认双面轮廓、映射和真实尺寸</label>
+        <label><input id="showAnnotation" type="checkbox">显示焊盘检测标注</label>
+      </div>
+      <div class="canvas-wrap"><canvas id="boardCanvas"></canvas></div>
+    </section>
+    <section class="panel">
+      <h2>2. 电气参数</h2>
+      <div class="grid three">
+        <label>项目名称<input id="name" value="JLH-1S-4108"></label>
+        <label>保护 IC 型号<input id="ic" value="HY2113-MB1B" placeholder="完整料号或简称"></label>
+        <label>电池数量<input id="count" type="number" min="1" max="5" value="1"></label>
+        <label>连接方式<select id="connection"><option value="series">串联</option><option value="parallel">并联</option></select></label>
+        <label>最低/标称/最高 V<input id="voltage" value="3.0,3.7,4.2"></label>
+        <label>持续/峰值 A（示例值，需确认）<input id="current" value="2,5"></label>
+        <label>过流动作目标 A<input id="overcurrentTrip" type="number" value="8" step="0.1"></label>
+        <label>峰值时间 s<input id="peakDuration" type="number" value="1"></label>
+        <label>环境温度 °C<input id="ambient" type="number" value="25"></label>
+        <label>允许温升 °C<input id="tempRise" type="number" value="40"></label>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>3. 点击标注触点</h2>
+      <div class="auto-detect">
+        <div>
+          <h3>丝印与焊盘预识别</h3>
+          <p>先识别 B+、B-、P+、P-、C+、C-、NTC、N、TH、ID 文字，再匹配离文字最近的银白色焊盘区域或孔位。候选框表示完整区域，确认后才会加入设计。</p>
+        </div>
+        <div class="toolbar">
+          <button id="detectTerminals" class="secondary">自动识别当前面</button>
+          <button id="acceptAllCandidates" class="secondary">采纳全部候选</button>
+        </div>
+      </div>
+      <ul id="candidateList" class="candidate-list"></ul>
+      <div class="toolbar">
+        <label>角色<select id="role"><option value="battery">电池</option><option value="charge">充电</option><option value="discharge">放电</option><option value="temperature">温度 TH</option><option value="identification">识别 ID</option><option value="auxiliary">其他辅助</option></select></label>
+        <label>极性<select id="polarity"><option value="positive">正极</option><option value="negative">负极</option><option value="">无极性/信号</option></select></label>
+        <label>焊盘直径/mm<input id="padSize" type="number" value="2" step="0.1"></label>
+        <button id="mergeRole" class="secondary">合并角色到最近添加的同面触点</button>
+      </div>
+      <p>先选择板面再点击照片。反面坐标会映射到正面统一坐标；同一触点合并“充电+放电”角色即可表达共口。</p>
+      <ol id="terminalList"></ol>
+      <button id="create">保存项目并生成机械预览</button>
+      <pre id="result"></pre>
+    </section>
+  </main>
+  <script src="/static/app.js?v=region-2"></script>
+</body>
+</html>

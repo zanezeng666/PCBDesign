@@ -1,0 +1,58 @@
+full_mpn: HY2113-MB1B
+aliases: [HY2113MB1B, 3M1B]
+manufacturer: HYCON Technology Corp.
+package: SOT-23-6
+supported_series: [1]
+port_topologies: [common]
+status: candidate
+official_source: true
+reference_circuit_verified: true
+source_url: https://www.sis.com/dl/Products/BMS/files/resources/DS-HY2113_EN.pdf
+source_cache: data/ic_catalog/sources/DS-HY2113-V16_EN.pdf
+source_sha256: 240e6bba7af3c22ed7f6f3fea8b1349998fdeb2fbd1ece5a63815463d9f45ad1
+confidence: 0.98
+pins:
+  "1": OD
+  "2": CS
+  "3": OC
+  "4": NC
+  "5": VDD
+  "6": VSS
+marking:
+  first_line: 3M1B
+  meaning: "3=HY2113 product code; M=serial code; 1=delay code; B=characteristic code"
+  second_line: date_code
+parameters:
+  chemistry: Li-ion/LiPo
+  overcharge_detection_v_typ: 4.280
+  overcharge_release_v_typ: 4.280
+  overdischarge_detection_v_typ: 2.800
+  overdischarge_release_v_typ: 2.800
+  discharge_overcurrent_detection_v_typ: 0.250
+  discharge_overcurrent_detection_v_min_25c: 0.235
+  discharge_overcurrent_detection_v_max_25c: 0.265
+  charge_overcurrent_detection_v_typ: -0.100
+  short_circuit_detection_v_typ: 0.850
+  overcharge_delay_ms_typ: 1300
+  overdischarge_delay_ms_typ: 145
+  discharge_overcurrent_delay_ms_typ: 12
+  charge_overcurrent_delay_ms_typ: 8
+  short_circuit_delay_us_typ: 300
+  zero_volt_charge: available
+  recovery_mode: auto_overdischarge_recovery
+reference_components:
+  R1:
+    typical_ohm: 100
+    min_ohm: 100
+    max_ohm: 200
+  R2:
+    typical_ohm: 2000
+    min_ohm: 1000
+    max_ohm: 2000
+  C1:
+    typical_f: 0.0000001
+    min_f: 0.00000001
+    max_f: 0.000001
+  M1: N-channel discharge-control MOSFET
+  M2: N-channel charge-control MOSFET
+template_dir: null

@@ -1,0 +1,20 @@
+full_mpn: DW01-G
+aliases: [DW01G, DW01]
+manufacturer: Fortune Semiconductor Corporation
+package: SOT-23-6
+supported_series: [1]
+port_topologies: [common]
+status: candidate
+official_source: true
+reference_circuit_verified: false
+source_url: https://www.ic-fortune.com/upload/Download/DW01-G-DS-10_EN.pdf
+source_sha256: ""
+confidence: 0.8
+pins:
+  "1": OD
+  "2": CS
+  "3": OC
+  "4": TD
+  "5": VCC
+  "6": GND
+template_dir: null

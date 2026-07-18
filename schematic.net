@@ -1,0 +1,289 @@
+(export 
+  (version "D")
+  (design
+    (source "schematic.py")
+    (date "07/15/2026 09:18 AM")
+    (tool "SKiDL (2.2.3)")
+    (sheet
+      (number 1)
+      (name "/")
+      (tstamps "/")
+      (title_block
+        (title)
+        (company)
+        (rev)
+        (date)
+        (source "..\schematic.py")
+        (comment
+          (number "1")
+          (value ""))
+        (comment
+          (number "2")
+          (value ""))
+        (comment
+          (number "3")
+          (value ""))
+        (comment
+          (number "4")
+          (value ""))
+        (comment
+          (number "5")
+          (value ""))
+        (comment
+          (number "6")
+          (value ""))
+        (comment
+          (number "7")
+          (value ""))
+        (comment
+          (number "8")
+          (value ""))
+        (comment
+          (number "9")
+          (value "")))))
+  (components
+    (comp
+      (ref "C1")
+      (value "0.1uF")
+      (description "Unpolarized capacitor, small symbol")
+      (footprint "Capacitor_SMD:C_0603_1608Metric")
+      (fields
+        (field
+          (name "Description") "Unpolarized capacitor, small symbol")
+        (field
+          (name "Footprint") "Capacitor_SMD:C_0603_1608Metric")
+        (field
+          (name "Datasheet") "~")
+        (field
+          (name "SKiDL Tag") "BKnS1gIPAL")
+        (field
+          (name "SKiDL Line") "schematic.py:56"))
+      (libsource
+        (lib "Device")
+        (part "C_Small"))
+      (sheetpath
+        (names "/")
+        (tstamps "/"))
+      (component_classes)
+      (tstamps "df020261-14bd-5b95-8546-62271e1d56c3"))
+    (comp
+      (ref "C2")
+      (value "10uF")
+      (description "Unpolarized capacitor, small symbol")
+      (footprint "Capacitor_SMD:C_0603_1608Metric")
+      (fields
+        (field
+          (name "Description") "Unpolarized capacitor, small symbol")
+        (field
+          (name "Footprint") "Capacitor_SMD:C_0603_1608Metric")
+        (field
+          (name "Datasheet") "~")
+        (field
+          (name "SKiDL Tag") "Dq5tgCeXrJ")
+        (field
+          (name "SKiDL Line") "schematic.py:56"))
+      (libsource
+        (lib "Device")
+        (part "C_Small"))
+      (sheetpath
+        (names "/")
+        (tstamps "/"))
+      (component_classes)
+      (tstamps "7d4286ad-20a0-506a-86ab-59a370517b66"))
+    (comp
+      (ref "J1")
+      (value "Header_4P")
+      (description "Generic connector, single row, 01x04, script generated (kicad-library-utils/schlib/autogen/connector/)")
+      (footprint "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical")
+      (fields
+        (field
+          (name "Description") "Generic connector, single row, 01x04, script generated (kicad-library-utils/schlib/autogen/connector/)")
+        (field
+          (name "Footprint") "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical")
+        (field
+          (name "Datasheet") "~")
+        (field
+          (name "SKiDL Tag") "vRb8A5v54D")
+        (field
+          (name "SKiDL Line") "schematic.py:59"))
+      (libsource
+        (lib "Connector_Generic")
+        (part "Conn_01x04"))
+      (sheetpath
+        (names "/")
+        (tstamps "/"))
+      (component_classes)
+      (tstamps "1ffdcfb2-063c-5972-aa8a-65df4e6cb78c"))
+    (comp
+      (ref "Q1")
+      (value "FS8205A")
+      (description "")
+      (footprint "Package_SO:TSSOP-8_4.4x3mm_P0.65mm")
+      (fields
+        (field
+          (name "Description"))
+        (field
+          (name "Footprint") "Package_SO:TSSOP-8_4.4x3mm_P0.65mm")
+        (field
+          (name "Datasheet"))
+        (field
+          (name "SKiDL Tag") "aQwNt4uVy_")
+        (field
+          (name "SKiDL Line") "schematic.py:51"))
+      (libsource
+        (lib "C:\Users\26509\Desktop\workspace\PCBDesign\engine\circuits\symbols\battery_protection.kicad_sym")
+        (part "FS8205A"))
+      (sheetpath
+        (names "/")
+        (tstamps "/"))
+      (component_classes)
+      (tstamps "cf55decd-0f5e-5f33-9d9a-1e2abc0b803b"))
+    (comp
+      (ref "R1")
+      (value "100")
+      (description "Resistor, small US symbol")
+      (footprint "Resistor_SMD:R_0603_1608Metric")
+      (fields
+        (field
+          (name "Description") "Resistor, small US symbol")
+        (field
+          (name "Footprint") "Resistor_SMD:R_0603_1608Metric")
+        (field
+          (name "Datasheet") "~")
+        (field
+          (name "SKiDL Tag") "g8WnTmocwQ")
+        (field
+          (name "SKiDL Line") "schematic.py:53"))
+      (libsource
+        (lib "Device")
+        (part "R_Small_US"))
+      (sheetpath
+        (names "/")
+        (tstamps "/"))
+      (component_classes)
+      (tstamps "887c64ef-1380-53e8-9f24-6ab9ec24fdd5"))
+    (comp
+      (ref "U1")
+      (value "DW01-G")
+      (description "")
+      (footprint "Package_TO_SOT_SMD:SOT-23-6")
+      (fields
+        (field
+          (name "Description"))
+        (field
+          (name "Footprint") "Package_TO_SOT_SMD:SOT-23-6")
+        (field
+          (name "Datasheet"))
+        (field
+          (name "SKiDL Tag") "H_CTPydxvc")
+        (field
+          (name "SKiDL Line") "schematic.py:51"))
+      (libsource
+        (lib "C:\Users\26509\Desktop\workspace\PCBDesign\engine\circuits\symbols\battery_protection.kicad_sym")
+        (part "DW01-G"))
+      (sheetpath
+        (names "/")
+        (tstamps "/"))
+      (component_classes)
+      (tstamps "b278924d-a032-5072-b591-1245989b0088")))
+  (nets
+    (net
+      (code 1)
+      (name "B-")
+      (class "Default")
+      (node
+        (ref "C1")
+        (pin "2")
+        (pintype "PASSIVE"))
+      (node
+        (ref "C2")
+        (pin "2")
+        (pintype "PASSIVE"))
+      (node
+        (ref "J1")
+        (pin "2")
+        (pintype "PASSIVE"))
+      (node
+        (ref "J1")
+        (pin "4")
+        (pintype "PASSIVE"))
+      (node
+        (ref "Q1")
+        (pin "1")
+        (pintype "PASSIVE"))
+      (node
+        (ref "Q1")
+        (pin "3")
+        (pintype "PASSIVE"))
+      (node
+        (ref "U1")
+        (pin "2")
+        (pintype "PASSIVE"))
+      (node
+        (ref "U1")
+        (pin "6")
+        (pintype "POWER-IN")))
+    (net
+      (code 2)
+      (name "OC")
+      (class "Default")
+      (node
+        (ref "Q1")
+        (pin "4")
+        (pintype "INPUT"))
+      (node
+        (ref "U1")
+        (pin "3")
+        (pintype "POWER-OUT")))
+    (net
+      (code 3)
+      (name "OD")
+      (class "Default")
+      (node
+        (ref "Q1")
+        (pin "2")
+        (pintype "INPUT"))
+      (node
+        (ref "U1")
+        (pin "1")
+        (pintype "POWER-IN")))
+    (net
+      (code 4)
+      (name "P+")
+      (class "Default")
+      (node
+        (ref "J1")
+        (pin "1")
+        (pintype "PASSIVE"))
+      (node
+        (ref "J1")
+        (pin "3")
+        (pintype "PASSIVE"))
+      (node
+        (ref "Q1")
+        (pin "7")
+        (pintype "PASSIVE"))
+      (node
+        (ref "Q1")
+        (pin "8")
+        (pintype "PASSIVE"))
+      (node
+        (ref "R1")
+        (pin "1")
+        (pintype "PASSIVE")))
+    (net
+      (code 5)
+      (name "VDD")
+      (class "Default")
+      (node
+        (ref "C1")
+        (pin "1")
+        (pintype "PASSIVE"))
+      (node
+        (ref "R1")
+        (pin "2")
+        (pintype "PASSIVE"))
+      (node
+        (ref "U1")
+        (pin "5")
+        (pintype "POWER-IN")))))

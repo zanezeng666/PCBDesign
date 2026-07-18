@@ -1,0 +1,120 @@
+name: "DW01-G 单节锂电池保护板"
+description: "DW01-G + FS8205A 经典方案，适用于3.6V单节锂电"
+type: 1S
+voltage: 3.6
+
+parts:
+  - id: U1
+    category: IC
+    part_name: DW01-G
+    footprint: Package_TO_SOT_SMD:SOT-23-6
+    value: DW01-G
+    pins: [OD, CS, OC, TD, VDD, VSS]
+
+  - id: Q1
+    category: MOSFET_DUAL
+    part_name: FS8205A
+    footprint: Package_SO:TSSOP-8_4.4x3mm_P0.65mm
+    value: FS8205A
+    pins: [S1, G1, S2, G2, D2, D2, D1, D1]
+
+  - id: R1
+    category: RES
+    part_name: R
+    footprint: Resistor_SMD:R_0603_1608Metric
+    value: 100
+    pins: ["1", "2"]
+
+  - id: C1
+    category: CAP
+    part_name: C
+    footprint: Capacitor_SMD:C_0603_1608Metric
+    value: 0.1uF
+    pins: ["1", "2"]
+
+  - id: C2
+    category: CAP
+    part_name: C
+    footprint: Capacitor_SMD:C_0603_1608Metric
+    value: 10uF
+    pins: ["1", "2"]
+
+  - id: J1
+    category: CONN
+    part_name: Conn_01x04
+    footprint: Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical
+    value: Header_4P
+    pins: ["1", "2", "3", "4"]
+
+nets:
+  - name: "B+"
+    connections:
+      - part: R1
+        pin: "1"
+      - part: Q1
+        pin: D1
+      - part: J1
+        pin: "1"
+
+  - name: "B-"
+    connections:
+      - part: U1
+        pin: VSS
+      - part: C1
+        pin: "2"
+      - part: C2
+        pin: "2"
+      - part: Q1
+        pin: S1
+      - part: Q1
+        pin: S2
+      - part: J1
+        pin: "2"
+
+  - name: VDD
+    connections:
+      - part: R1
+        pin: "2"
+      - part: U1
+        pin: VDD
+      - part: C1
+        pin: "1"
+
+  - name: OD
+    connections:
+      - part: U1
+        pin: OD
+      - part: Q1
+        pin: G1
+
+  - name: OC
+    connections:
+      - part: U1
+        pin: OC
+      - part: Q1
+        pin: G2
+
+  - name: CS
+    connections:
+      - part: U1
+        pin: CS
+      - part: Q1
+        pin: S1
+
+  - name: "P+"
+    connections:
+      - part: J1
+        pin: "3"
+      - part: Q1
+        pin: D1
+
+  - name: "P-"
+    connections:
+      - part: J1
+        pin: "4"
+      - part: Q1
+        pin: S1
+
+board:
+  width_mm: 40
+  height_mm: 15
