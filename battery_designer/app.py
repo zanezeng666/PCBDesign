@@ -19,8 +19,8 @@ from .generator import DesignGenerator
 from .kicad import KicadPipeline
 from .models import DesignSpec, ValidationRecord
 from .storage import ProjectStore
-from .terminal_detection import detect_terminal_candidates
 from .vision import calibrate_known_size, calibrate_photo, outline_alignment_error
+from .vlm_detection import detect_with_vlm as _vlm_detect
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -105,6 +105,7 @@ async def calibrate_by_known_size(
 
 @app.post("/api/vision/detect-terminals")
 def detect_terminals(calibration_id: str = Form(...), side: str = Form(...)):
+    """Detect terminal candidates on a rectified PCB image using qwen3.7-plus VLM."""
     if len(calibration_id) != 32 or any(character not in "0123456789abcdef" for character in calibration_id):
         raise DesignError("INVALID_CALIBRATION_ID", "The calibration id is invalid.")
     directory = WORK_ROOT / "calibrations" / calibration_id
@@ -113,14 +114,19 @@ def detect_terminals(calibration_id: str = Form(...), side: str = Form(...)):
     if not metadata_path.exists() or not image_path.exists():
         raise DesignError("CALIBRATION_NOT_FOUND", "Photo calibration record not found.", {"calibration_id": calibration_id})
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    result = detect_terminal_candidates(
-        image_path.read_bytes(), float(metadata["width_mm"]), float(metadata["height_mm"]), side
-    )
+    image_bytes = image_path.read_bytes()
+    width_mm = float(metadata["width_mm"])
+    height_mm = float(metadata["height_mm"])
+
+    result = _vlm_detect(image_bytes, width_mm, height_mm, side)
+    result["method_used"] = "vlm"
+
     (directory / "terminal-candidates.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    annotated = base64.b64decode(result["annotated_png_base64"])
-    (directory / "terminal-annotated.png").write_bytes(annotated)
+    if result.get("annotated_png_base64"):
+        annotated = base64.b64decode(result["annotated_png_base64"])
+        (directory / "terminal-annotated.png").write_bytes(annotated)
     return result
 
 

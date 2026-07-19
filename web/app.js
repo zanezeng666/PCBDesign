@@ -42,8 +42,9 @@ async function calibrateSide(side) {
     image.src = 'data:image/png;base64,' + result.rectified_png_base64;
     $('activeSide').value = side;
     const perspective = result.perspective_method === 'detected_board_corners' ? '四角透视已校正' : result.perspective_method ? '使用旋转矩形回退' : '';
+    const refinement = result.refinement_applied ? '；二次裁剪已生效' : '；二次裁剪未生效（可能已对齐）';
     const warning = result.method === 'known_size_auto' ? '；自动板框必须人工确认' : '';
-    show(`${side === 'front' ? '正面' : '反面'}标定完成：${result.width_mm} × ${result.height_mm} mm，置信度 ${(result.confidence * 100).toFixed(1)}%${perspective ? `，${perspective}` : ''}${warning}`);
+    show(`${side === 'front' ? '正面' : '反面'}标定完成：${result.width_mm} × ${result.height_mm} mm，置信度 ${(result.confidence * 100).toFixed(1)}%${perspective ? `，${perspective}` : ''}${refinement}${warning}`);
   } catch (error) { show(error.message); }
 }
 
@@ -53,7 +54,7 @@ async function detectCurrentSide() {
   const body = new FormData();
   body.append('calibration_id', calibration.calibration_id);
   body.append('side', side);
-  show(`正在识别${side === 'front' ? '正面' : '反面'}丝印与焊盘，首次加载 OCR 可能需要十几秒…`);
+  show(`正在识别${side === 'front' ? '正面' : '反面'}丝印与焊盘…`);
   try {
     const result = await api('/api/vision/detect-terminals', {method: 'POST', body});
     state.candidates = state.candidates.filter(candidate => candidate.side !== side).concat(result.candidates);
@@ -63,7 +64,7 @@ async function detectCurrentSide() {
       annotated.src = 'data:image/png;base64,' + result.annotated_png_base64;
     }
     draw(); listCandidates();
-    show(`识别完成：找到 ${result.candidate_count} 个待确认候选（共检测到 ${result.all_pad_count || '?'} 个焊盘区域，OCR 匹配 ${result.matched_pad_count || '?'} 个）${result.ocr_available ? '' : '；当前未安装 OCR 组件'}`);
+    show(`识别完成：找到 ${result.candidate_count} 个待确认候选（qwen3.7-plus VLM 识别）`);
   } catch (error) { show(error.message); }
 }
 
@@ -78,8 +79,11 @@ function acceptCandidate(candidate) {
 function listCandidates() {
   $('candidateList').innerHTML = state.candidates.map((candidate, index) => {
     const region = candidate.visible_region;
-    const areaText = region ? `${region.type === 'hole' ? '孔位' : '焊盘'}区域 ${region.bbox.width_mm} × ${region.bbox.height_mm} mm，距离文字 ${candidate.match_distance_mm} mm` : '未匹配到银白色区域或孔位';
-    return `<li><span class="candidate-label">${candidate.label}</span> ${candidate.side === 'front' ? '正面' : '反面'} · ${Math.round(candidate.confidence * 100)}%<br><span class="candidate-detail">${areaText}</span> <button class="tiny accept" data-accept="${index}" ${region ? '' : 'disabled'}>确认区域并采纳</button><button class="tiny" data-dismiss="${index}">忽略</button></li>`;
+    const multiRegions = candidate.matched_regions || [];
+    const multiHint = multiRegions.length > 1 ? `（双排 ${multiRegions.length} 个焊盘）` : '';
+    const areaText = region ? `${region.type === 'hole' ? '孔位' : '焊盘'}区域 ${region.bbox.width_mm} × ${region.bbox.height_mm} mm${multiHint}，距离文字 ${candidate.match_distance_mm} mm` : '未匹配到银白色区域或孔位';
+    const qualityTag = candidate.match_quality === 'manual_review' ? ' <span style="color:#e00">[需确认]</span>' : '';
+    return `<li><span class="candidate-label">${candidate.label}</span> ${candidate.side === 'front' ? '正面' : '反面'} · ${Math.round(candidate.confidence * 100)}%${qualityTag}<br><span class="candidate-detail">${areaText}</span> <button class="tiny accept" data-accept="${index}" ${region ? '' : 'disabled'}>确认区域并采纳</button><button class="tiny" data-dismiss="${index}">忽略</button></li>`;
   }).join('');
   document.querySelectorAll('[data-accept]').forEach(button => button.onclick = () => { const index = +button.dataset.accept; acceptCandidate(state.candidates[index]); state.candidates.splice(index, 1); draw(); list(); listCandidates(); });
   document.querySelectorAll('[data-dismiss]').forEach(button => button.onclick = () => { state.candidates.splice(+button.dataset.dismiss, 1); draw(); listCandidates(); });
@@ -142,8 +146,9 @@ function draw() {
   });
   state.candidates.filter(candidate => candidate.side === side).forEach(candidate => {
     const point = candidate.visible_region?.center || candidate.visible_position, x = point.x_mm / calibration.width_mm * canvas.width, y = point.y_mm / calibration.height_mm * canvas.height;
-    if (candidate.visible_region) drawRegion(candidate.visible_region, calibration, '#ff5fa244', '#ff5fa2', true);
-    else { ctx.save(); ctx.strokeStyle = '#ff5fa2'; ctx.lineWidth = 4; ctx.setLineDash([10, 7]); ctx.beginPath(); ctx.arc(x, y, 15, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
+    const regions = candidate.matched_regions || (candidate.visible_region ? [candidate.visible_region] : []);
+    regions.forEach(region => drawRegion(region, calibration, '#ff5fa244', '#ff5fa2', true));
+    if (!regions.length) { ctx.save(); ctx.strokeStyle = '#ff5fa2'; ctx.lineWidth = 4; ctx.setLineDash([10, 7]); ctx.beginPath(); ctx.arc(x, y, 15, 0, Math.PI * 2); ctx.stroke(); ctx.restore(); }
     ctx.fillStyle = '#ff5fa2'; ctx.font = 'bold 22px sans-serif'; ctx.fillText(`${candidate.label}?`, x + 20, y + 7);
   });
 }
