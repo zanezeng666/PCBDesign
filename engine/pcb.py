@@ -1,16 +1,13 @@
 """
-PCB 生成器 — 使用 KiCad 9.0 自带 Python (3.11) 运行
-用法: & "C:\Program Files\KiCad\9.0\bin\python.exe" engine/pcb.py
+PCB 生成器 — 使用 KiCad CLI 生成 PCB 文件
+用法: python engine/pcb.py
 """
 import os
 import sys
 import json
 from pathlib import Path
 
-# KiCad pcbnew 路径
-KICAD_BIN = r"C:\Program Files\KiCad\9.0\bin"
-KICAD_SHARE = r"C:\Program Files\KiCad\9.0\share\kicad"
-KICAD_CLI = os.path.join(KICAD_BIN, "kicad-cli.exe")
+from .config import KICAD_BIN, KICAD_CLI
 
 def create_pcb_from_netlist(netlist_path: str, output_dir: str, 
                              width_mm: float = 40, height_mm: float = 15) -> dict:

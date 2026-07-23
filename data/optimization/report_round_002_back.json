@@ -1,0 +1,59 @@
+{
+  "image_name": "back.jpg",
+  "image_size": [
+    4096,
+    1832
+  ],
+  "side": "back",
+  "gt_count": 2,
+  "det_count": 2,
+  "matched_count": 2,
+  "missed_count": 0,
+  "false_positive_count": 0,
+  "iou": {
+    "mean": 0.9117,
+    "median": 0.9359,
+    "min": 0.8875,
+    "max": 0.9359
+  },
+  "center_distance": {
+    "mean_px": 8.99,
+    "max_px": 15.19,
+    "mean_pct": 0.002
+  },
+  "size_error": {
+    "width_mean_pct": 0.03,
+    "height_mean_pct": 0.01,
+    "area_mean_pct": 0.03
+  },
+  "recall": 1.0,
+  "precision": 1.0,
+  "f1_score": 1.0,
+  "composite_score": 95.47,
+  "matches": [
+    {
+      "gt_label": "pad_1",
+      "det_label": "pad_1",
+      "iou": 0.9359,
+      "center_distance": 15.19,
+      "center_offset_pct": 0.0034,
+      "size_error_w": -0.0059,
+      "size_error_h": -0.0545,
+      "area_error_pct": -0.0601,
+      "quality": "excellent"
+    },
+    {
+      "gt_label": "pad_0",
+      "det_label": "pad_0",
+      "iou": 0.8875,
+      "center_distance": 2.8,
+      "center_offset_pct": 0.0006,
+      "size_error_w": 0.0564,
+      "size_error_h": 0.0667,
+      "area_error_pct": 0.1268,
+      "quality": "excellent"
+    }
+  ],
+  "unmatched_gt": [],
+  "unmatched_det": []
+}

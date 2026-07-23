@@ -1,0 +1,74 @@
+{
+  "outline": [
+    {
+      "x_mm": 9.179,
+      "y_mm": 6.994
+    },
+    {
+      "x_mm": 50.474,
+      "y_mm": 6.994
+    },
+    {
+      "x_mm": 50.576,
+      "y_mm": 14.724
+    },
+    {
+      "x_mm": 9.281,
+      "y_mm": 14.703
+    }
+  ],
+  "grooves": [
+    {
+      "id": "groove_01",
+      "groove_type": "groove",
+      "polygon": [
+        {
+          "x_mm": 9.138,
+          "y_mm": 9.081
+        },
+        {
+          "x_mm": 13.356,
+          "y_mm": 9.081
+        },
+        {
+          "x_mm": 13.356,
+          "y_mm": 10.101
+        },
+        {
+          "x_mm": 9.138,
+          "y_mm": 10.101
+        }
+      ],
+      "depth_mm": 2.5,
+      "confidence": 0.95,
+      "source": "vlm"
+    },
+    {
+      "id": "groove_02",
+      "groove_type": "groove",
+      "polygon": [
+        {
+          "x_mm": 9.138,
+          "y_mm": 10.701
+        },
+        {
+          "x_mm": 13.356,
+          "y_mm": 10.701
+        },
+        {
+          "x_mm": 13.356,
+          "y_mm": 11.721
+        },
+        {
+          "x_mm": 9.138,
+          "y_mm": 11.721
+        }
+      ],
+      "depth_mm": 2.5,
+      "confidence": 0.95,
+      "source": "vlm"
+    }
+  ],
+  "vertex_count": 4,
+  "groove_count": 2
+}

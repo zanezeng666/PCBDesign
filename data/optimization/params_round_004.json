@@ -1,0 +1,30 @@
+{
+  "version": 5,
+  "notes": "v5: minor → ",
+  "cv": {
+    "canny_low": 50,
+    "canny_high": 150,
+    "dilate_iterations": 1,
+    "dilate_kernel": 3,
+    "erode_iterations": 1,
+    "erode_kernel": 3,
+    "roi_expand_ratio": 0.3,
+    "roi_min_expand": 20,
+    "min_contour_area": 200,
+    "max_contour_area": 500000,
+    "min_aspect_ratio": 0.1,
+    "max_aspect_ratio": 10.0,
+    "rect_fit_epsilon": 0.02,
+    "adaptive_block_size": 11,
+    "adaptive_c": 2,
+    "boundary_margin": 5
+  },
+  "vlm": {
+    "prompt_temperature": 0.1,
+    "prompt_detail_level": "high",
+    "use_structured_output": true,
+    "min_confidence": 0.3,
+    "max_terminals_per_side": 6,
+    "prompt_suffix_hints": []
+  }
+}

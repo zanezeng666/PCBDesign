@@ -2,23 +2,10 @@
 import os, yaml
 from pathlib import Path
 
-KICAD_PATH = r"C:\Program Files\KiCad\9.0"
-KICAD_SHARE = os.path.join(KICAD_PATH, "share", "kicad")
-os.environ["KICAD_SYMBOL_DIR"] = os.path.join(KICAD_SHARE, "symbols")
-os.environ["KICAD9_SYMBOL_DIR"] = os.path.join(KICAD_SHARE, "symbols")
-os.environ["KICAD8_SYMBOL_DIR"] = os.path.join(KICAD_SHARE, "symbols")
-os.environ["KICAD7_SYMBOL_DIR"] = os.path.join(KICAD_SHARE, "symbols")
-os.environ["KICAD6_SYMBOL_DIR"] = os.path.join(KICAD_SHARE, "symbols")
+from .config import KICAD_CLI, KICAD_BIN, CUSTOM_SYM_LIB  # noqa: F401 — side-effects set env vars for skidl
 
 import skidl
 from skidl import Net, Part, KICAD9, SchLib, generate_schematic
-
-CUSTOM_SYM_LIB = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "circuits", "symbols", "battery_protection.kicad_sym"
-)
-
-KICAD_CLI = os.path.join(KICAD_PATH, "bin", "kicad-cli.exe")
 
 
 def generate_with_manual_placement(ic="DW01-G", mos_count=1, series=1,
@@ -156,18 +143,12 @@ def generate_with_manual_placement(ic="DW01-G", mos_count=1, series=1,
     return sch_file
 
 
+from .circuit_helpers import export_sch_png, export_sch_png_direct
+
 def export_png(sch_path, png_path):
-    import cairo, cairosvg, subprocess
-    os.environ['PATH'] = KICAD_PATH + r'\bin;' + os.environ.get('PATH', '')
-    svg_file = str(Path(png_path).with_suffix('.svg'))
-    r = subprocess.run(
-        [KICAD_CLI, "sch", "export", "svg", str(sch_path), "--output", svg_file],
-        capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"SVG fail: {r.stderr[:200]}")
-        return
-    cairosvg.svg2png(url=svg_file, write_to=str(png_path), output_width=1600)
-    print(f"PNG: {png_path} ({os.path.getsize(png_path)} bytes)")
+    """Export schematic to PNG."""
+    if not export_sch_png_direct(sch_path, png_path):
+        export_sch_png(sch_path, png_path)
 
 
 if __name__ == "__main__":

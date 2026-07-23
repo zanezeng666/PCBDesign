@@ -53,6 +53,14 @@ reference_components:
     typical_f: 0.0000001
     min_f: 0.00000001
     max_f: 0.000001
-  M1: N-channel discharge-control MOSFET
-  M2: N-channel charge-control MOSFET
+  M1:
+    description: N-channel discharge-control MOSFET
+    mpn: FS8205A
+    typical_rds_on_mohm: 24
+    package: TSSOP-8
+  M2:
+    description: N-channel charge-control MOSFET
+    mpn: FS8205A
+    typical_rds_on_mohm: 24
+    package: TSSOP-8
 template_dir: null

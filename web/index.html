@@ -1,83 +1,217 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>电池保护板参数化设计</title>
-  <link rel="stylesheet" href="/static/styles.css?v=region-2">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Battery Protection Board Designer</title>
+<link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <main>
-    <header>
-      <p class="eyebrow">LOCAL · KICAD 9</p>
-      <h1>电池保护板参数化设计</h1>
-      <p>正反面照片统一标定，从触点语义到候选样板输出。首次 IC 方案不会被误标为量产设计。</p>
-    </header>
-    <section class="panel">
-      <h2>1. 正反面照片标定</h2>
-      <div class="grid three">
-        <label>正面照片<input id="frontPhoto" type="file" accept="image/*"></label>
-        <label>反面照片（可选）<input id="backPhoto" type="file" accept="image/*"></label>
-        <label>标定方式<select id="calibrationMode"><option value="known_size">已知板框尺寸</option><option value="aruco">四个 ArUco 标记</option></select></label>
-        <label>板宽 / mm<input id="boardWidth" type="number" value="41" min="2" step="0.1"></label>
-        <label>板高 / mm<input id="boardHeight" type="number" value="7" min="2" step="0.1"></label>
-        <label>ArUco 边长 / mm<input id="markerSize" type="number" value="10" min="2" step="0.1"></label>
-      </div>
-      <p class="status">填写 PCB 的真实长宽后，系统会识别四个板角并进行透视校正，把手机斜拍形成的梯形恢复到真实毫米坐标。无标尺照片仍需人工确认板框；要求 ≤0.2 mm 的任务应使用 ArUco 重新拍摄。</p>
-      <div class="toolbar">
-        <button id="calibrateFront">标定正面</button>
-        <button id="calibrateBack" class="secondary">标定反面</button>
-        <label>当前标注面<select id="activeSide"><option value="front">正面</option><option value="back">反面</option></select></label>
-        <label>反面映射<select id="backTransform"><option value="mirror_x">左右翻转</option><option value="mirror_y">上下翻转</option><option value="rotate_180">旋转 180°</option><option value="none">不翻转</option></select></label>
-      </div>
-      <p id="calibrationStatus" class="status"></p>
-      <div class="toolbar">
-        <label><input id="editOutline" type="checkbox">在正面拖动轮廓顶点</label>
-        <label><input id="outlineConfirmed" type="checkbox">我已确认双面轮廓、映射和真实尺寸</label>
-        <label><input id="showAnnotation" type="checkbox">显示焊盘检测标注</label>
-      </div>
-      <div class="canvas-wrap"><canvas id="boardCanvas"></canvas></div>
-    </section>
-    <section class="panel">
-      <h2>2. 电气参数</h2>
-      <div class="grid three">
-        <label>项目名称<input id="name" value="JLH-1S-4108"></label>
-        <label>保护 IC 型号<input id="ic" value="HY2113-MB1B" placeholder="完整料号或简称"></label>
-        <label>电池数量<input id="count" type="number" min="1" max="5" value="1"></label>
-        <label>连接方式<select id="connection"><option value="series">串联</option><option value="parallel">并联</option></select></label>
-        <label>最低/标称/最高 V<input id="voltage" value="3.0,3.7,4.2"></label>
-        <label>持续/峰值 A（示例值，需确认）<input id="current" value="2,5"></label>
-        <label>过流动作目标 A<input id="overcurrentTrip" type="number" value="8" step="0.1"></label>
-        <label>峰值时间 s<input id="peakDuration" type="number" value="1"></label>
-        <label>环境温度 °C<input id="ambient" type="number" value="25"></label>
-        <label>允许温升 °C<input id="tempRise" type="number" value="40"></label>
-      </div>
-    </section>
-    <section class="panel">
-      <h2>3. 点击标注触点</h2>
-      <div class="auto-detect">
-        <div>
-          <h3>丝印与焊盘预识别</h3>
-          <p>先识别 B+、B-、P+、P-、C+、C-、NTC、N、TH、ID 文字，再匹配离文字最近的银白色焊盘区域或孔位。候选框表示完整区域，确认后才会加入设计。</p>
+
+<!-- ═══ Top Bar: Electrical Parameters ═══ -->
+<header id="top-bar">
+  <span class="logo">🔋 PCB Designer</span>
+  <div class="param-group">
+    <label>IC型号</label>
+    <select id="param-ic"></select>
+  </div>
+  <div class="param-group">
+    <label>电芯类型</label>
+    <select id="param-cell">
+      <option value="1S">1S (3.7V)</option>
+      <option value="2S">2S (7.4V)</option>
+      <option value="3S">3S (11.1V)</option>
+    </select>
+  </div>
+  <div class="param-group">
+    <label>最大电流</label>
+    <input type="number" id="param-current" value="5" min="0.1" step="0.1"> A
+  </div>
+  <div class="param-group">
+    <label>保护电压范围</label>
+    <input type="number" id="param-vmin" value="3.0" min="2.0" step="0.1"> –
+    <input type="number" id="param-vmax" value="4.25" min="3.0" step="0.1"> V
+  </div>
+  <div class="param-group">
+    <label>MOS型号</label>
+    <select id="param-mos"></select>
+  </div>
+  <span class="param-status" id="param-status">⚙️ 就绪</span>
+</header>
+
+<!-- ═══ Main Layout ═══ -->
+<main id="workspace">
+  <!-- Simulation Status Bar -->
+  <section class="step-card" id="step-sim" hidden>
+    <div class="sim-status" id="sim-status">
+      <span class="sim-icon" id="sim-icon">⏳</span>
+      <span class="sim-text" id="sim-text">正在模拟流程...</span>
+      <div class="sim-details" id="sim-details"></div>
+    </div>
+  </section>
+
+  <!-- Step 1: Upload Images -->
+  <section class="step-card" id="step-upload">
+    <h2>📷 步骤1 — 上传图片</h2>
+    <div class="upload-row">
+      <div class="upload-zone" id="zone-front">
+        <input type="file" id="file-front" accept="image/jpeg,image/png" hidden>
+        <div class="zone-inner" id="zone-inner-front">
+          <span class="zone-icon">📸</span>
+          <span class="zone-label">正面 Front</span>
+          <span class="zone-hint">点击或拖拽上传</span>
         </div>
-        <div class="toolbar">
-          <button id="detectTerminals" class="secondary">自动识别当前面</button>
-          <button id="acceptAllCandidates" class="secondary">采纳全部候选</button>
+        <img class="zone-preview" id="preview-front" alt="Front preview">
+        <button class="btn btn-sm rectify-toggle" id="btn-rectify-front" hidden title="预览矫正图片">🔄 矫正预览</button>
+        <span class="rectify-badge" id="badge-rectify-front" hidden>已矫正</span>
+      </div>
+      <div class="upload-zone" id="zone-back">
+        <input type="file" id="file-back" accept="image/jpeg,image/png" hidden>
+        <div class="zone-inner" id="zone-inner-back">
+          <span class="zone-icon">📸</span>
+          <span class="zone-label">背面 Back</span>
+          <span class="zone-hint">点击或拖拽上传</span>
+        </div>
+        <img class="zone-preview" id="preview-back" alt="Back preview">
+        <button class="btn btn-sm rectify-toggle" id="btn-rectify-back" hidden title="预览矫正图片">🔄 矫正预览</button>
+        <span class="rectify-badge" id="badge-rectify-back" hidden>已矫正</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Step 2: Black Frame Setup -->
+  <section class="step-card" id="step-frame">
+    <h2>📏 步骤2 — 先填入尺寸，再扫描黑色方框</h2>
+
+    <!-- Black Frame mode controls -->
+    <div class="cal-panel" id="panel-black-frame">
+      <div class="frame-controls">
+        <div class="frame-size">
+          <label>🖼️ 黑色方框外尺寸（10mm整数倍）</label>
+          <div class="size-input-group">
+            <input type="number" id="frame-w" value="60" min="10" max="200" step="10" class="size-input">
+            <span class="size-sep">×</span>
+            <input type="number" id="frame-h" value="30" min="10" max="200" step="10" class="size-input">
+            <span class="size-unit">mm</span>
+          </div>
+          <p class="muted" style="margin-top:4px;font-size:12px">先填入黑色方框实际尺寸，再点击"扫描黑色方框"自动检测位置</p>
+        </div>
+        <div class="frame-actions">
+          <button class="btn btn-outline" id="btn-scan-frame">🔍 扫描黑色方框</button>
+          <div class="frame-info" id="frame-info">
+            <span class="muted">先上传图片，填入尺寸后点击扫描</span>
+          </div>
         </div>
       </div>
-      <ul id="candidateList" class="candidate-list"></ul>
-      <div class="toolbar">
-        <label>角色<select id="role"><option value="battery">电池</option><option value="charge">充电</option><option value="discharge">放电</option><option value="temperature">温度 TH</option><option value="identification">识别 ID</option><option value="auxiliary">其他辅助</option></select></label>
-        <label>极性<select id="polarity"><option value="positive">正极</option><option value="negative">负极</option><option value="">无极性/信号</option></select></label>
-        <label>焊盘直径/mm<input id="padSize" type="number" value="2" step="0.1"></label>
-        <button id="mergeRole" class="secondary">合并角色到最近添加的同面触点</button>
+      <!-- Frame Comparison Results -->
+      <div class="frame-compare" id="frame-compare" hidden>
+        <h4>📐 方框检测对比</h4>
+        <div class="compare-grid">
+          <div class="compare-item">
+            <span class="compare-label">期望尺寸</span>
+            <span class="compare-value" id="cmp-expected">—</span>
+          </div>
+          <div class="compare-item">
+            <span class="compare-label">检测尺寸</span>
+            <span class="compare-value" id="cmp-detected">—</span>
+          </div>
+          <div class="compare-item">
+            <span class="compare-label">宽高比误差</span>
+            <span class="compare-value" id="cmp-aspect-error">—</span>
+          </div>
+          <div class="compare-item">
+            <span class="compare-label">结果</span>
+            <span class="compare-value" id="cmp-status">—</span>
+          </div>
+        </div>
       </div>
-      <p>先选择板面再点击照片。反面坐标会映射到正面统一坐标；同一触点合并“充电+放电”角色即可表达共口。</p>
-      <ol id="terminalList"></ol>
-      <button id="create">保存项目并生成机械预览</button>
-      <pre id="result"></pre>
-    </section>
-  </main>
-  <script src="/static/app.js?v=region-2"></script>
+    </div>
+  </section>
+
+  <!-- Step 3 & 4: Calibrate + Detect per side -->
+  <section class="step-card" id="step-detect" hidden>
+    <h2>🔬 步骤3 — 标定 & 识别（扫描成功后可操作）</h2>
+    <div class="detect-grid">
+      <!-- Front Column -->
+      <div class="detect-col" data-side="front">
+        <h3>🔵 正面 Front</h3>
+        <div class="detect-actions">
+          <button class="btn btn-primary" id="btn-calibrate-front" disabled>🎯 标定正面</button>
+          <span class="action-hint">透视矫正</span>
+        </div>
+        <div class="canvas-wrap" id="canvas-wrap-front">
+          <canvas id="canvas-front"></canvas>
+          <div class="canvas-overlay" id="overlay-front">
+            <span>等待标定...</span>
+          </div>
+        </div>
+        <div class="detect-stats" id="stats-front"></div>
+        <div class="detect-actions step-actions">
+          <button class="btn btn-outline" id="btn-extract-pcb-front" disabled>✂️ 识别轮廓</button>
+          <span class="action-hint">去白底→去阴影→识别凹槽</span>
+        </div>
+        <div class="step-result" id="extract-result-front" hidden></div>
+        <div class="detect-actions step-actions">
+          <button class="btn btn-outline" id="btn-detect-holes-front" disabled>⭕ 识别孔槽</button>
+          <span class="action-hint">PCB内白色区域</span>
+        </div>
+        <div class="step-result" id="holes-result-front" hidden></div>
+        <div class="detect-actions pad-actions">
+          <button class="btn btn-accent" id="btn-pads-front" disabled>📌 识别焊盘</button>
+          <span class="action-hint">VLM自动标注</span>
+        </div>
+      </div>
+      <!-- Back Column -->
+      <div class="detect-col" data-side="back">
+        <h3>🔴 背面 Back</h3>
+        <div class="detect-actions">
+          <button class="btn btn-primary" id="btn-calibrate-back" disabled>🎯 标定背面</button>
+          <span class="action-hint">透视矫正</span>
+        </div>
+        <div class="canvas-wrap" id="canvas-wrap-back">
+          <canvas id="canvas-back"></canvas>
+          <div class="canvas-overlay" id="overlay-back">
+            <span>等待标定...</span>
+          </div>
+        </div>
+        <div class="detect-stats" id="stats-back"></div>
+        <div class="detect-actions step-actions">
+          <button class="btn btn-outline" id="btn-extract-pcb-back" disabled>✂️ 识别轮廓</button>
+          <span class="action-hint">去白底→去阴影→识别凹槽</span>
+        </div>
+        <div class="step-result" id="extract-result-back" hidden></div>
+        <div class="detect-actions step-actions">
+          <button class="btn btn-outline" id="btn-detect-holes-back" disabled>⭕ 识别孔槽</button>
+          <span class="action-hint">PCB内白色区域</span>
+        </div>
+        <div class="step-result" id="holes-result-back" hidden></div>
+        <div class="detect-actions pad-actions">
+          <button class="btn btn-accent" id="btn-pads-back" disabled>📌 识别焊盘</button>
+          <span class="action-hint">VLM自动标注</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hole & Pad detail tables -->
+    <div class="results-tables" id="results-tables" hidden>
+      <div class="table-col" id="table-front"></div>
+      <div class="table-col" id="table-back"></div>
+    </div>
+  </section>
+
+  <!-- Step 5: Export -->
+  <section class="step-card" id="step-export" hidden>
+    <h2>🚀 步骤4 — 生成设计</h2>
+    <button class="btn btn-success btn-lg" id="btn-generate" disabled>
+      生成 KiCad 工程 →  schematic + PCB + BOM
+    </button>
+    <div id="export-status"></div>
+  </section>
+</main>
+
+<!-- Toast notification -->
+<div id="toast" class="toast"></div>
+
+<script src="/static/app.js"></script>
 </body>
 </html>

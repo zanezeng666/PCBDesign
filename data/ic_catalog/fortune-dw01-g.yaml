@@ -17,4 +17,47 @@ pins:
   "4": TD
   "5": VCC
   "6": GND
+parameters:
+  overcharge_detection_v_max:
+    typical: 4.28
+    min: 4.225
+    max: 4.335
+  overcharge_release_v_max:
+    typical: 4.08
+    min: 4.025
+    max: 4.135
+  overdischarge_detection_v_max:
+    typical: 2.5
+    min: 2.4
+    max: 2.6
+  overdischarge_release_v_max:
+    typical: 2.9
+    min: 2.8
+    max: 3.0
+  discharge_overcurrent_detection_v_typ: 0.15
+  charge_overcurrent_detection_v_typ: -0.15
+  short_circuit_detection_v_typ: 1.35
+reference_components:
+  M1:
+    description: N-channel discharge-control MOSFET
+    mpn: FS8205A
+    typical_rds_on_mohm: 24
+    package: TSSOP-8
+  M2:
+    description: N-channel charge-control MOSFET
+    mpn: FS8205A
+    typical_rds_on_mohm: 24
+    package: TSSOP-8
+  R1:
+    typical_ohm: 100
+    min_ohm: 100
+    max_ohm: 200
+  R2:
+    typical_ohm: 1000
+    min_ohm: 500
+    max_ohm: 2000
+  C1:
+    typical_f: 0.0000001
+    min_f: 0.00000001
+    max_f: 0.000001
 template_dir: null

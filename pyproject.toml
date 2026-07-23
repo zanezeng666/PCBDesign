@@ -11,6 +11,7 @@ dependencies = [
   "PyYAML>=6.0,<7",
   "pydantic>=2.13,<3",
   "CairoSVG>=2.9,<3",
+  "piexif>=1.1,<2",
 ]
 
 [project.scripts]

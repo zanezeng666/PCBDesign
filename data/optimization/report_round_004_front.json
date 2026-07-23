@@ -1,0 +1,81 @@
+{
+  "image_name": "front.jpg",
+  "image_size": [
+    4096,
+    1832
+  ],
+  "side": "front",
+  "gt_count": 4,
+  "det_count": 4,
+  "matched_count": 4,
+  "missed_count": 0,
+  "false_positive_count": 0,
+  "iou": {
+    "mean": 0.8646,
+    "median": 0.8764,
+    "min": 0.833,
+    "max": 0.8866
+  },
+  "center_distance": {
+    "mean_px": 4.74,
+    "max_px": 7.71,
+    "mean_pct": 0.0011
+  },
+  "size_error": {
+    "width_mean_pct": 0.02,
+    "height_mean_pct": 0.07,
+    "area_mean_pct": 0.09
+  },
+  "recall": 1.0,
+  "precision": 1.0,
+  "f1_score": 1.0,
+  "composite_score": 92.94,
+  "matches": [
+    {
+      "gt_label": "pad_3",
+      "det_label": "pad_3",
+      "iou": 0.8866,
+      "center_distance": 0.95,
+      "center_offset_pct": 0.0002,
+      "size_error_w": -0.0678,
+      "size_error_h": 0.0323,
+      "area_error_pct": -0.0377,
+      "quality": "excellent"
+    },
+    {
+      "gt_label": "pad_5",
+      "det_label": "pad_5",
+      "iou": 0.8764,
+      "center_distance": 7.71,
+      "center_offset_pct": 0.0017,
+      "size_error_w": 0.023,
+      "size_error_h": 0.0215,
+      "area_error_pct": 0.045,
+      "quality": "excellent"
+    },
+    {
+      "gt_label": "pad_4",
+      "det_label": "pad_4",
+      "iou": 0.8622,
+      "center_distance": 5.02,
+      "center_offset_pct": 0.0011,
+      "size_error_w": 0.0575,
+      "size_error_h": 0.0968,
+      "area_error_pct": 0.1598,
+      "quality": "excellent"
+    },
+    {
+      "gt_label": "pad_0",
+      "det_label": "pad_0",
+      "iou": 0.833,
+      "center_distance": 5.28,
+      "center_offset_pct": 0.0012,
+      "size_error_w": 0.0734,
+      "size_error_h": 0.1183,
+      "area_error_pct": 0.2004,
+      "quality": "excellent"
+    }
+  ],
+  "unmatched_gt": [],
+  "unmatched_det": []
+}

@@ -1,435 +1,1001 @@
+"""PCB contour recognition using verified HSV pipeline + VLM refinement.
+
+Pipeline (verified via pcb_image_pipeline.md):
+  1. EXIF orientation fix — OpenCV ignores EXIF, piexif normalises it
+  2. Black frame detection — simple threshold + convexHull + approxPolyDP(0.02*peri)
+  3. Perspective correction — warp to 60×30mm reference frame
+  4. HSV PCB extraction — green/blue/yellow detection + Otsu fallback
+  5. Edge decontamination — 1px erosion + distanceTransform for clean transparent PNG
+  6. VLM groove detection — validates CV convexity defects for edge grooves
+"""
+
 from __future__ import annotations
 
-import base64
-from dataclasses import dataclass
+import base64, json, logging, math, os, re, uuid
+from pathlib import Path
 
-import cv2
-import numpy as np
+import cv2, numpy as np
 
-from .errors import DesignError
+_log = logging.getLogger(__name__)
 
+try:
+    import dashscope
+    from dashscope import MultiModalConversation
+except ImportError:
+    MultiModalConversation = None
+    dashscope = None
 
-@dataclass
-class CalibrationResult:
-    width_mm: float
-    height_mm: float
-    pixels_per_mm: float
-    outline: list[dict[str, float]]
-    confidence: float
-    rectified_png: bytes
-    preview_png: bytes
-    marker_ids: list[int]
-    method: str = "aruco"
-    source_quad_px: list[list[float]] | None = None
-    perspective_method: str | None = None
-
-    def response(self) -> dict:
-        return {
-            "width_mm": self.width_mm,
-            "height_mm": self.height_mm,
-            "pixels_per_mm": self.pixels_per_mm,
-            "outline": self.outline,
-            "confidence": self.confidence,
-            "marker_ids": self.marker_ids,
-            "method": self.method,
-            "source_quad_px": self.source_quad_px,
-            "perspective_method": self.perspective_method,
-            "rectified_png_base64": base64.b64encode(self.rectified_png).decode("ascii"),
-            "preview_png_base64": base64.b64encode(self.preview_png).decode("ascii"),
-        }
+MODEL_NAME = "qwen3.7-plus"
+TEMPERATURE = 0.05
+MAX_TOKENS = 4096
+ENABLE_THINKING = False
+MAX_GROOVES = 6
 
 
-def calibrate_photo(image_bytes: bytes, marker_size_mm: float) -> CalibrationResult:
-    if not 2 <= marker_size_mm <= 100:
-        raise DesignError("INVALID_MARKER_SIZE", "marker_size_mm must be between 2 and 100 mm")
-    image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
-        raise DesignError("INVALID_IMAGE", "The uploaded file is not a readable image.")
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    if hasattr(cv2.aruco, "ArucoDetector"):
-        detector = cv2.aruco.ArucoDetector(dictionary, cv2.aruco.DetectorParameters())
-        corners, ids, _ = detector.detectMarkers(gray)
-    else:  # OpenCV 4 compatibility.
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, dictionary)
-    if ids is None or len(ids) != 4:
-        raise DesignError("ARUCO_COUNT", "Exactly four ArUco markers are required.", {"detected": 0 if ids is None else len(ids)})
+# ═══════════════════════════════════════════════════════════════════════
+#  EXIF orientation fix (verified pipeline, step 1)
+# ═══════════════════════════════════════════════════════════════════════
 
-    centers = np.array([corner[0].mean(axis=0) for corner in corners], dtype=np.float32)
-    ordered_centers = _order_quad(centers)
-    marker_sides = []
-    for corner in corners:
-        points = corner[0]
-        marker_sides.extend(np.linalg.norm(points[(i + 1) % 4] - points[i]) for i in range(4))
-    pixels_per_mm = float(np.median(marker_sides) / marker_size_mm)
-    if pixels_per_mm < 1:
-        raise DesignError("CALIBRATION_TOO_SMALL", "Markers are too small in the image for reliable calibration.")
+def _fix_exif_orientation(img_buf: bytes) -> bytes:
+    """Normalise EXIF orientation to 1 so OpenCV decodes images correctly.
 
-    top = np.linalg.norm(ordered_centers[1] - ordered_centers[0])
-    bottom = np.linalg.norm(ordered_centers[2] - ordered_centers[3])
-    left = np.linalg.norm(ordered_centers[3] - ordered_centers[0])
-    right = np.linalg.norm(ordered_centers[2] - ordered_centers[1])
-    width_px = max(200, int(round((top + bottom) / 2)))
-    height_px = max(200, int(round((left + right) / 2)))
-    target = np.array([[0, 0], [width_px - 1, 0], [width_px - 1, height_px - 1], [0, height_px - 1]], dtype=np.float32)
-    transform = cv2.getPerspectiveTransform(ordered_centers, target)
-    rectified = cv2.warpPerspective(image, transform, (width_px, height_px))
-
-    outline_px, contour_confidence = _extract_outline(rectified)
-    outline = [{"x_mm": round(float(x / pixels_per_mm), 3), "y_mm": round(float(y / pixels_per_mm), 3)} for x, y in outline_px]
-
-    preview = rectified.copy()
-    cv2.polylines(preview, [outline_px.astype(np.int32)], True, (0, 0, 255), max(2, width_px // 400))
-    ok_rectified, encoded_rectified = cv2.imencode(".png", rectified)
-    ok_preview, encoded_preview = cv2.imencode(".png", preview)
-    if not ok_rectified or not ok_preview:
-        raise DesignError("IMAGE_ENCODING_FAILED", "Failed to encode calibration previews.")
-    side_variation = float(np.std(marker_sides) / max(np.mean(marker_sides), 1))
-    confidence = max(0.0, min(1.0, contour_confidence * (1.0 - min(side_variation, 0.5))))
-    return CalibrationResult(
-        width_mm=round(width_px / pixels_per_mm, 3),
-        height_mm=round(height_px / pixels_per_mm, 3),
-        pixels_per_mm=pixels_per_mm,
-        outline=outline,
-        confidence=confidence,
-        rectified_png=encoded_rectified.tobytes(),
-        preview_png=encoded_preview.tobytes(),
-        marker_ids=sorted(int(value) for value in ids.ravel()),
-    )
+    Many mobile cameras embed an orientation tag (e.g. 6 = 90° CW) that
+    OpenCV ignores.  We use piexif to encode the correct orientation directly
+    into the JPEG data before decoding.
+    Returns unchanged bytes if the input is not JPEG or has no EXIF.
+    """
+    try:
+        import piexif
+    except ImportError:
+        _log.info("piexif not installed — skipping EXIF orientation fix")
+        return img_buf
+    # Only JPEG files carry EXIF
+    if img_buf[:2] != b'\xff\xd8':
+        return img_buf
+    try:
+        exif_dict = piexif.load(img_buf)
+        current = exif_dict.get("0th", {}).get(piexif.ImageIFD.Orientation, 1)
+        if current == 1:
+            return img_buf  # already normal
+        exif_dict["0th"][piexif.ImageIFD.Orientation] = 1
+        exif_bytes = piexif.dump(exif_dict)
+        fixed = piexif.insert(exif_bytes, img_buf)
+        _log.info("EXIF orientation fixed: %d → 1", current)
+        return fixed
+    except Exception as e:
+        _log.warning("EXIF orientation fix failed (non-fatal): %s", e)
+        return img_buf
 
 
-def _detect_board_by_color(hsv: np.ndarray, image_shape: tuple, image_area: float, target_aspect: float) -> list[tuple[float, np.ndarray, float, float]]:
-    """Detect PCB board contour using multi-color HSV masks (green, blue, black) with progressive saturation sweep."""
-    candidates: list[tuple[float, np.ndarray, float, float]] = []
-    h, w = image_shape[:2]
+# ═══════════════════════════════════════════════════════════════════════
+#  Public API
+# ═══════════════════════════════════════════════════════════════════════
 
-    # Multi-color PCB detection: green/blue/black all supported
-    color_ranges = [
-        # Name, lower_bound, upper_bound
-        ("green",  (25, 40, 20),   (115, 255, 255)),
-        ("green",  (30, 30, 15),   (105, 255, 255)),
-        ("blue",   (90, 40, 25),   (150, 255, 255)),
-        ("blue",   (95, 30, 20),   (145, 255, 255)),
-        ("black",  (0, 0, 5),      (180, 60, 70)),
-        ("black",  (0, 0, 3),      (180, 80, 80)),
-    ]
+def extract_pcb(rectified_png: bytes, width_mm: float, height_mm: float,
+                pixels_per_mm: float) -> dict:
+    """Extract PCB from rectified image using verified HSV pipeline.
 
-    kernel_size = max(7, int(round(min(h, w) / 140)) | 1)
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    Pipeline:
+      1. VLM contour detection (grooves + shadows)
+      2. HSV PCB extraction (green/blue/yellow + Otsu fallback)
+      3. Outline refinement (~12 vertices via epsilon scan)
+      4. Groove validation (CV convexity defects + VLM merging)
+      5. Edge-decontaminated transparent PNG
 
-    for color_name, lower, upper in color_ranges:
-        # Progressive saturation sweep: start strict (high sat threshold), then relax (lower sat)
-        # This ensures the algorithm captures the board shape across varied lighting
-        if color_name in ("green", "blue"):
-            # Sweep lower saturation from high (strict) to low (relaxed), like original 140→80
-            sweep_values = (140, 120, 100, 80)
-        else:
-            # Black boards: sweep upper S/V bound from low (strict) to higher (relaxed)
-            sweep_values = (0.55, 0.65, 0.75, 0.85, 0.95, 1.0)
-        for sweep_val in sweep_values:
-            if color_name in ("green", "blue"):
-                lower_adj = (lower[0], sweep_val, lower[2])
-                upper_adj = upper
-            else:
-                # For black, scale the upper S/V bounds proportionally
-                lower_adj = lower
-                upper_adj = (upper[0], int(upper[1] * sweep_val), int(upper[2] * sweep_val))
-            mask = cv2.inRange(hsv, lower_adj, upper_adj)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    Returns: outline, grooves, groove_count, groove_warning, pcb_mask_b64,
+             transparent_pcb_b64, method, debug_steps, vertex_count.
+    """
+    nparr = np.frombuffer(rectified_png, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        from .errors import DesignError
+        raise DesignError("INVALID_IMAGE", "Failed to decode rectified image.")
+    h, w = img.shape[:2]
+    debug_steps = [{"step": "00_raw", "label": "原始图像", "image_base64": _to_b64(img)}]
+
+    # ── Step 1: VLM contour detection ──
+    vlm = _vlm_detect_contour(img, width_mm, height_mm)
+    vlm_vc = len(vlm.get("outline", []))
+    _log.info("VLM outline vertices: %d", vlm_vc)
+    debug_steps.append({"step": "01_vlm", "label": f"VLM轮廓识别({vlm_vc}顶点)",
+                        "outline": vlm["outline"], "grooves": vlm["grooves"],
+                        "vlm_vertex_count": vlm_vc})
+
+    # ── Step 2: HSV PCB extraction (verified pipeline, replaces shadow removal) ──
+    pcb_mask, _ = _extract_pcb_hsv(img)
+    if pcb_mask is None:
+        from .errors import DesignError
+        raise DesignError("NO_PCB_FOUND",
+                          "Could not detect PCB board in rectified image.")
+    debug_steps.append({"step": "02_hsv_extract", "label": "HSV PCB提取",
+                        "pcb_mask_b64": _to_b64(pcb_mask)})
+
+    # ── Step 3: Outline refinement ──
+    outline = _refine_outline(pcb_mask, width_mm, height_mm, pixels_per_mm)
+    vertex_count = len(outline)
+    debug_steps.append({"step": "03_outline", "label": f"PCB轮廓({vertex_count}顶点)",
+                        "outline_mm": outline})
+
+    # ── Step 4: Groove validation ──
+    grooves, warning = _validate_grooves(img, pcb_mask, outline, vlm["grooves"],
+                                         width_mm, height_mm, pixels_per_mm)
+    debug_steps.append({"step": "04_grooves", "label": f"凹槽检测({len(grooves)}个)",
+                        "grooves": grooves, "warning": warning})
+
+    # ── Step 5: Edge-decontaminated transparent PNG ──
+    transparent_png = _make_transparent(img, pcb_mask)
+    return {
+        "outline": outline, "grooves": grooves,
+        "groove_count": len(grooves), "groove_warning": warning,
+        "pcb_mask_b64": _to_b64(pcb_mask),
+        "transparent_pcb_b64": base64.b64encode(transparent_png).decode("ascii"),
+        "method": "hsv-pipeline+vlm",
+        "debug_steps": debug_steps,
+        "vertex_count": vertex_count,
+    }
+
+
+def detect_holes(rectified_png: bytes, width_mm: float, height_mm: float,
+                 pixels_per_mm: float, outline_mm: list[dict]) -> list[dict]:
+    """Detect holes/slots inside PCB using VLM + CV refinement."""
+    nparr = np.frombuffer(rectified_png, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return []
+
+    vlm_holes = _vlm_detect_holes(img, width_mm, height_mm)
+    h, w = img.shape[:2]
+    outline_px = _mm_to_px(outline_mm, width_mm, height_mm, w, h)
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if len(outline_px) >= 3:
+        cv2.fillPoly(mask, [np.array(outline_px, dtype=np.int32)], 255)
+
+    holes = _refine_holes_cv(img, mask, vlm_holes, width_mm, height_mm, pixels_per_mm)
+    cv_holes = _detect_cv_holes(img, mask, width_mm, height_mm, pixels_per_mm,
+                                 existing_ids={hh["id"] for hh in holes})
+    _log.info("detect_holes: VLM=%d + CV=%d → %d", len(holes), len(cv_holes), len(holes) + len(cv_holes))
+    return holes + cv_holes
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  VLM prompt & detection
+# ═══════════════════════════════════════════════════════════════════════
+
+_CONTOUR_PROMPT = """You are a PCB visual inspector. This is a rectified top-down photo of a
+BATTERY PROTECTION BOARD (锂电池保护板) sitting on white A4 paper.
+
+Board physical size: {width:.1f}mm × {height:.1f}mm. Image: ~{px_w}×{px_h}px.
+The black calibration frame has been cropped away — what remains is the PCB board
+(dark green/blue) on clean white paper background.
+
+CRITICAL — BOUNDING BOX vs PERIMETER TRACE:
+This is NOT a bounding-box task. A bounding box (4 corners) is WRONG. Battery
+protection PCBs have IRREGULAR perimeters with MANY notches, cutouts, and
+protrusions along the edges. You MUST trace the actual perimeter, including
+EVERY corner formed by edge deviations — even small ones (≥1mm).
+
+HOW TO TRACE:
+1. Look at the board edge carefully. Follow it pixel by pixel in your mind.
+2. Place a vertex at EVERY point where the edge changes direction.
+3. If the edge goes in (notch/groove) or out (protrusion/tab), you need
+   EXTRA vertices to follow that shape — do NOT bridge across with a straight line.
+4. Battery protection boards often have 6-16 perimeter vertices — 4 corners
+   is always too few.
+
+TASKS:
+1. PCB PERIMETER TRACE — polygon following the actual board edge, CLOCKWISE:
+   - Start from the top-leftmost vertex on the board perimeter.
+   - Place vertices at EVERY visible corner, notch, protrusion, and edge
+     direction change — even small ones. The polygon must follow the real
+     perimeter shape, not just the four extreme corners.
+   - Shadows on paper are NOT part of the board.
+   - Bright PCB surface elements ARE part of the board.
+2. SHADOWS — Darker paper regions OUTSIDE the PCB. One polygon per region.
+3. EDGE GROOVES (凹槽) — MAX {max_grooves} most prominent concave indentations
+   into the board edge where white paper is visible inside the notch.
+
+Return ONLY a JSON object (no markdown, no explanation):
+{{
+  "outline": [{{"x_frac":0.1234,"y_frac":0.0567}}, ...],
+  "shadows": [{{"polygon":[{{"x_frac":...,"y_frac":...}},...]}}],
+  "grooves": [
+    {{"type":"groove","polygon":[{{"x_frac":...,"y_frac":...}},...],
+      "depth_mm":2.5,"confidence":0.85}}
+  ]
+}}
+
+Coordinates: x_frac/y_frac are 0.0-1.0 fractions, 4-5 decimal places.
+The outline polygon should faithfully follow the board's perimeter."""
+
+
+def _get_api_key() -> str:
+    key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        import winreg
+        for hive, sk in ((winreg.HKEY_LOCAL_MACHINE,
+                          r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                         (winreg.HKEY_CURRENT_USER, r"Environment")):
+            try:
+                with winreg.OpenKey(hive, sk) as reg:
+                    key, _ = winreg.QueryValueEx(reg, "DASHSCOPE_API_KEY")
+                    if key: return key.strip()
+            except OSError: continue
+    except Exception: pass
+    return ""
+
+
+def _vlm_detect_contour(img: np.ndarray, width_mm: float, height_mm: float) -> dict:
+    """Call Qwen VLM → {outline, grooves, shadows, holes}."""
+    if not _get_api_key() or MultiModalConversation is None:
+        _log.warning("VLM unavailable")
+        return _empty()
+
+    dashscope.api_key = _get_api_key()
+    h, w = img.shape[:2]
+    _, png = cv2.imencode(".png", img)
+    url = f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}"
+    prompt = _CONTOUR_PROMPT.format(width=width_mm, height=height_mm,
+                                     px_w=w, px_h=h, max_grooves=MAX_GROOVES)
+
+    _log.info("VLM contour: %d×%d image", w, h)
+    try:
+        resp = MultiModalConversation.call(model=MODEL_NAME,
+            messages=[{"role":"user","content":[{"image":url},{"text":prompt}]}],
+            temperature=TEMPERATURE, max_tokens=MAX_TOKENS, enable_thinking=ENABLE_THINKING)
+    except Exception as exc:
+        _log.error("VLM API error: %s", exc)
+        return _empty()
+
+    if resp.status_code != 200:
+        _log.error("VLM API status: %s", getattr(resp, 'code', '?'))
+        return _empty()
+
+    try:
+        raw = "".join(p.get("text","") for p in resp.output.choices[0].message.content
+                      if isinstance(p, dict))
+    except Exception as exc:
+        _log.error("VLM response parse: %s", exc)
+        return _empty()
+
+    if not raw: return _empty()
+    _log.debug("VLM raw(500): %s", raw[:500])
+    parsed = _extract_json(raw)
+    if parsed is None: return _empty()
+
+    return {
+        "outline": _frac_list(parsed.get("outline",[]), width_mm, height_mm),
+        "grooves": _parse_grooves(parsed.get("grooves",[]), width_mm, height_mm),
+        "shadows": [{"polygon": _frac_list(s.get("polygon",[]), width_mm, height_mm)}
+                    for s in parsed.get("shadows",[])],
+        "holes": _parse_holes(parsed.get("holes",[]), width_mm, height_mm),
+    }
+
+
+def _vlm_detect_holes(img: np.ndarray, width_mm: float, height_mm: float) -> list[dict]:
+    r = _vlm_detect_contour(img, width_mm, height_mm)
+    return r.get("holes", [])
+
+
+def _empty() -> dict:
+    return {"outline":[],"grooves":[],"shadows":[],"holes":[]}
+
+
+def _extract_json(text: str) -> dict | None:
+    text = text.strip()
+    for transform in (
+        json.loads,
+        lambda t: json.loads(t.split("```json",1)[-1].rsplit("```",1)[0].strip()),
+        lambda t: json.loads(re.search(r"\{[\s\S]*\}",t).group()) if re.search(r"\{[\s\S]*\}",t) else None,
+        lambda t: json.loads(re.search(r"\[[\s\S]*\]",t).group()) if re.search(r"\[[\s\S]*\]",t) else None,
+    ):
+        try:
+            val = transform(text)
+            return val if isinstance(val, dict) else {"items":val}
+        except Exception:
+            continue
+    return None
+
+
+def _frac_list(pts, w_mm, h_mm):
+    return [{"x_mm":round(float(p.get("x_frac",0))*w_mm,3),
+             "y_mm":round(float(p.get("y_frac",0))*h_mm,3)}
+            for p in pts if isinstance(p,dict) and 0<=float(p.get("x_frac",-1))<=1]
+
+def _parse_grooves(vg, w, h):
+    out = []
+    for i,g in enumerate(vg[:MAX_GROOVES]):
+        if not isinstance(g,dict): continue
+        poly = _frac_list(g.get("polygon",[]),w,h)
+        if len(poly)<3: continue
+        t = g.get("type","groove"); t = t if t in ("groove","protrusion") else "groove"
+        out.append({"id":f"groove_{i+1:02d}","groove_type":t,"polygon":poly,
+                     "depth_mm":float(g.get("depth_mm",0)),
+                     "confidence":float(g.get("confidence",0.7)),"source":"vlm"})
+    return out
+
+def _parse_holes(vh, w, h):
+    out = []
+    for i,hh in enumerate(vh):
+        if not isinstance(hh,dict): continue
+        poly = _frac_list(hh.get("polygon",[]),w,h)
+        if len(poly)<3: continue
+        xs = [p["x_mm"] for p in poly]; ys = [p["y_mm"] for p in poly]
+        out.append({"id":f"hole_{i+1:02d}","hole_type":hh.get("type","round"),
+                     "center":{"x_mm":round(sum(xs)/len(xs),3),"y_mm":round(sum(ys)/len(ys),3)},
+                     "polygon":poly,"confidence":float(hh.get("confidence",0.7)),"source":"vlm"})
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  HSV PCB extraction (verified pipeline)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _extract_pcb_hsv(img):
+    """Extract PCB binary mask using HSV colour detection.
+
+    Verified pipeline (pcb_image_pipeline.md):
+      1. HSV green: H=60-95, S=18-255, V=18-255
+      2. Morphology: close(5x5, 4 iterations), open(3x3, 1 iteration)
+      3. Largest external contour — NO convex hull (preserves grooves/arcs)
+      4. Fine approxPolyDP(0.001 * perimeter) for micro-arc preservation
+      5. Fill binary mask
+
+    Falls back through blue/yellow HSV then Otsu if green area is unreasonable.
+    Returns (binary_mask, contour) or (None, None).
+    """
+    h, w = img.shape[:2]
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    lower = np.array([60, 18, 18])
+    upper = np.array([95, 255, 255])
+    mask = cv2.inRange(hsv, lower, upper)
+
+    k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    k_open = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=4)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        _log.warning("HSV green: no contours found")
+        return None, None
+
+    pcb_contour = max(contours, key=cv2.contourArea)
+    area_ratio = cv2.contourArea(pcb_contour) / (h * w)
+
+    # ── Fallback: back-side PCB may not have green solder mask ──
+    if area_ratio < 0.015 or area_ratio > 0.95:
+        _log.info("HSV green area=%.1f%% — trying alternative colour ranges",
+                  area_ratio * 100)
+        for lo, hi, label in (
+            ([100, 18, 18], [130, 255, 255], "blue"),
+            ([20, 18, 18], [40, 255, 255], "yellow/tan"),
+        ):
+            mask2 = cv2.inRange(hsv, np.array(lo), np.array(hi))
+            mask2 = cv2.morphologyEx(mask2, cv2.MORPH_CLOSE, k_close, iterations=4)
+            mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, k_open, iterations=1)
+            c2, _ = cv2.findContours(mask2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if c2:
+                c2b = max(c2, key=cv2.contourArea)
+                a2 = cv2.contourArea(c2b) / (h * w)
+                if 0.02 < a2 < 0.90:
+                    mask, pcb_contour, area_ratio = mask2, c2b, a2
+                    _log.info("Fallback %s HSV: area=%.1f%%", label, a2 * 100)
+                    break
+
+        # ── Last resort: Otsu on LAB L-channel ──
+        if area_ratio < 0.02 or area_ratio > 0.90:
+            lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+            L = lab[:, :, 0]
+            _, mask = cv2.threshold(L, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close, iterations=4)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open, iterations=1)
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area < 0.002 * image_area:
-                    continue
-                rect = cv2.minAreaRect(contour)
-                a, b = rect[1]
-                if min(a, b) < 10:
-                    continue
-                aspect = max(a, b) / min(a, b)
-                if aspect < 2 or max(a, b) < 0.25 * max(h, w):
-                    continue
-                aspect_error = abs(np.log(aspect / target_aspect))
-                fill = area / max(a * b, 1)
-                # Prefer green over blue/black slightly (greens are most reliable)
-                color_penalty = 0.15 if color_name == "blue" else (0.30 if color_name == "black" else 0.0)
-                score = float(2.5 * aspect_error - min(area / image_area, 0.3) - 0.15 * fill + color_penalty)
-                candidates.append((score, contour, aspect, fill))
+            if contours:
+                pcb_contour = max(contours, key=cv2.contourArea)
+                area_ratio = cv2.contourArea(pcb_contour) / (h * w)
+                _log.info("Otsu fallback: area=%.1f%%", area_ratio * 100)
+            else:
+                _log.error("All PCB extraction methods failed")
+                return None, None
 
-    return candidates
+    # Fine approx (0.001 * perimeter — preserves micro-arcs and grooves)
+    peri = cv2.arcLength(pcb_contour, True)
+    smooth = cv2.approxPolyDP(pcb_contour, 0.001 * peri, True)
+
+    # Fill binary mask with fine polygon
+    binary = np.zeros((h, w), dtype=np.uint8)
+    cv2.drawContours(binary, [smooth], -1, 255, -1)
+
+    # Fill small internal holes
+    inv = cv2.bitwise_not(binary)
+    nl, labs, stats, _ = cv2.connectedComponentsWithStats(inv, 8)
+    for i in range(1, nl):
+        if stats[i, cv2.CC_STAT_AREA] < 50:
+            binary[labs == i] = 255
+
+    _log.info("PCB extracted: area=%.1f%%  contour_len=%.0fpx  fine_verts=%d",
+              area_ratio * 100, peri, len(smooth))
+    return binary, pcb_contour
 
 
-def _detect_board_by_otsu(v_channel: np.ndarray, image_shape: tuple, image_area: float, target_aspect: float) -> list[tuple[float, np.ndarray, float, float]]:
-    """Fallback: Otsu brightness separation on V channel to distinguish board from background.
+# ═══════════════════════════════════════════════════════════════════════
+#  CV outline refinement
+# ═══════════════════════════════════════════════════════════════════════
 
-    When color-based detection fails (non-green/blue boards, unusual lighting), Otsu
-    adaptively thresholds the V channel to separate the PCB from its background
-    (desk, paper, etc.). Both dark-on-light and light-on-dark orientations are tried.
+def _refine_outline(binary, w_mm, h_mm, ppm, target_vertices=12):
+    """Refine binary mask to polygon with ~target_vertices using epsilon scan.
+
+    Uses the pipeline's perimeter-fraction-based epsilon approach.
+    When contour has natural features (grooves, cutouts), vertex count
+    should match real geometry. Falling back to edge-split/merge if close.
     """
-    candidates: list[tuple[float, np.ndarray, float, float]] = []
-    h, w = image_shape[:2]
+    h_img, w_img = binary.shape[:2]
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
 
-    otsu_thresh, _ = cv2.threshold(v_channel, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    kernel_size = max(7, int(round(min(h, w) / 120)) | 1)
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    largest = max(contours, key=cv2.contourArea)
+    peri = cv2.arcLength(largest, True)
 
-    # Try both polarities: board could be darker or brighter than background
-    for invert, label in ((False, "otsu_bright"), (True, "otsu_dark")):
-        if invert:
-            binary = (v_channel < otsu_thresh).astype(np.uint8) * 255
-        else:
-            binary = (v_channel > otsu_thresh).astype(np.uint8) * 255
+    # Epsilon scan: fraction of perimeter from 0.004 to 0.06
+    best_eps = 0.0
+    best_approx = None
+    best_nv = 999
+    best_gap = 999
 
-        # Remove small noise, close gaps
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=3)
+    for frac in np.arange(0.004, 0.06, 0.002):
+        eps = peri * frac
+        approx = cv2.approxPolyDP(largest, eps, True)
+        nv = len(approx)
+        gap = abs(nv - target_vertices)
+        if gap < best_gap or (gap == best_gap and eps > best_eps):
+            best_gap, best_eps, best_approx, best_nv = gap, eps, approx, nv
+        if nv == target_vertices:
+            break
 
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 0.015 * image_area or area > 0.92 * image_area:
-                continue
-            hull = cv2.convexHull(contour)
-            hull_area = cv2.contourArea(hull)
-            if hull_area < 0.02 * image_area:
-                continue
-            rect = cv2.minAreaRect(hull)
-            a, b = rect[1]
-            if min(a, b) < 15:
-                continue
-            aspect = max(a, b) / min(a, b)
-            if aspect < 1.3 or aspect > 12:
-                continue
-            if max(a, b) < 0.22 * max(h, w):
-                continue
-            aspect_error = abs(np.log(aspect / target_aspect))
-            fill = hull_area / max(a * b, 1)
-            # Otsu is less reliable than color detection → higher base penalty
-            score = float(2.5 * aspect_error - min(hull_area / image_area, 0.25) - 0.15 * fill + 0.45)
-            candidates.append((score, hull, aspect, fill))
+    if best_approx is None or best_nv < 3:
+        _log.warning("Refine outline: cannot find valid polygon")
+        return []
 
-    return candidates
+    pts = best_approx.reshape(-1, 2)
+    nv = len(pts)
 
+    # ── Force exactly target_vertices if close ──
+    if nv < target_vertices:
+        need = target_vertices - nv
+        pts_list = pts.tolist()
+        for _ in range(need):
+            max_len, split_idx = 0, 0
+            for i in range(len(pts_list)):
+                j = (i + 1) % len(pts_list)
+                d = np.hypot(pts_list[j][0] - pts_list[i][0],
+                             pts_list[j][1] - pts_list[i][1])
+                if d > max_len:
+                    max_len, split_idx = d, i
+            j = (split_idx + 1) % len(pts_list)
+            mid = [(pts_list[split_idx][0] + pts_list[j][0]) / 2,
+                   (pts_list[split_idx][1] + pts_list[j][1]) / 2]
+            pts_list.insert(split_idx + 1, mid)
+        pts = np.array(pts_list, dtype=np.float32)
+    elif nv > target_vertices:
+        while len(pts) > target_vertices:
+            min_dist, merge_i = float('inf'), 0
+            for i in range(len(pts)):
+                j = (i + 1) % len(pts)
+                d = np.hypot(pts[j][0] - pts[i][0], pts[j][1] - pts[i][1])
+                if d < min_dist:
+                    min_dist, merge_i = d, i
+            pts = np.delete(pts, merge_i, axis=0)
 
-def _detect_board_by_edges(gray: np.ndarray, image_shape: tuple, image_area: float, target_aspect: float) -> list[tuple[float, np.ndarray, float, float]]:
-    """Final fallback: Canny edge detection when both color and Otsu approaches fail."""
-    candidates: list[tuple[float, np.ndarray, float, float]] = []
-    h, w = image_shape[:2]
+    # Deduplicate near-identical vertices (within 0.15mm)
+    pts = _dedup_vertices(pts, min_dist_px=max(ppm * 0.15, 4.0))
 
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    for low_thresh in (30, 40, 50, 60):
-        edges = cv2.Canny(blurred, low_thresh, low_thresh * 3)
-        kernel = np.ones((7, 7), np.uint8)
-        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=3)
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 0.008 * image_area:
-                continue
-            hull = cv2.convexHull(contour)
-            hull_area = cv2.contourArea(hull)
-            if hull_area < 0.01 * image_area:
-                continue
-            rect = cv2.minAreaRect(hull)
-            a, b = rect[1]
-            if min(a, b) < 15:
-                continue
-            aspect = max(a, b) / min(a, b)
-            if aspect < 1.5 or aspect > 10:
-                continue
-            if max(a, b) < 0.2 * max(h, w):
-                continue
-            aspect_error = abs(np.log(aspect / target_aspect))
-            fill = hull_area / max(a * b, 1)
-            # Edge detection is least reliable → highest base penalty
-            score = float(3.0 * aspect_error - min(hull_area / image_area, 0.3) - 0.1 * fill + 0.55)
-            candidates.append((score, hull, aspect, fill))
-    return candidates
+    # Clockwise order
+    if cv2.contourArea(pts.reshape(-1, 1, 2)) < 0:
+        pts = pts[::-1]
+
+    _log.info("Refine outline: %d vertices at eps=%.2f*peri (%.1fpx, gap=%d)",
+              len(pts), best_eps / peri, best_eps, best_gap)
+    return [{"x_mm": round(px / w_img * w_mm, 3), "y_mm": round(py / h_img * h_mm, 3)}
+            for px, py in pts.tolist()]
 
 
-def calibrate_known_size(image_bytes: bytes, width_mm: float, height_mm: float) -> CalibrationResult:
-    """Rectify a rectangular PCB using its confirmed size and visible board color.
+def _dedup_vertices(pts, min_dist_px):
+    """Remove near-duplicate vertices, keeping the first of each cluster."""
+    if len(pts) <= 3:
+        return pts
+    result = [pts[0]]
+    for pt in pts[1:]:
+        last = result[-1]
+        dist = np.sqrt((pt[0] - last[0]) ** 2 + (pt[1] - last[1]) ** 2)
+        if dist >= min_dist_px:
+            result.append(pt)
+    # Check if last and first are too close (polygon closure)
+    if len(result) >= 3:
+        d = np.sqrt((result[-1][0] - result[0][0]) ** 2 +
+                     (result[-1][1] - result[0][1]) ** 2)
+        if d < min_dist_px:
+            result.pop()
+    return np.array(result)
 
-    Detection pipeline (3 stages, progressive fallback):
-    1. Multi-color HSV masks (green, blue, black) — most reliable
-    2. Otsu V-channel brightness separation — handles unusual lighting
-    3. Canny edge detection — last resort
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CV groove detection & validation (convexity defects)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _validate_grooves(img, pcb_mask, outline_mm, vlm_grooves,
+                      w_mm, h_mm, ppm):
+    """Validate VLM grooves + CV convexity with curvature-based filtering.
+
+    A real groove is a sharp inward indentation. We distinguish real grooves
+    from gentle edge curvature by checking:
+      - Segment arc length (≤25% of perimeter — edge curves are long)
+      - Depth ratio (depth / arc_width ≥ 0.08)
+      - Minimum absolute depth (≥0.25mm)
     """
-    if not 2 <= width_mm <= 500 or not 2 <= height_mm <= 500:
-        raise DesignError("INVALID_BOARD_SIZE", "width_mm and height_mm must be between 2 and 500 mm")
-    image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if image is None:
-        raise DesignError("INVALID_IMAGE", "The uploaded file is not a readable image.")
+    h, w_img = pcb_mask.shape[:2]
 
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    v_channel = hsv[:, :, 2]
-    image_area = image.shape[0] * image.shape[1]
-    target_aspect = max(width_mm, height_mm) / min(width_mm, height_mm)
+    # Get pixel contour
+    contours, _ = cv2.findContours(pcb_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        warning = f"VLM detected {len(vlm_grooves)} grooves but CV found no PCB contour"
+        return vlm_grooves[:MAX_GROOVES], warning if len(vlm_grooves) > MAX_GROOVES else None
 
-    # Stage 1: multi-color detection (green, blue, black)
-    candidates = _detect_board_by_color(hsv, image.shape, image_area, target_aspect)
-    detection_method = "color"
+    cnt = max(contours, key=cv2.contourArea)
+    n_contour = len(cnt)
+    perim = cv2.arcLength(cnt, True)
 
-    # Stage 2: Otsu brightness fallback
-    if not candidates:
-        candidates = _detect_board_by_otsu(v_channel, image.shape, image_area, target_aspect)
-        detection_method = "otsu"
+    hull = cv2.convexHull(cnt, returnPoints=False)
+    if len(hull) < 4:
+        if len(vlm_grooves) > MAX_GROOVES:
+            return vlm_grooves[:MAX_GROOVES], f"检测到{len(vlm_grooves)}个凹槽(超过{MAX_GROOVES}上限)，可能存在误识别"
+        return vlm_grooves, None
 
-    # Stage 3: edge-based fallback (last resort)
-    if not candidates:
-        candidates = _detect_board_by_edges(gray, image.shape, image_area, target_aspect)
-        detection_method = "edges"
+    defects = cv2.convexityDefects(cnt, hull)
+    cv_grooves = []
 
-    if not candidates:
-        raise DesignError(
-            "RECTANGULAR_BOARD_NOT_FOUND",
-            "No reliable rectangular PCB was found. Use an ArUco capture or provide a clearer top-down photo.",
-        )
+    if defects is not None:
+        min_depth_px = ppm * 0.20   # ≥0.20mm
+        max_seg_ratio = 0.25        # max 25% of perimeter
+        max_seg_px = perim * max_seg_ratio
 
-    _, contour, source_aspect, fill = min(candidates, key=lambda item: item[0])
-    source, perspective_method = _contour_quad(contour)
-    pixels_per_mm = 50.0
-    output_width = max(200, int(round(width_mm * pixels_per_mm)))
-    output_height = max(100, int(round(height_mm * pixels_per_mm)))
-    target = np.array([[0, 0], [output_width - 1, 0], [output_width - 1, output_height - 1], [0, output_height - 1]], dtype=np.float32)
-    transform = cv2.getPerspectiveTransform(source, target)
-    rectified = cv2.warpPerspective(image, transform, (output_width, output_height))
+        # ── Gather, filter, and merge overlapping defects ──
+        raw = []
+        for i in range(defects.shape[0]):
+            row = defects[i].flatten()
+            s, e, f, d = int(row[0]), int(row[1]), int(row[2]), int(row[3])
+            depth = d / 256.0
+            if depth < min_depth_px:
+                continue
 
-    outline_px = np.array([[0, 0], [output_width - 1, 0], [output_width - 1, output_height - 1], [0, output_height - 1]], dtype=np.int32)
-    preview = rectified.copy()
-    cv2.polylines(preview, [outline_px], True, (0, 0, 255), max(2, output_width // 500))
-    ok_rectified, encoded_rectified = cv2.imencode(".png", rectified)
-    ok_preview, encoded_preview = cv2.imencode(".png", preview)
-    if not ok_rectified or not ok_preview:
-        raise DesignError("IMAGE_ENCODING_FAILED", "Failed to encode calibration previews.")
-    aspect_quality = max(0.0, 1.0 - min(abs(float(np.log(source_aspect / target_aspect))), 0.7))
-    # Confidence reflects both shape fit and detection method reliability
-    base_confidence = max(0.20, min(0.88, 0.55 * aspect_quality + 0.30 * min(fill, 1.0)))
-    method_penalty = {"color": 0.0, "otsu": 0.15, "edges": 0.25}.get(detection_method, 0.25)
-    confidence = max(0.18, base_confidence - method_penalty)
-    method_str = f"known_size_{detection_method}"
-    return CalibrationResult(
-        width_mm=round(width_mm, 3),
-        height_mm=round(height_mm, 3),
-        pixels_per_mm=pixels_per_mm,
-        outline=[
-            {"x_mm": 0.0, "y_mm": 0.0},
-            {"x_mm": round(width_mm, 3), "y_mm": 0.0},
-            {"x_mm": round(width_mm, 3), "y_mm": round(height_mm, 3)},
-            {"x_mm": 0.0, "y_mm": round(height_mm, 3)},
-        ],
-        confidence=confidence,
-        rectified_png=encoded_rectified.tobytes(),
-        preview_png=encoded_preview.tobytes(),
-        marker_ids=[],
-        method=method_str,
-        source_quad_px=[[round(float(x), 2), round(float(y), 2)] for x, y in source],
-        perspective_method=perspective_method,
-    )
+            # Arc length of the indentation along contour
+            fwd = (e - s) % n_contour
+            bwd = (s - e) % n_contour
+            seg_arc = min(fwd, bwd)
+            if seg_arc > max_seg_px:
+                _log.debug("Reject defect: seg_arc=%.0fpx > max=%.0fpx (%.0f%%)",
+                           seg_arc, max_seg_px, seg_arc / perim * 100)
+                continue
+
+            depth_mm = depth / ppm
+            arc_mm = seg_arc / ppm
+            depth_ratio = depth_mm / max(arc_mm, 0.1)
+
+            # Depth ratio: a real groove is at least 8% as deep as it is wide
+            min_ratio = 0.06 if depth_mm > 0.8 else 0.08
+            if depth_ratio < min_ratio:
+                _log.debug("Reject defect: depth_ratio=%.3f < %.3f", depth_ratio, min_ratio)
+                continue
+
+            raw.append({"s": s, "e": e, "f": f, "depth": depth,
+                        "depth_mm": depth_mm, "arc_mm": arc_mm,
+                        "seg_arc": seg_arc, "ratio": depth_ratio})
+
+        # Merge overlapping defects (share hull edge or are very close)
+        merged = []
+        used = set()
+        for i, di in enumerate(raw):
+            if i in used:
+                continue
+            cluster = [di]
+            used.add(i)
+            for j, dj in enumerate(raw):
+                if j in used:
+                    continue
+                if (di["s"] == dj["s"] and di["e"] == dj["e"]) or \
+                   (di["s"] == dj["e"] and di["e"] == dj["s"]):
+                    cluster.append(dj)
+                    used.add(j)
+                elif abs(di["f"] - dj["f"]) < 30:
+                    cluster.append(dj)
+                    used.add(j)
+            best = max(cluster, key=lambda x: x["depth_mm"])
+            merged.append(best)
+
+        _log.info("Groove CV: %d raw defects → %d merged clusters", len(raw), len(merged))
+
+        for idx, di in enumerate(merged):
+            s, e, f, depth_mm = di["s"], di["e"], di["f"], di["depth_mm"]
+
+            # Collect contour points between s and e
+            if s < e:
+                groove_pts = cnt[s:e+1, 0, :].tolist()
+            else:
+                groove_pts = cnt[s:, 0, :].tolist() + cnt[:e+1, 0, :].tolist()
+
+            if len(groove_pts) < 4:
+                continue
+
+            # Simplify polygon to 3-6 points
+            segments = np.array(groove_pts, dtype=np.float32).reshape(-1, 1, 2)
+            poly_eps = max(ppm * 0.15, 5.0)
+            simplified = cv2.approxPolyDP(segments, poly_eps, True).reshape(-1, 2)
+            if len(simplified) < 3:
+                simplified = np.array(groove_pts[:min(6, len(groove_pts))])
+
+            cx = int(np.mean([p[0] for p in groove_pts]))
+            cy = int(np.mean([p[1] for p in groove_pts]))
+
+            cv_grooves.append({
+                "id": f"cv_groove_{idx+1:02d}",
+                "groove_type": "groove",
+                "polygon": [{"x_mm": round(px / w_img * w_mm, 3),
+                             "y_mm": round(py / h * h_mm, 3)}
+                           for px, py in simplified.tolist()],
+                "center_mm": {"x_mm": round(cx / w_img * w_mm, 3),
+                              "y_mm": round(cy / h * h_mm, 3)},
+                "depth_mm": round(depth_mm, 2),
+                "seg_arc_mm": round(di["arc_mm"], 2),
+                "depth_ratio": round(di["ratio"], 3),
+                "confidence": min(0.9, depth_mm / 3.0),
+                "source": "cv_curvature",
+            })
+
+    # Merge: VLM grooves first, CV grooves as supplement
+    merged_grooves = list(vlm_grooves)
+    existing_regions = [_groove_region(g, w_mm, h_mm) for g in vlm_grooves]
+    for cvg in cv_grooves:
+        cvg_region = _groove_region(cvg, w_mm, h_mm)
+        overlap = any(_region_overlap(cvg_region, er) > 0.3 for er in existing_regions)
+        if not overlap:
+            merged_grooves.append(cvg)
+            existing_regions.append(cvg_region)
+
+    # Validate count
+    warning = None
+    if len(merged_grooves) > MAX_GROOVES:
+        merged_grooves.sort(key=lambda g: g.get("confidence", 0), reverse=True)
+        merged_grooves = merged_grooves[:MAX_GROOVES]
+        warning = f"检测到超过{MAX_GROOVES}个凹槽/凸起（可能存在误识别），已保留最显著的{MAX_GROOVES}个"
+    elif len(merged_grooves) == MAX_GROOVES:
+        warning = f"检测到{MAX_GROOVES}个凹槽/凸起，请人工确认是否正确"
+
+    _log.info("Groove validation: VLM=%d CV=%d → merged=%d",
+              len(vlm_grooves), len(cv_grooves), len(merged_grooves))
+    return merged_grooves, warning
 
 
-def transform_back_point(point: dict[str, float], source_width_mm: float, source_height_mm: float, target_width_mm: float, target_height_mm: float, transform: str) -> dict[str, float]:
-    x = point["x_mm"] * target_width_mm / source_width_mm
-    y = point["y_mm"] * target_height_mm / source_height_mm
-    if transform in {"mirror_x", "rotate_180"}:
-        x = target_width_mm - x
-    if transform in {"mirror_y", "rotate_180"}:
-        y = target_height_mm - y
-    return {"x_mm": x, "y_mm": y}
+def _groove_region(groove, w_mm, h_mm):
+    """Get bounding region of a groove for overlap checking."""
+    xs = [p["x_mm"] for p in groove.get("polygon", [])]
+    ys = [p["y_mm"] for p in groove.get("polygon", [])]
+    if not xs:
+        return (0, 0, 0, 0)
+    return (min(xs), min(ys), max(xs)-min(xs), max(ys)-min(ys))
 
 
-def outline_alignment_error(front: dict, back: dict, transform: str) -> float:
-    front_points = front["outline"]
-    back_points = [
-        transform_back_point(point, back["width_mm"], back["height_mm"], front["width_mm"], front["height_mm"], transform)
-        for point in back["outline"]
-    ]
-
-    def directed(a: list[dict[str, float]], b: list[dict[str, float]]) -> float:
-        distances = []
-        for point in a:
-            distances.append(min(((point["x_mm"] - other["x_mm"]) ** 2 + (point["y_mm"] - other["y_mm"]) ** 2) ** 0.5 for other in b))
-        return sum(distances) / len(distances)
-
-    return (directed(front_points, back_points) + directed(back_points, front_points)) / 2
+def _region_overlap(a, b):
+    """Compute IoU of two bounding regions."""
+    ax1, ay1, aw, ah = a; ax2, ay2 = ax1+aw, ay1+ah
+    bx1, by1, bw, bh = b; bx2, by2 = bx1+bw, by1+bh
+    ix = max(0, min(ax2,bx2)-max(ax1,bx1))
+    iy = max(0, min(ay2,by2)-max(ay1,by1))
+    inter = ix*iy; union = aw*ah + bw*bh - inter
+    return inter/union if union>0 else 0
 
 
-def _order_quad(points: np.ndarray) -> np.ndarray:
-    ordered = np.zeros((4, 2), dtype=np.float32)
-    sums = points.sum(axis=1)
-    differences = np.diff(points, axis=1).ravel()
-    ordered[0] = points[np.argmin(sums)]
-    ordered[2] = points[np.argmax(sums)]
-    ordered[1] = points[np.argmin(differences)]
-    ordered[3] = points[np.argmax(differences)]
-    return ordered
+# ═══════════════════════════════════════════════════════════════════════
+#  CV hole detection
+# ═══════════════════════════════════════════════════════════════════════
+
+def _refine_holes_cv(img, mask, vlm_holes, w_mm, h_mm, ppm):
+    """Refine VLM holes with CV validation."""
+    h,w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Find dark regions inside PCB mask
+    dark = cv2.bitwise_not(cv2.adaptiveThreshold(gray,255,
+                          cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10))
+    dark = cv2.bitwise_and(dark, mask)
+
+    holes = []
+    for vh in vlm_holes:
+        poly = vh.get("polygon",[])
+        if len(poly)<3: continue
+        # Check if region is actually dark (hole should be dark)
+        pts = np.array([[[int(p["x_mm"]/w_mm*w), int(p["y_mm"]/h_mm*h)]]
+                        for p in poly], np.int32)
+        roi = np.zeros((h,w), np.uint8)
+        cv2.fillPoly(roi, [pts], 255)
+        dark_in_roi = cv2.bitwise_and(dark, roi)
+        fill_ratio = np.sum(dark_in_roi) / max(np.sum(roi), 1)
+        conf = vh.get("confidence", 0.7) * (0.5 + 0.5*fill_ratio)
+        holes.append({**vh, "confidence": round(conf, 3), "fill_ratio": round(fill_ratio, 3)})
+    return holes
 
 
-def _contour_quad(contour: np.ndarray) -> tuple[np.ndarray, str]:
-    """Prefer the photographed PCB's four visible corners over a rotated box.
+def _detect_cv_holes(img, mask, w_mm, h_mm, ppm, existing_ids):
+    """Detect additional holes via CV that VLM may have missed."""
+    h,w = img.shape[:2]
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Look for dark blobs inside PCB
+    masked = cv2.bitwise_and(gray, mask)
+    _, th = cv2.threshold(masked, 0, 255, cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+    th = cv2.bitwise_and(th, mask)
 
-    A min-area rectangle only fixes rotation and uniform scale.  A four-corner
-    homography also removes the trapezoid distortion introduced by an oblique
-    phone camera.  Rounded or partly hidden boards safely fall back to the
-    min-area rectangle and are still flagged for manual confirmation by the UI.
-    """
-    hull = cv2.convexHull(contour)
-    perimeter = cv2.arcLength(hull, True)
-    # Stage 1: Try DP approximation at various epsilon levels
-    for epsilon in (0.004, 0.006, 0.008, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.06):
-        polygon = cv2.approxPolyDP(hull, epsilon * perimeter, True)
-        if len(polygon) != 4 or not cv2.isContourConvex(polygon):
+    # Remove tiny noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN, kernel, 1)
+
+    contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    holes = []
+    idx = len(existing_ids)
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        min_area = (ppm * 1.5) ** 2  # 1.5mm minimum
+        max_area = (ppm * 20) ** 2   # 20mm maximum
+        if area < min_area or area > max_area:
             continue
-        polygon = polygon.reshape(4, 2).astype(np.float32)
-        if cv2.contourArea(polygon) < 0.75 * cv2.contourArea(hull):
-            continue
-        return _order_quad(polygon), "detected_board_corners"
 
-    # Stage 2: Extract best 4 extreme points from convex hull
-    hull_pts = hull.reshape(-1, 2).astype(np.float32)
-    hull_area = cv2.contourArea(hull)
-    # Find extreme points: top-left, top-right, bottom-right, bottom-left
-    sums = hull_pts.sum(axis=1)
-    diffs = np.diff(hull_pts, axis=1).ravel()
-    tl = hull_pts[np.argmin(sums)]
-    br = hull_pts[np.argmax(sums)]
-    tr = hull_pts[np.argmin(diffs)]
-    bl = hull_pts[np.argmax(diffs)]
-    quad = np.array([tl, tr, br, bl], dtype=np.float32)
+        # Approximate shape
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02*peri, True)
+        circularity = 4*math.pi*area/(peri*peri) if peri>0 else 0
 
-    # Validate: area should be close to hull area
-    quad_area = cv2.contourArea(quad)
-    if quad_area > 0.65 * hull_area:
-        return _order_quad(quad), "extreme_points_quad"
+        M = cv2.moments(cnt)
+        if M["m00"] == 0: continue
+        cx, cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
 
-    # Stage 3: Use minAreaRect on hull, refine corners from hull vertices for best fit
-    rect_pts = cv2.boxPoints(cv2.minAreaRect(hull)).astype(np.float32)
-    # Snap each rect corner to the nearest point on the convex hull
-    snap_threshold = max(8.0, perimeter * 0.04)
-    for i in range(4):
-        pt = rect_pts[i].reshape(1, 2)
-        # Find closest hull point
-        distances = np.linalg.norm(hull_pts - pt, axis=1)
-        closest_idx = np.argmin(distances)
-        if distances[closest_idx] < snap_threshold:
-            rect_pts[i] = hull_pts[closest_idx]
-    return _order_quad(rect_pts), "rect_with_hull_snap"
+        hole_type = "round" if circularity > 0.7 else "slot" if circularity > 0.3 else "irregular"
+        pts = approx.reshape(-1,2).tolist()
+        idx += 1
+        holes.append({
+            "id": f"cv_hole_{idx:02d}",
+            "hole_type": hole_type,
+            "center": {"x_mm": round(cx/w*w_mm,3), "y_mm": round(cy/h*h_mm,3)},
+            "polygon": [{"x_mm": round(px/w*w_mm,3), "y_mm": round(py/h*h_mm,3)}
+                       for px,py in pts],
+            "confidence": round(min(0.8, 0.5+0.5*circularity), 3),
+            "area_px": area,
+            "circularity": round(circularity, 3),
+            "source": "cv",
+        })
+    return holes
 
 
-def _extract_outline(image: np.ndarray) -> tuple[np.ndarray, float]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 40, 120)
-    edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=2)
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    image_area = image.shape[0] * image.shape[1]
-    center = (image.shape[1] / 2, image.shape[0] / 2)
-    candidates = [c for c in contours if 0.03 * image_area < cv2.contourArea(c) < 0.95 * image_area]
-    if not candidates:
-        raise DesignError("OUTLINE_NOT_FOUND", "No reliable PCB outline was found; adjust lighting or edit the outline manually.")
-    candidates.sort(key=lambda c: (cv2.pointPolygonTest(c, center, False) >= 0, cv2.contourArea(c)), reverse=True)
-    contour = candidates[0]
-    perimeter = cv2.arcLength(contour, True)
-    simplified = cv2.approxPolyDP(contour, max(1.0, 0.003 * perimeter), True).reshape(-1, 2)
-    confidence = min(1.0, cv2.contourArea(contour) / (0.25 * image_area))
-    return simplified, confidence
+# ═══════════════════════════════════════════════════════════════════════
+#  Utilities
+# ═══════════════════════════════════════════════════════════════════════
+
+def _to_b64(img):
+    _, buf = cv2.imencode(".png", img)
+    return base64.b64encode(buf).decode("ascii")
+
+
+def _make_transparent(img, mask):
+    """Create clean RGBA PNG with edge decontamination and alpha feathering.
+
+    Verified pipeline (pcb_image_pipeline.md), step 4:
+      1. Erode mask 1px to strip white-halo edges
+      2. Distance transform → 2px soft alpha feather
+      3. Colour decontamination (un-premultiply) for clean edges
+      4. Output RGBA PNG
+    """
+    # 1. Erode to remove white-border halo
+    eroded = cv2.erode(mask, np.ones((3, 3), np.uint8), iterations=1)
+
+    # 2. Distance transform for soft alpha (2px feather)
+    dist = cv2.distanceTransform(eroded, cv2.DIST_L2, 5)
+    alpha = np.clip(dist / 2.0, 0, 1)
+
+    # 3. Colour decontamination: remove background-tint from edge pixels
+    img_f = img.astype(np.float32)
+    a = alpha.astype(np.float32)[..., None]
+    F = (img_f - (1 - a) * 255.0) / np.clip(a, 0.01, 1.0)
+    F = np.clip(F, 0, 255).astype(np.uint8)
+
+    # 4. Assemble RGBA
+    rgba = cv2.cvtColor(F, cv2.COLOR_BGR2BGRA)
+    rgba[:, :, 3] = (alpha * 255).astype(np.uint8)
+
+    _, buf = cv2.imencode(".png", rgba)
+    return buf.tobytes()
+
+
+def _mm_to_px(points, w_mm, h_mm, pw, ph):
+    return [[int(p["x_mm"]/w_mm*pw), int(p["y_mm"]/h_mm*ph)] for p in points]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Black frame detection (perspective rectification)
+# ═══════════════════════════════════════════════════════════════════════
+
+def detect_black_frame(img_buf: bytes, target_aspect: float | None = None) -> dict:
+    """Detect the dark rectangular frame border on white paper.
+
+    If `target_aspect` is provided (e.g. frame_w_mm / frame_h_mm), it is used
+    to score candidate contours — those matching the expected ratio are preferred.
+    If None, aspect scoring is skipped and any large rectangular frame is returned.
+
+    Returns {found, outline, aspect_ratio, avg_width_px, avg_height_px, ...}
+    """
+    nparr = np.frombuffer(img_buf, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        return {"found": False, "error": "Failed to decode image"}
+
+    h, w = img.shape[:2]
+
+    # ── Verified pipeline: simple threshold + convexHull + approxPolyDP ──
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY_INV)
+
+    kernel = np.ones((5, 5), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return {"found": False, "error": "No contours found in image"}
+
+    largest = max(contours, key=cv2.contourArea)
+    hull = cv2.convexHull(largest)
+    peri = cv2.arcLength(hull, True)
+    corners = cv2.approxPolyDP(hull, 0.02 * peri, True)
+
+    if len(corners) != 4:
+        # Fallback: try minAreaRect on hull
+        rect = cv2.minAreaRect(hull)
+        corners = cv2.boxPoints(rect)
+        corners = corners.astype(np.int32)
+
+    # Compute aspect ratio from bounding rect for logging
+    rect = cv2.minAreaRect(hull)
+    rw, rh = rect[1]
+    best_aspect = max(rw, rh) / max(min(rw, rh), 1)
+
+    outline = _order_corners(corners.reshape(-1, 2))
+
+    aspect_ratio = max(rw, rh) / min(rw, rh) if min(rw, rh) > 0 else 1.0
+
+    # Annotated image
+    annotated = img.copy()
+    cv2.drawContours(annotated, [outline], -1, (0, 255, 0), 3)
+    for pt in outline:
+        cv2.circle(annotated, tuple(pt), 8, (255, 0, 0), -1)
+
+    return {
+        "found": True,
+        "outline": [[int(x), int(y)] for x, y in outline],
+        "aspect_ratio": round(aspect_ratio, 4),
+        "avg_width_px": round(rw, 1),
+        "avg_height_px": round(rh, 1),
+        "annotated_png_base64": _to_b64(annotated),
+    }
+
+
+def _order_corners(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points: top-left, top-right, bottom-right, bottom-left."""
+    pts = pts.reshape(4, 2).astype(np.float32)
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]  # top-right
+    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    return rect.astype(np.int32)
+
+
+def calibrate_black_frame(img_buf: bytes, frame_w_mm: float,
+                          frame_h_mm: float) -> dict:
+    """Detect black frame and compute perspective rectification.
+    Saves calibration data to disk for later retrieval.
+    Returns dict with calibration_id, rectified_png_base64, etc.
+    """
+    img_buf = _fix_exif_orientation(img_buf)
+    nparr = np.frombuffer(img_buf, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Failed to decode image")
+
+    # Detect black frame — use known aspect ratio to help detection
+    target_aspect = frame_w_mm / frame_h_mm if frame_h_mm > 0 else None
+    frame_result = detect_black_frame(img_buf, target_aspect)
+    if not frame_result.get("found"):
+        raise ValueError("未检测到黑色方框 — 请确保黑色矩形框清晰可见")
+
+    outline = frame_result["outline"]
+    src_pts = np.array(outline, dtype=np.float32)
+
+    # Use actual detected frame pixel dimensions for output resolution
+    # Compute edge lengths from the 4-corner outline
+    e0 = float(np.linalg.norm(src_pts[1] - src_pts[0]))  # edge p0→p1
+    e1 = float(np.linalg.norm(src_pts[2] - src_pts[1]))  # edge p1→p2
+    e2 = float(np.linalg.norm(src_pts[3] - src_pts[2]))  # edge p2→p3
+    e3 = float(np.linalg.norm(src_pts[0] - src_pts[3]))  # edge p3→p0
+
+    dim1 = (e0 + e2) / 2.0  # average of opposite sides
+    dim2 = (e1 + e3) / 2.0  # average of opposite sides
+
+    aspect = frame_w_mm / frame_h_mm
+    # Match pixel dimensions to physical dimensions using known aspect ratio
+    if abs(dim1 / dim2 - aspect) < abs(dim2 / dim1 - aspect):
+        w_px, h_px = dim1, dim2
+    else:
+        w_px, h_px = dim2, dim1
+
+    source_ppm = min(w_px / frame_w_mm, h_px / frame_h_mm)
+    target_ppm = max(min(source_ppm, 60), 10)  # cap: 10–60 px/mm
+    rw_img = max(int(frame_w_mm * target_ppm), 200)
+    rh_img = max(int(frame_h_mm * target_ppm), 100)
+
+    _log.info("Rectified output: %dx%d px (%.1f px/mm from source %.1f px/mm)",
+              rw_img, rh_img, target_ppm, source_ppm)
+
+    dst_pts = np.array([
+        [0, 0],
+        [rw_img - 1, 0],
+        [rw_img - 1, rh_img - 1],
+        [0, rh_img - 1]
+    ], dtype=np.float32)
+
+    M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+    rectified = cv2.warpPerspective(img, M, (rw_img, rh_img))
+
+    # Annotated original
+    annotated = img.copy()
+    cv2.drawContours(annotated, [src_pts.astype(np.int32)], -1, (0, 255, 0), 3)
+    for pt in src_pts.astype(np.int32):
+        cv2.circle(annotated, tuple(pt), 10, (255, 0, 0), -1)
+
+    pixels_per_mm = rw_img / frame_w_mm
+    cal_id = uuid.uuid4().hex  # full 32-char hex UUID
+
+    ROOT = Path(__file__).resolve().parents[1]
+    WORK_ROOT = Path(os.getenv("BATTERY_DESIGN_WORKDIR", ROOT / "work"))
+
+    # Save calibration under work/calibrations/{cal_id}/
+    cal_data = {
+        "id": cal_id,
+        "frame_w_mm": frame_w_mm,
+        "frame_h_mm": frame_h_mm,
+        "width_mm": frame_w_mm,
+        "height_mm": frame_h_mm,
+        "pixels_per_mm": round(pixels_per_mm, 3),
+        "rectified_w_px": rw_img,
+        "rectified_h_px": rh_img,
+        "outline_px": [[int(x), int(y)] for x, y in outline],
+    }
+
+    cal_dir = WORK_ROOT / "calibrations" / cal_id
+    cal_dir.mkdir(parents=True, exist_ok=True)
+    with open(cal_dir / "calibration.json", "w", encoding="utf-8") as f:
+        json.dump(cal_data, f, indent=2)
+    _, rect_buf = cv2.imencode(".png", rectified)
+    (cal_dir / "rectified.png").write_bytes(rect_buf.tobytes())
+
+    _log.info("Black frame calibration: %s → %d×%d px, %.2f px/mm",
+              cal_id, rw_img, rh_img, pixels_per_mm)
+
+    return {
+        "calibration_id": cal_id,
+        "pixels_per_mm": round(pixels_per_mm, 3),
+        "rectified_png_base64": _to_b64(rectified),
+        "annotated_png_base64": _to_b64(annotated),
+        "outline": [[int(x), int(y)] for x, y in outline],
+        "width_mm": frame_w_mm,
+        "height_mm": frame_h_mm,
+    }

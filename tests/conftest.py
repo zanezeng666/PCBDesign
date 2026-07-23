@@ -14,17 +14,9 @@ def common_spec() -> DesignSpec:
             "battery": {
                 "count": 3,
                 "connection": "parallel",
-                "cell_min_v": 3.0,
-                "cell_nominal_v": 3.7,
-                "cell_max_v": 4.2,
+                "battery_type": "18650",
             },
-            "limits": {
-                "continuous_current_a": 2,
-                "peak_current_a": 5,
-                "peak_duration_s": 3,
-                "ambient_temp_c": 25,
-                "max_temp_rise_c": 40,
-            },
+            "mos_count": 2,
             "outline": {
                 "confirmed": True,
                 "points": [

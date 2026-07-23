@@ -5,25 +5,59 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from .catalog import DevicePackage
 from .errors import DesignError
 from .models import DesignSpec
 
-_KICAD_BIN = Path(os.getenv("KICAD_BIN", r"C:\Program Files\KiCad\9.0\bin"))
-_DLL_HANDLE = None
-if os.name == "nt" and _KICAD_BIN.exists():
-    os.environ["PATH"] = str(_KICAD_BIN) + os.pathsep + os.environ.get("PATH", "")
-    _DLL_HANDLE = os.add_dll_directory(str(_KICAD_BIN))
+# ── KiCad path resolution (cross-platform) ──
+_KICAD_BIN = Path(os.getenv("KICAD_BIN", ""))
+_KICAD_CLI_DEFAULT = Path(os.getenv("KICAD_CLI", ""))
 
-import cairosvg
+if not _KICAD_BIN or not _KICAD_BIN.exists():
+    _KICAD_BIN = _resolve_kicad_bin()
+if not _KICAD_CLI_DEFAULT or not _KICAD_CLI_DEFAULT.exists():
+    _KICAD_CLI_DEFAULT = _KICAD_BIN / ("kicad-cli.exe" if sys.platform == "win32" else "kicad-cli")
+
+if sys.platform == "win32" and _KICAD_BIN.exists():
+    os.environ["PATH"] = str(_KICAD_BIN) + os.pathsep + os.environ.get("PATH", "")
+    try:
+        os.add_dll_directory(str(_KICAD_BIN))
+    except (AttributeError, OSError):
+        pass
+
+
+def _resolve_kicad_bin() -> Path:
+    """Find KiCad bin directory from common platform-specific locations."""
+    candidates: list[Path] = []
+    if sys.platform == "win32":
+        for ver in ("9.0", "8.0", "7.0"):
+            candidates.append(Path(f"C:\\Program Files\\KiCad\\{ver}\\bin"))
+            candidates.append(Path(f"C:\\Program Files (x86)\\KiCad\\{ver}\\bin"))
+    elif sys.platform == "darwin":
+        candidates.append(Path("/Applications/KiCad/KiCad.app/Contents/Applications/bin"))
+    else:
+        candidates.extend([Path("/usr/bin"), Path("/usr/local/bin")])
+
+    for c in candidates:
+        kicad_cli = c / ("kicad-cli.exe" if sys.platform == "win32" else "kicad-cli")
+        if kicad_cli.exists():
+            return c
+    return Path(".")  # fallback — user will get a clear error on first CLI call
+
+
+try:
+    import cairosvg  # noqa: F401
+except OSError:
+    cairosvg = None  # type: ignore[assignment]
 
 
 class KicadPipeline:
     def __init__(self, kicad_cli: Path | None = None):
         configured = os.getenv("KICAD_CLI")
-        self.kicad_cli = Path(configured) if configured else (kicad_cli or Path(r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe"))
+        self.kicad_cli = Path(configured) if configured else kicad_cli or _KICAD_CLI_DEFAULT
 
     def diagnose(self) -> dict:
         if not self.kicad_cli.exists():
@@ -93,7 +127,8 @@ class KicadPipeline:
         for side, layers in (("front", "F.Cu,F.Mask,F.Silkscreen,Edge.Cuts"), ("back", "B.Cu,B.Mask,B.Silkscreen,Edge.Cuts")):
             self._run([str(self.kicad_cli), "pcb", "export", "svg", "--layers", layers, "-o", str(preview / f"pcb_{side}.svg"), str(pcb)], "PCB_SVG_FAILED")
         for svg in preview.rglob("*.svg"):
-            cairosvg.svg2png(url=str(svg), write_to=str(svg.with_suffix(".png")), output_width=1800)
+            if cairosvg is not None:
+                cairosvg.svg2png(url=str(svg), write_to=str(svg.with_suffix(".png")), output_width=1800)
         self._run([str(self.kicad_cli), "pcb", "export", "gerbers", "-o", str(gerber), str(pcb)], "GERBER_FAILED")
         self._run([str(self.kicad_cli), "pcb", "export", "drill", "-o", str(gerber), str(pcb)], "DRILL_FAILED")
         bom = manufacturing / "bom.csv"

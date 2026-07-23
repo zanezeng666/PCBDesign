@@ -185,3 +185,17 @@ def validate_ic_for_design(device: DevicePackage, series_cells: int, topology: s
             f"{device.full_mpn} does not have a reviewed {topology} port topology.",
             {"supported": list(device.port_topologies)},
         )
+
+
+def get_reference_mosfet_mpn(device: DevicePackage) -> str:
+    """Return the recommended MOSFET MPN for this IC.
+
+    Looks up ``reference_components.M1.mpn`` (or ``M2.mpn``),
+    falling back to the standard companion FS8205A.
+    """
+    ref = device.reference_components
+    for key in ("M1", "M2"):
+        entry = ref.get(key)
+        if isinstance(entry, dict) and entry.get("mpn"):
+            return entry["mpn"]
+    return "FS8205A"

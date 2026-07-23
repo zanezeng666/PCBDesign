@@ -3,9 +3,7 @@ import os, uuid, math
 from pathlib import Path
 from datetime import datetime
 
-KICAD_PATH = r"C:\Program Files\KiCad\9.0"
-KICAD_SHARE = os.path.join(KICAD_PATH, "share", "kicad")
-KICAD_CLI = os.path.join(KICAD_PATH, "bin", "kicad-cli.exe")
+from .circuit_helpers import export_sch_png_direct, export_sch_png
 
 
 def uid(): return str(uuid.uuid4())
@@ -441,16 +439,6 @@ if __name__ == "__main__":
     print(f"{wires} wires, {labels} labels")
     
     # 导出 PNG
-    import subprocess, cairosvg
-    os.environ['PATH'] = KICAD_PATH + r'\bin;' + os.environ.get('PATH', '')
-    svg_file = out_dir / "schematic.svg"
     png_file = out_dir / "schematic.png"
-    
-    r = subprocess.run(
-        [KICAD_CLI, "sch", "export", "svg", str(sch_file), "--output", str(svg_file)],
-        capture_output=True, text=True)
-    if r.returncode == 0 and Path(svg_file).exists():
-        cairosvg.svg2png(url=str(svg_file), write_to=str(png_file), output_width=1600)
-        print(f"PNG: {png_file} ({os.path.getsize(png_file)} bytes)")
-    else:
-        print(f"SVG失败: {r.stderr[:200]}")
+    if not export_sch_png_direct(sch_file, png_file):
+        export_sch_png(sch_file, png_file)  # fallback via SVG

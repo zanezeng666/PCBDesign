@@ -1,0 +1,81 @@
+{
+  "image_name": "front.jpg",
+  "image_size": [
+    4096,
+    1832
+  ],
+  "side": "front",
+  "gt_count": 4,
+  "det_count": 4,
+  "matched_count": 4,
+  "missed_count": 0,
+  "false_positive_count": 0,
+  "iou": {
+    "mean": 0.8565,
+    "median": 0.8707,
+    "min": 0.7632,
+    "max": 0.9283
+  },
+  "center_distance": {
+    "mean_px": 6.48,
+    "max_px": 10.32,
+    "mean_pct": 0.0014
+  },
+  "size_error": {
+    "width_mean_pct": 0.01,
+    "height_mean_pct": 0.07,
+    "area_mean_pct": 0.08
+  },
+  "recall": 1.0,
+  "precision": 1.0,
+  "f1_score": 1.0,
+  "composite_score": 92.69,
+  "matches": [
+    {
+      "gt_label": "pad_0",
+      "det_label": "pad_0",
+      "iou": 0.9283,
+      "center_distance": 2.91,
+      "center_offset_pct": 0.0006,
+      "size_error_w": 0.0,
+      "size_error_h": 0.0538,
+      "area_error_pct": 0.0538,
+      "quality": "excellent"
+    },
+    {
+      "gt_label": "pad_4",
+      "det_label": "pad_4",
+      "iou": 0.8707,
+      "center_distance": 6.9,
+      "center_offset_pct": 0.0015,
+      "size_error_w": -0.0172,
+      "size_error_h": 0.043,
+      "area_error_pct": 0.025,
+      "quality": "excellent"
+    },
+    {
+      "gt_label": "pad_3",
+      "det_label": "pad_3",
+      "iou": 0.8636,
+      "center_distance": 5.8,
+      "center_offset_pct": 0.0013,
+      "size_error_w": 0.0113,
+      "size_error_h": 0.0968,
+      "area_error_pct": 0.1092,
+      "quality": "excellent"
+    },
+    {
+      "gt_label": "pad_5",
+      "det_label": "pad_5",
+      "iou": 0.7632,
+      "center_distance": 10.32,
+      "center_offset_pct": 0.0023,
+      "size_error_w": 0.0345,
+      "size_error_h": 0.0968,
+      "area_error_pct": 0.1346,
+      "quality": "excellent"
+    }
+  ],
+  "unmatched_gt": [],
+  "unmatched_det": []
+}

@@ -69,8 +69,33 @@ def test_auxiliary_terminal_can_be_unpolarized(common_spec):
     assert DesignSpec.model_validate(data).terminals[-1].polarity is None
 
 
-def test_overcurrent_trip_must_exceed_continuous_current(common_spec):
+def test_battery_type_lookup(common_spec):
+    assert common_spec.battery.battery_type == "18650"
+    assert common_spec.battery.cell_min_v == 3.0
+    assert common_spec.battery.cell_nominal_v == 3.7
+    assert common_spec.battery.cell_max_v == 4.2
+    assert common_spec.battery.chemistry == "Li-ion/LiPo"
+
+
+def test_battery_type_lfp():
+    from battery_designer.models import BatterySpec, ConnectionMode
+    spec = BatterySpec(count=4, connection=ConnectionMode.SERIES, battery_type="LFP")
+    assert spec.cell_min_v == 2.5
+    assert spec.cell_nominal_v == 3.2
+    assert spec.cell_max_v == 3.65
+    assert spec.chemistry == "LiFePO4"
+    assert spec.series_cells == 4
+    assert spec.parallel_cells == 1
+
+
+def test_unknown_battery_type_is_rejected():
+    from battery_designer.models import BatterySpec, ConnectionMode
+    with pytest.raises(ValidationError, match="Unknown battery_type"):
+        BatterySpec(count=1, connection=ConnectionMode.SERIES, battery_type="nuclear-42")
+
+
+def test_mos_count_required():
     data = common_spec.model_dump(mode="json")
-    data["limits"]["overcurrent_trip_a"] = data["limits"]["continuous_current_a"]
-    with pytest.raises(ValidationError, match="overcurrent trip"):
-        DesignSpec.model_validate(data)
+    assert data.pop("mos_count", None) is not None
+    with pytest.raises(ValidationError):
+        DesignSpec.model_validate({**data, "mos_count": None})

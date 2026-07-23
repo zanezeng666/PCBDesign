@@ -6,12 +6,12 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .catalog import DevicePackage, validate_ic_for_design
+from .catalog import DevicePackage, get_reference_mosfet_mpn, validate_ic_for_design
 from .errors import DesignError
 from .kicad import KicadPipeline
-from .models import DesignSpec
-from .mos import MosfetSelection, select_mosfets
-from .ocp import assess_overcurrent_target
+from .models import DesignSpec, ElectricalLimits
+from .mos import MosfetSelection, derive_config_from_count, derive_electrical_limits, get_mosfet
+from .ocp import evaluate_oc_protection
 from .preview import write_mechanical_previews
 
 
@@ -19,24 +19,57 @@ class DesignGenerator:
     def __init__(self, pipeline: KicadPipeline):
         self.pipeline = pipeline
 
-    def preflight(self, spec: DesignSpec, device: DevicePackage) -> MosfetSelection:
+    # ── preflight (no user-provided limits) ─────────────────────
+
+    def preflight(self, spec: DesignSpec, device: DevicePackage) -> tuple[MosfetSelection, ElectricalLimits, dict]:
+        """Validate inputs and auto-derive electrical characteristics.
+
+        Derivation chain:
+          battery_type → cell voltages
+          mos_count + MOSFET spec → continuous / peak / OC trip
+        """
         if not spec.outline.confirmed:
             raise DesignError("OUTLINE_NOT_CONFIRMED", "The photo-derived board outline must be confirmed before generation.")
         validate_ic_for_design(device, spec.battery.series_cells, spec.port_topology)
-        return select_mosfets(spec.limits)
+
+        # Derive: which MOSFET is this IC's standard companion?
+        mosfet_mpn = get_reference_mosfet_mpn(device)
+        mosfet = get_mosfet(mosfet_mpn)
+
+        # Derive: electrical characteristics from mos_count
+        selection = derive_config_from_count(spec.mos_count, mosfet)
+        limits = derive_electrical_limits(
+            selection,
+            dischg_oc_detection_v=device.parameters.get("discharge_overcurrent_detection_v_typ", 0.25),
+        )
+
+        # Derive: OC protection report
+        ocp = evaluate_oc_protection(
+            selection,
+            dischg_oc_detection_v_typ=device.parameters.get("discharge_overcurrent_detection_v_typ"),
+            dischg_oc_detection_v_min_25c=device.parameters.get("discharge_overcurrent_detection_v_min_25c"),
+            dischg_oc_detection_v_max_25c=device.parameters.get("discharge_overcurrent_detection_v_max_25c"),
+        )
+
+        return selection, limits, ocp
+
+    # ── stages ──────────────────────────────────────────────────
 
     def generate_preview(self, spec: DesignSpec, device: DevicePackage, project_dir: Path) -> dict:
-        selection = self.preflight(spec, device)
+        selection, limits, ocp = self.preflight(spec, device)
         output = project_dir / "output"
         preview = output / "preview"
         reports = output / "reports"
         reports.mkdir(parents=True, exist_ok=True)
+
         artifacts = write_mechanical_previews(spec, preview)
-        (output / "design-input.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")
+        design_input = spec.model_dump()
+        design_input["derived_limits"] = limits.model_dump()
+        (output / "design-input.json").write_text(json.dumps(design_input, ensure_ascii=False, indent=2), encoding="utf-8")
         (reports / "ic-source.json").write_text(json.dumps(device.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         (reports / "mos-selection.json").write_text(json.dumps(selection.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
-        ocp = assess_overcurrent_target(spec, device, selection)
         (reports / "overcurrent-assessment.json").write_text(json.dumps(ocp, ensure_ascii=False, indent=2), encoding="utf-8")
+
         warnings = [] if device.status == "validated" else ["候选样板，不得直接批量生产", "ERC/DRC cannot prove electrical behavior"]
         if ocp.get("status") == "mismatch":
             warnings.append("过流动作目标与 IC/MOS 最坏情况计算不匹配")
@@ -46,12 +79,14 @@ class DesignGenerator:
             "warnings": warnings,
         }
         (reports / "risk-report.json").write_text(json.dumps(risk, ensure_ascii=False, indent=2), encoding="utf-8")
+
         manifest = self._manifest(output, "preview")
         return {
             "stage": "preview_ready",
             "port_topology": spec.port_topology,
             "device": device.as_dict(),
             "mos_selection": selection.as_dict(),
+            "derived_limits": limits.model_dump(),
             "overcurrent_assessment": ocp,
             "risk": risk,
             "artifacts": [str(path.relative_to(project_dir)).replace("\\", "/") for path in artifacts],
@@ -61,10 +96,11 @@ class DesignGenerator:
     def generate_manufacturing(self, spec: DesignSpec, device: DevicePackage, project_dir: Path, approved: bool) -> dict:
         if device.status != "validated" and not approved:
             raise DesignError("CANDIDATE_APPROVAL_REQUIRED", "Candidate templates require explicit sample-build approval.")
-        selection = self.preflight(spec, device)
+        selection, limits, ocp = self.preflight(spec, device)
         output = project_dir / "output"
         build = self.pipeline.build(spec, device, output)
         (output / "reports" / "mos-selection.json").write_text(json.dumps(selection.as_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        (output / "reports" / "overcurrent-assessment.json").write_text(json.dumps(ocp, ensure_ascii=False, indent=2), encoding="utf-8")
         manifest = self._manifest(output, "manufacturing")
         package = project_dir / f"{_safe_name(spec.name)}-candidate-package.zip"
         self._zip(output, package)
@@ -75,6 +111,8 @@ class DesignGenerator:
             "build": build,
             "manifest": manifest,
         }
+
+    # ── internal helpers ────────────────────────────────────────
 
     @staticmethod
     def _manifest(output: Path, stage: str) -> dict:
