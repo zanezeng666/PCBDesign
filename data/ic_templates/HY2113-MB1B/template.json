@@ -1,0 +1,9 @@
+{
+  "device": "HY2113-MB1B",
+  "description": "1S 锂电池保护板（HY2113-MB1B + FS8205A 共口），候选模板",
+  "schematic": "schematic.kicad_sch",
+  "pcb": "pcb.kicad_pcb",
+  "adapter": "adapt.py",
+  "adapter_interpreter": "kicad-python",
+  "status": "candidate"
+}

@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "battery_protection") (type "KiCad") (uri "${KIPRJMOD}/battery_protection.kicad_sym") (options "") (descr ""))
+)

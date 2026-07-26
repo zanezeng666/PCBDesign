@@ -1,0 +1,48 @@
+ERC report (2026-07-26T09:10:32, Encoding UTF8)
+Report includes: Errors, Warnings
+
+***** Sheet /
+[footprint_link_issues]: 当前配置中不包含封装库 'Connector_PinHeader_2.54mm'
+    ; warning
+    @(25.40 mm, 60.96 mm): Symbol J1 [Conn_01x04]
+[lib_symbol_issues]: 当前配置不包含符号库 'battery_protection'
+    ; warning
+    @(25.40 mm, 60.96 mm): Symbol J1 [Conn_01x04]
+[footprint_link_issues]: 当前配置中不包含封装库 'Package_TO_SOT_SMD'
+    ; warning
+    @(76.20 mm, 60.96 mm): Symbol U1 [HY2113-MB1B]
+[lib_symbol_issues]: 当前配置不包含符号库 'battery_protection'
+    ; warning
+    @(76.20 mm, 60.96 mm): Symbol U1 [HY2113-MB1B]
+[footprint_link_issues]: 当前配置中不包含封装库 'Package_SO'
+    ; warning
+    @(76.20 mm, 111.76 mm): Symbol Q1 [FS8205A]
+[lib_symbol_issues]: 当前配置不包含符号库 'battery_protection'
+    ; warning
+    @(76.20 mm, 111.76 mm): Symbol Q1 [FS8205A]
+[footprint_link_issues]: 当前配置中不包含封装库 'Resistor_SMD'
+    ; warning
+    @(127.00 mm, 35.56 mm): Symbol R1 [R]
+[lib_symbol_issues]: 当前配置不包含符号库 'battery_protection'
+    ; warning
+    @(127.00 mm, 35.56 mm): Symbol R1 [R]
+[footprint_link_issues]: 当前配置中不包含封装库 'Capacitor_SMD'
+    ; warning
+    @(127.00 mm, 60.96 mm): Symbol C1 [C]
+[lib_symbol_issues]: 当前配置不包含符号库 'battery_protection'
+    ; warning
+    @(127.00 mm, 60.96 mm): Symbol C1 [C]
+[footprint_link_issues]: 当前配置中不包含封装库 'Capacitor_SMD'
+    ; warning
+    @(127.00 mm, 86.36 mm): Symbol C2 [C]
+[lib_symbol_issues]: 当前配置不包含符号库 'battery_protection'
+    ; warning
+    @(127.00 mm, 86.36 mm): Symbol C2 [C]
+
+ ** ERC messages: 12  Errors 0  Warnings 12
+
+ ** Ignored checks:
+    - Global label only appears once in the schematic
+    - Four connection points are joined together
+    - SPICE model issue
+    - Assigned footprint doesn't match footprint filters

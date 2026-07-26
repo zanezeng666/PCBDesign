@@ -1,4 +1,4 @@
-"""VLM-based pad detection using Aliyun DashScope qwen3.7-plus.
+"""VLM-based pad and component detection using Aliyun DashScope qwen3.7-plus.
 
 Pure VLM detection pipeline — no OCR or heuristic fallback.
 
@@ -10,6 +10,15 @@ Architecture:
         │
         ▼
     _parse_vlm_response() ──► standardized candidate list
+
+    Component detection:
+    rectified_png (原图) + width_mm/height_mm/side
+        │
+        ▼
+    _vlm_detect_components_raw() ──► raw JSON from qwen3.7-plus
+        │
+        ▼
+    _parse_components_response() ──► component list with silkscreen/package
 """
 
 from __future__ import annotations
@@ -65,11 +74,18 @@ def detect_with_vlm(
     width_mm: float,
     height_mm: float,
     side: str,
+    is_transparent: bool = False,
+    img_w_px: int = 0,
+    img_h_px: int = 0,
 ) -> dict:
     """Detect terminal candidates using qwen3.7-plus VLM.
 
     Pipeline:
       1. VLM identifies pads and returns approximate polygon coordinates
+
+    Args:
+        img_w_px / img_h_px: actual pixel dimensions of the image being sent.
+            If 0, estimated from width_mm * 50.
 
     Raises DesignError if VLM is unavailable or fails.
     """
@@ -79,7 +95,8 @@ def detect_with_vlm(
 
     _check_vlm_available()
 
-    raw = _vlm_detect_raw(rectified_png, width_mm, height_mm)
+    raw = _vlm_detect_raw(rectified_png, width_mm, height_mm, is_transparent,
+                          img_w_px=img_w_px, img_h_px=img_h_px)
     if raw is None:
         from .errors import DesignError
         raise DesignError("VLM_DETECTION_FAILED", "qwen3.7-plus returned no usable response")
@@ -135,7 +152,8 @@ def _check_vlm_available() -> None:
         raise DesignError("VLM_UNAVAILABLE", "dashscope SDK not installed")
 
 
-def _vlm_detect_raw(rectified_png: bytes, width_mm: float, height_mm: float) -> dict | None:
+def _vlm_detect_raw(rectified_png: bytes, width_mm: float, height_mm: float, is_transparent: bool = False,
+                    img_w_px: int = 0, img_h_px: int = 0) -> dict | None:
     """Call qwen3.7-plus and return the parsed JSON response, or None on failure."""
 
     dashscope.api_key = _get_api_key()
@@ -143,7 +161,7 @@ def _vlm_detect_raw(rectified_png: bytes, width_mm: float, height_mm: float) -> 
     image_b64 = base64.b64encode(rectified_png).decode("ascii")
     image_url = f"data:image/png;base64,{image_b64}"
 
-    prompt = _build_prompt(width_mm, height_mm)
+    prompt = _build_prompt(width_mm, height_mm, is_transparent, img_w_px, img_h_px)
 
     messages = [{
         "role": "user",
@@ -195,13 +213,30 @@ def _vlm_detect_raw(rectified_png: bytes, width_mm: float, height_mm: float) -> 
     return parsed
 
 
-def _build_prompt(width_mm: float, height_mm: float) -> str:
+def _build_prompt(width_mm: float, height_mm: float, is_transparent: bool = False,
+                  img_w_px: int = 0, img_h_px: int = 0) -> str:
     """Construct the system-style instruction for qwen3.7-plus."""
+
+    # Use actual pixel dimensions if provided, otherwise estimate
+    px_w = img_w_px if img_w_px > 0 else int(width_mm * 50)
+    px_h = img_h_px if img_h_px > 0 else int(height_mm * 50)
+
+    image_desc = (
+        "Clean PCB image on white background. The PCB board FILLS the entire image "
+        "edge-to-edge — the image has been cropped to exactly the PCB boundary. "
+        "This is a processed image with all background noise removed. "
+        "Use the ENTIRE image as your coordinate reference: "
+        "(0,0)=top-left corner of image=top-left of PCB, "
+        "(1,1)=bottom-right corner of image=bottom-right of PCB."
+        if is_transparent else
+        "Rectified photo with possible black frame border and white paper background."
+    )
 
     return f"""You are an expert PCB (printed circuit board) inspector. Analyze the uploaded image of a battery protection board.
 
+Image type: {image_desc}
 Board physical dimensions: {width_mm:.1f} mm × {height_mm:.1f} mm.
-Image dimensions: exactly {int(width_mm * 50)} × {int(height_mm * 50)} pixels.
+Image dimensions: exactly {px_w} × {px_h} pixels.
 
 CRITICAL DOMAIN KNOWLEDGE — read carefully:
 - ALL solder pads on this PCB are ROUNDED RECTANGLES in reality.
@@ -211,8 +246,16 @@ CRITICAL DOMAIN KNOWLEDGE — read carefully:
   boundary of the metallic pad, PLUS (optionally) transition points at rounded corners.
 
 Your task:
-1. Locate ALL terminal solder pads on this PCB that are labeled with silkscreen text (white text near metallic pads).
-2. For each terminal pad, identify its label and trace the EXACT metallic pad outline.
+1. Locate ALL terminal solder pads on this PCB. Each pad has a silkscreen text label printed NEAR or ON it.
+2. For each terminal pad, use the text ONLY to identify which pad it is (its label).
+3. Then trace the EXACT outline of the METALLIC CONDUCTIVE AREA (the silver/gold/copper exposed metal).
+
+⚠️ CRITICAL DISTINCTION:
+- The silkscreen TEXT (white characters like "P-", "TH") is NOT the pad. Text is just a label.
+- The PAD is the exposed METALLIC area (shiny silver/gold/copper) that a probe or wire would contact.
+- The text may be printed ON TOP of the metallic area, or ADJACENT to it — either way,
+  your polygon must trace the METAL boundary, not the text character boundary.
+- If text is printed on the pad, ignore the text and trace the full metallic area underneath.
 
 Terminal labels to look for: B+, B-, P+, P-, C+, C-, NTC, TH, ID, N
 - "B+" and "B-" are battery connection terminals (usually larger pads spanning most of the board height).
@@ -272,7 +315,8 @@ Example — 4-corner quadrilateral format (PREFERRED for rounded rectangles):
 ]
 
 FINAL REMINDERS:
-- Pad = metallic area only (silver/gold/copper), NOT surrounding PCB or text.
+- Pad = METALLIC conductive area only (silver/gold/copper). NOT the text label, NOT surrounding PCB.
+- The text label (e.g. "P-", "TH") tells you WHICH pad it is, but your polygon traces the METAL area.
 - Pads on opposite edges have very different x_frac (e.g. 0.05 vs 0.95).
 - All pads are rounded rectangles in 3D → appear as skewed quadrilaterals in the 2D image.
 - 4-vertex output is preferred and sufficient for rounded rectangle pads.
@@ -963,4 +1007,286 @@ def _make_outline_candidate(
     }
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  Component Detection (元器件识别)
+# ══════════════════════════════════════════════════════════════════════
+
+def detect_components(
+    rectified_png: bytes,
+    width_mm: float,
+    height_mm: float,
+    side: str,
+) -> dict:
+    """Detect electronic components on the PCB using the original rectified image.
+
+    Unlike pad detection which uses cropped/upscaled images, this function
+    uses the original rectified PNG to preserve full visual context needed
+    to read tiny silkscreen text on ICs, MOSFETs, resistors, etc.
+
+    Returns:
+        {
+            "side": str,
+            "components": [
+                {
+                    "id": str,
+                    "type": "ic"|"mosfet"|"resistor"|"capacitor"|"diode"|"ntc"|"led"|"other",
+                    "silkscreen": str,        # 丝印文字
+                    "package": str,           # 封装类型
+                    "position_mm": {"x": float, "y": float},
+                    "size_mm": {"w": float, "h": float},
+                    "confidence": float,
+                    "side": str,
+                },
+                ...
+            ],
+            "inferred_ic": str | None,   # 自动推断的 IC 型号
+            "inferred_mos": str | None,  # 自动推断的 MOS 型号
+            "method": str,
+        }
+    """
+    if side not in {"front", "back"}:
+        from .errors import DesignError
+        raise DesignError("INVALID_BOARD_SIDE", "side must be front or back")
+
+    _check_vlm_available()
+
+    raw = _vlm_detect_components_raw(rectified_png, width_mm, height_mm, side)
+    if raw is None:
+        from .errors import DesignError
+        raise DesignError("VLM_DETECTION_FAILED",
+                          "qwen3.7-plus returned no usable response for component detection")
+
+    components = _parse_components_response(raw, width_mm, height_mm, side)
+
+    # Auto-infer IC and MOS models from detected components
+    inferred_ic = None
+    inferred_mos = None
+    for comp in components:
+        if comp["type"] == "ic" and comp["silkscreen"] and inferred_ic is None:
+            inferred_ic = comp["silkscreen"]
+        elif comp["type"] == "mosfet" and comp["silkscreen"] and inferred_mos is None:
+            inferred_mos = comp["silkscreen"]
+
+    _log.info("Component detection: %d components for side %r (ic=%s, mos=%s)",
+              len(components), side, inferred_ic, inferred_mos)
+
+    return {
+        "side": side,
+        "components": components,
+        "inferred_ic": inferred_ic,
+        "inferred_mos": inferred_mos,
+        "method": "vlm→qwen3.7-plus→components",
+    }
+
+
+# ── Component prompt ─────────────────────────────────────────────────
+
+_COMPONENT_PROMPT_TEMPLATE = """You are an expert PCB (printed circuit board) inspector.
+Analyze this rectified top-down photo of a battery protection PCB.
+
+Board physical dimensions: {width:.1f} mm × {height:.1f} mm.
+Image side: {side} (front = component side with most ICs; back = usually has battery pads and some components).
+
+Your task: Identify ALL electronic components visible on this PCB board.
+
+COMPONENT TYPES to identify:
+1. **IC** — Integrated circuits (protection IC, controller IC). Usually black rectangular packages with many pins.
+   - Read the silkscreen text ON the chip body (e.g., "DW01", "FS8205", "HY2113", "S-8261").
+   - Identify package type (SOT-23-6, SOT-23-5, TSSOP-8, SOP-8, QFN, etc.)
+
+2. **MOSFET** — Power MOS transistors. Usually small black packages with 3-8 pins.
+   - Read the silkscreen code on the chip body (e.g., "A09", "FS8205A", "Si2302").
+   - Identify package type (SOT-23, TDFN, SOT-23-6, etc.)
+
+3. **Resistor** — Small rectangular surface-mount components.
+   - Read the resistance marking if visible (e.g., "102" = 1kΩ, "472" = 4.7kΩ, "100" = 10Ω).
+   - Estimate package size (0402, 0603, 0805, 1206).
+
+4. **Capacitor** — Small rectangular SMD components, often brown/tan or dark.
+   - Note any polarity marking (+ or stripe for tantalum).
+   - Estimate package size (0402, 0603, 0805).
+
+5. **Diode** — Two-terminal SMD components, often with a stripe/cathode mark.
+   - Read marking if visible (e.g., "SS14", "1N4148").
+
+6. **NTC** — Thermistor, usually a small round or rectangular component.
+   - May have "NTC" or resistance marking.
+
+7. **LED** — Light-emitting diode, usually has colored or translucent body.
+
+8. **Other** — Any other component not fitting above categories.
+
+IMPORTANT GUIDELINES:
+- The PCB sits INSIDE a black rectangular calibration frame on white paper.
+- Focus on components ON the PCB board, ignore the black frame and white paper.
+- Read silkscreen text CAREFULLY — component markings are tiny and may be partially obscured.
+- For ICs and MOSFETs: the silkscreen on the chip body is the MOST IMPORTANT identifier.
+- For resistors: the 3-digit or 4-digit code is the resistance value.
+- Position coordinates are FRACTIONAL (0.0 to 1.0) relative to the FULL IMAGE dimensions.
+- Size (bounding box) is also FRACTIONAL.
+
+OUTPUT FORMAT — Return ONLY a JSON object, no markdown fences, no explanation:
+{{
+  "components": [
+    {{
+      "type": "ic",
+      "silkscreen": "DW01",
+      "package": "SOT-23-6",
+      "position": {{"x_frac": 0.4500, "y_frac": 0.3500}},
+      "size": {{"w_frac": 0.0600, "h_frac": 0.0300}},
+      "confidence": 0.92
+    }},
+    {{
+      "type": "mosfet",
+      "silkscreen": "FS8205A",
+      "package": "SOT-23-6",
+      "position": {{"x_frac": 0.5500, "y_frac": 0.4200}},
+      "size": {{"w_frac": 0.0550, "h_frac": 0.0280}},
+      "confidence": 0.88
+    }},
+    {{
+      "type": "resistor",
+      "silkscreen": "102",
+      "package": "0603",
+      "position": {{"x_frac": 0.3200, "y_frac": 0.5000}},
+      "size": {{"w_frac": 0.0200, "h_frac": 0.0120}},
+      "confidence": 0.75
+    }}
+  ]
+}}
+
+If a component's silkscreen is unreadable, set "silkscreen" to "" (empty string).
+If package type is uncertain, use "unknown".
+Only include components you can actually SEE on the PCB board surface."""
+
+
+def _vlm_detect_components_raw(
+    rectified_png: bytes,
+    width_mm: float,
+    height_mm: float,
+    side: str,
+) -> dict | None:
+    """Call qwen3.7-plus with the component detection prompt."""
+    dashscope.api_key = _get_api_key()
+
+    image_b64 = base64.b64encode(rectified_png).decode("ascii")
+    image_url = f"data:image/png;base64,{image_b64}"
+
+    prompt = _COMPONENT_PROMPT_TEMPLATE.format(
+        width=width_mm, height=height_mm, side=side)
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"image": image_url},
+            {"text": prompt},
+        ],
+    }]
+
+    _log.info("Calling DashScope VLM (components, model=%s, side=%s, image_size=%d bytes)",
+              MODEL_NAME, side, len(rectified_png))
+
+    try:
+        response = MultiModalConversation.call(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=TEMPERATURE,
+            max_tokens=MAX_TOKENS,
+            enable_thinking=ENABLE_THINKING,
+        )
+    except Exception as exc:
+        _log.error("DashScope API call failed (components): %s", exc)
+        return None
+
+    if response.status_code != 200:
+        _log.error("DashScope API error (components): code=%s message=%s",
+                   response.code, response.message)
+        return None
+
+    try:
+        contents = response.output.choices[0].message.content
+    except (AttributeError, IndexError, KeyError) as exc:
+        _log.error("Unexpected DashScope response (components): %s", exc)
+        return None
+
+    raw_text = ""
+    for part in contents:
+        if isinstance(part, dict) and "text" in part:
+            raw_text += part["text"]
+
+    if not raw_text:
+        _log.error("DashScope returned empty text (components)")
+        return None
+
+    _log.debug("VLM components response (first 500 chars): %s", raw_text[:500])
+
+    return _extract_json(raw_text)
+
+
+def _parse_components_response(
+    raw: dict,
+    width_mm: float,
+    height_mm: float,
+    side: str,
+) -> list[dict]:
+    """Parse VLM component detection response into standardized component list.
+
+    Returns list of component dicts with mm-based positions and sizes.
+    """
+    VALID_TYPES = {"ic", "mosfet", "resistor", "capacitor", "diode", "ntc", "led", "other"}
+    components: list[dict] = []
+
+    items = raw.get("components", [])
+    if not isinstance(items, list):
+        _log.warning("Component response 'components' is not a list")
+        return components
+
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+
+        comp_type = str(item.get("type", "other")).lower().strip()
+        if comp_type not in VALID_TYPES:
+            comp_type = "other"
+
+        silkscreen = str(item.get("silkscreen", "")).strip()
+        package = str(item.get("package", "unknown")).strip()
+        confidence = float(item.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))
+
+        # Parse position
+        pos = item.get("position", {})
+        x_frac = float(pos.get("x_frac", -1))
+        y_frac = float(pos.get("y_frac", -1))
+        if x_frac < -0.1 or x_frac > 1.1 or y_frac < -0.1 or y_frac > 1.1:
+            _log.debug("Component %d: position out of range (%.3f, %.3f), skipping", i, x_frac, y_frac)
+            continue
+        x_frac = max(0.0, min(1.0, x_frac))
+        y_frac = max(0.0, min(1.0, y_frac))
+
+        # Parse size
+        size = item.get("size", {})
+        w_frac = float(size.get("w_frac", 0.03))
+        h_frac = float(size.get("h_frac", 0.02))
+        w_frac = max(0.001, min(0.5, w_frac))
+        h_frac = max(0.001, min(0.5, h_frac))
+
+        # Convert to mm
+        cx_mm = round(x_frac * width_mm, 3)
+        cy_mm = round(y_frac * height_mm, 3)
+        w_mm = round(w_frac * width_mm, 3)
+        h_mm = round(h_frac * height_mm, 3)
+
+        components.append({
+            "id": f"comp_{i + 1}",
+            "type": comp_type,
+            "silkscreen": silkscreen,
+            "package": package,
+            "position_mm": {"x": cx_mm, "y": cy_mm},
+            "size_mm": {"w": w_mm, "h": h_mm},
+            "confidence": round(confidence, 3),
+            "side": side,
+        })
+
+    return components
 

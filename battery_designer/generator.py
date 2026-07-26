@@ -12,7 +12,7 @@ from .kicad import KicadPipeline
 from .models import DesignSpec, ElectricalLimits
 from .mos import MosfetSelection, derive_config_from_count, derive_electrical_limits, get_mosfet
 from .ocp import evaluate_oc_protection
-from .preview import write_mechanical_previews
+from .preview import CalibrationInfo, write_mechanical_previews
 
 
 class DesignGenerator:
@@ -32,8 +32,8 @@ class DesignGenerator:
             raise DesignError("OUTLINE_NOT_CONFIRMED", "The photo-derived board outline must be confirmed before generation.")
         validate_ic_for_design(device, spec.battery.series_cells, spec.port_topology)
 
-        # Derive: which MOSFET is this IC's standard companion?
-        mosfet_mpn = get_reference_mosfet_mpn(device)
+        # Derive: which MOSFET — 优先用用户指定型号，否则用 IC 数据手册推荐
+        mosfet_mpn = spec.mos_mpn or get_reference_mosfet_mpn(device)
         mosfet = get_mosfet(mosfet_mpn)
 
         # Derive: electrical characteristics from mos_count
@@ -62,7 +62,8 @@ class DesignGenerator:
         reports = output / "reports"
         reports.mkdir(parents=True, exist_ok=True)
 
-        artifacts = write_mechanical_previews(spec, preview)
+        calibrations = self._load_calibrations(spec, project_dir)
+        artifacts = write_mechanical_previews(spec, preview, calibrations)
         design_input = spec.model_dump()
         design_input["derived_limits"] = limits.model_dump()
         (output / "design-input.json").write_text(json.dumps(design_input, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -113,6 +114,32 @@ class DesignGenerator:
         }
 
     # ── internal helpers ────────────────────────────────────────
+
+    @staticmethod
+    def _load_calibrations(
+        spec: DesignSpec, project_dir: Path,
+    ) -> dict[str, CalibrationInfo]:
+        """Load calibration data from project photos directory."""
+        calibrations: dict[str, CalibrationInfo] = {}
+        photo_dir = project_dir / "photos"
+        for side in ("front", "back"):
+            side_dir = photo_dir / side
+            if not side_dir.exists():
+                continue
+            cal_json = side_dir / "calibration.json"
+            transparent = side_dir / "transparent.png"
+            ppm = 0.0
+            if cal_json.exists():
+                try:
+                    data = json.loads(cal_json.read_text(encoding="utf-8"))
+                    ppm = float(data.get("pixels_per_mm", 0.0))
+                except Exception:
+                    pass
+            calibrations[side] = CalibrationInfo(
+                pixels_per_mm=ppm,
+                transparent_png_path=transparent if transparent.exists() else None,
+            )
+        return calibrations
 
     @staticmethod
     def _manifest(output: Path, stage: str) -> dict:

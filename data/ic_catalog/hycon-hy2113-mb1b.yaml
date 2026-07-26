@@ -63,4 +63,4 @@ reference_components:
     mpn: FS8205A
     typical_rds_on_mohm: 24
     package: TSSOP-8
-template_dir: null
+template_dir: data/ic_templates/HY2113-MB1B

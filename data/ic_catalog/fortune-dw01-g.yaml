@@ -60,4 +60,4 @@ reference_components:
     typical_f: 0.0000001
     min_f: 0.00000001
     max_f: 0.000001
-template_dir: null
+template_dir: data/ic_templates/DW01-G

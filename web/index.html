@@ -1,216 +1,623 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Battery Protection Board Designer</title>
-<link rel="stylesheet" href="/static/styles.css">
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Battery Designer — 锂电池保护板自动设计</title>
+<link rel="stylesheet" href="/static/styles.css" />
+<style>
+/* ── Layout / Container ── */
+.app-container {
+  max-width: 1320px; margin: 24px auto;
+  padding: 0 16px 80px;
+  display: flex; flex-direction: column; gap: 24px;
+}
+header {
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 18px 24px;
+  text-align: center;
+}
+header h1 { font-size: 1.4rem; margin: 0 0 4px 0; }
+.subtitle { font-size: 0.85rem; color: var(--muted); margin: 0; }
+
+/* ── Text helpers ── */
+.ok { color: #16a34a; font-weight: 500; }
+.ng { color: #dc2626; font-weight: 500; }
+
+/* ── Step header ── */
+.step-header-row {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 16px; padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.step-header-row h2 {
+  font-size: 1.1rem; font-weight: 600; margin: 0; padding: 0; border: none;
+}
+.step-badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 20px;
+  font-size: 0.72rem; font-weight: 600;
+  text-transform: uppercase;
+}
+.step-badge.ready { background: #dcfce7; color: #166534; }
+.step-badge.waiting { background: #fef3c7; color: #92400e; }
+
+/* ── Step 1: 方框尺寸 + 上传 ── */
+.frame-dim-section {
+  background: #f8fafc;
+  border: 2px dashed #94a3b8;
+  border-radius: 12px;
+  padding: 20px 24px;
+  margin-bottom: 20px;
+}
+.frame-dim-section h3 {
+  margin: 0 0 12px 0;
+  font-size: 1.05rem;
+  color: #334155;
+}
+.frame-dim-section .dim-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.frame-dim-section input[type="number"] {
+  width: 70px;
+  padding: 6px 8px;
+  font-size: 1rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  text-align: center;
+}
+.frame-dim-section .dim-unit {
+  color: #64748b;
+  font-size: 0.92rem;
+}
+.frame-dim-section .dim-hint {
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: #94a3b8;
+}
+
+.upload-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 8px;
+}
+
+/* ── Upload zone (vertical layout, no aspect-ratio constraint) ── */
+#step-upload .upload-zone {
+  aspect-ratio: auto;
+  display: block;
+  min-height: 120px;
+  padding: 14px;
+  border: 2px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+  transition: border-color .2s;
+}
+#step-upload .upload-zone:hover { border-color: var(--primary); }
+
+.zone-label {
+  font-weight: 600; font-size: 0.92rem;
+  margin-bottom: 8px; color: var(--text);
+}
+.zone-drop {
+  border: 2px dashed #e2e8f0;
+  border-radius: 8px;
+  padding: 20px 12px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+.zone-drop:hover { border-color: var(--primary); background: #f0f5ff; }
+.zone-drop.drag-over { border-color: var(--primary); background: #eef2ff; }
+.zone-drop p { margin: 0; pointer-events: none; }
+.zone-drop small { font-size: 0.75rem; color: #94a3b8; }
+
+.zone-status {
+  margin-top: 6px; font-size: 0.8rem; min-height: 20px;
+}
+
+/* Rectify toggle inside upload zone */
+.rectify-row {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.rectify-row label {
+  font-size: 0.82rem;
+  cursor: pointer;
+  color: #475569;
+}
+
+/* Canvas inside upload zone */
+.zone-canvas-wrap {
+  margin-top: 8px; text-align: center;
+}
+.zone-canvas-wrap canvas {
+  max-width: 100%; height: auto;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+}
+
+/* Scan button area */
+.scan-area {
+  margin-top: 16px; text-align: center;
+}
+
+/* Paper model section */
+.paper-model-section {
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-top: 16px;
+}
+.paper-model-section h4 {
+  margin: 0 0 8px 0; font-size: 0.95rem; color: #166534;
+}
+
+/* Frame comparison grid */
+.frame-compare-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 14px;
+}
+.frame-compare-side {
+  background: #f1f5f9;
+  border-radius: 8px;
+  padding: 12px 14px;
+  font-size: 0.85rem;
+}
+.frame-compare-side h4 { margin: 0 0 6px 0; font-size: 0.9rem; }
+
+/* ── Step 2: 获取PCB & 识别 ── */
+.detect-grid-combined {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-top: 12px;
+}
+.detect-side {
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 14px;
+  background: #fafafa;
+}
+.detect-side h4 { margin: 0 0 8px 0; }
+.detect-side .action-row { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* Combined extract button centered */
+.combined-btn-area {
+  text-align: center;
+  margin: 20px 0 16px 0;
+}
+.btn-combined {
+  background: #0f172a; color: #fff;
+  padding: 12px 28px; font-size: 1.05rem; font-weight: 600;
+  border: none; border-radius: 8px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 8px;
+}
+.btn-combined:hover { background: #1e293b; }
+.btn-combined:disabled { background: #cbd5e1; cursor: not-allowed; }
+.btn-combined.btn-done { background: #16a34a; }
+
+/* Calibrate canvas in step 2 */
+.cal-canvas-wrap {
+  margin-top: 8px;
+}
+.cal-canvas-wrap canvas {
+  max-width: 100%; height: auto;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  cursor: zoom-in;
+  transition: transform 0.15s ease;
+  /* Checkerboard reveals transparent notch/groove areas (image is RGBA;
+     without this the transparent pixels show the white card behind). */
+  background: repeating-conic-gradient(#e2e8f0 0% 25%, #fff 0% 50%) 50% / 16px 16px;
+}
+.cal-canvas-wrap canvas:hover {
+  transform: scale(1.01);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.12);
+}
+
+/* ── Buttons (extended) ── */
+.btn-secondary {
+  background: #334155; color: #fff;
+  padding: 8px 18px;
+  border: none; border-radius: 8px;
+  font-size: .88rem; font-weight: 500;
+  cursor: pointer;
+}
+.btn-secondary:hover:not(:disabled) { background: #475569; }
+.btn-secondary:disabled { opacity: .4; cursor: not-allowed; }
+.btn-sm { padding: 6px 14px; font-size: .8rem; }
+.btn-done { background: #16a34a !important; color: #fff !important; }
+
+/* Contour consistency section */
+.consistency-section {
+  background: #fefce8;
+  border: 1px solid #fde047;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-top: 16px;
+}
+.consistency-section h4 { margin: 0 0 8px 0; }
+.consistency-section .match-ok { color: #16a34a; }
+.consistency-section .match-ng { color: #dc2626; }
+
+.img-grid { margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap; }
+.img-grid img { max-width: 280px; border-radius: 6px; border: 1px solid #d1d5db; }
+
+/* ── Results Tables ── */
+.results-tables {
+  margin-top: 16px;
+}
+.results-tables h3 {
+  font-size: 1rem; color: #334155;
+  margin: 0 0 8px 0;
+}
+.results-table {
+  width: 100%; border-collapse: collapse;
+  font-size: .82rem;
+}
+.results-table th, .results-table td {
+  padding: 8px 12px; text-align: left;
+  border-bottom: 1px solid #e2e8f0;
+}
+.results-table th { color: #64748b; font-weight: 500; background: #f8fafc; }
+.results-table tr:hover { background: #f1f5f9; }
+
+/* ── Generate / Download ── */
+.gen-actions { margin-top: 14px; }
+.gen-actions h4 { font-size: .9rem; margin: 0 0 8px 0; }
+.gen-actions .btn { margin: 4px; }
+
+/* ── Step 3: Parameter sections ── */
+.param-section {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 14px;
+}
+.param-section h3 {
+  margin: 0 0 10px 0;
+  font-size: 0.95rem;
+  color: #334155;
+}
+.param-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.param-row label { font-size: 0.85rem; color: #475569; font-weight: 500; }
+.param-row input[type="text"],
+.param-row input[type="number"],
+.param-row select {
+  padding: 5px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.88rem;
+}
+.param-row input[type="text"] { width: 160px; }
+.param-hint {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  color: #94a3b8;
+}
+.param-result {
+  margin-top: 10px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.82rem;
+  color: #166534;
+}
+.param-result.result-error {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #dc2626;
+}
+.radio-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85rem;
+  color: #475569;
+  cursor: pointer;
+}
+.spinner {
+  display: inline-block;
+  width: 12px; height: 12px;
+  border: 2px solid #94a3b8;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#frame-info { margin-top: 6px; font-size: 0.85rem; }
+
+/* ── Responsive ── */
+@media (max-width: 900px) {
+  .upload-row, .detect-grid-combined { grid-template-columns: 1fr; }
+  .app-container { padding: 0 8px 60px; }
+}
+</style>
 </head>
 <body>
-
-<!-- ═══ Top Bar: Electrical Parameters ═══ -->
-<header id="top-bar">
-  <span class="logo">🔋 PCB Designer</span>
-  <div class="param-group">
-    <label>IC型号</label>
-    <select id="param-ic"></select>
-  </div>
-  <div class="param-group">
-    <label>电芯类型</label>
-    <select id="param-cell">
-      <option value="1S">1S (3.7V)</option>
-      <option value="2S">2S (7.4V)</option>
-      <option value="3S">3S (11.1V)</option>
-    </select>
-  </div>
-  <div class="param-group">
-    <label>最大电流</label>
-    <input type="number" id="param-current" value="5" min="0.1" step="0.1"> A
-  </div>
-  <div class="param-group">
-    <label>保护电压范围</label>
-    <input type="number" id="param-vmin" value="3.0" min="2.0" step="0.1"> –
-    <input type="number" id="param-vmax" value="4.25" min="3.0" step="0.1"> V
-  </div>
-  <div class="param-group">
-    <label>MOS型号</label>
-    <select id="param-mos"></select>
-  </div>
-  <span class="param-status" id="param-status">⚙️ 就绪</span>
+<div class="app-container">
+<header>
+  <h1>Battery Designer</h1>
+  <p class="subtitle">锂电池保护板 — 自动提取 PCB 轮廓 · 识别孔位焊盘 · 生成 KiCad 工程</p>
 </header>
 
-<!-- ═══ Main Layout ═══ -->
-<main id="workspace">
-  <!-- Simulation Status Bar -->
-  <section class="step-card" id="step-sim" hidden>
-    <div class="sim-status" id="sim-status">
-      <span class="sim-icon" id="sim-icon">⏳</span>
-      <span class="sim-text" id="sim-text">正在模拟流程...</span>
-      <div class="sim-details" id="sim-details"></div>
+<!-- ═══════════════════════════════════════════════════════ -->
+<!-- Step 1: 方框尺寸 → 上传图片 → 矫正预览 → 方框检测对比 -->
+<!-- ═══════════════════════════════════════════════════════ -->
+<section class="step-card" id="step-upload">
+  <div class="step-header-row">
+    <h2>步骤1 — 设置尺寸 & 上传图片</h2>
+    <span class="step-badge waiting" id="badge-step1">等待输入</span>
+  </div>
+
+  <!-- 1a: 黑色方框外尺寸 (最前面) -->
+  <div class="frame-dim-section">
+    <h3>黑色方框外尺寸</h3>
+    <div class="dim-row">
+      <label>宽</label>
+      <input type="number" id="frame-w" value="60" min="10" max="200" step="10" />
+      <span class="dim-unit">&times;</span>
+      <label>高</label>
+      <input type="number" id="frame-h" value="30" min="10" max="200" step="10" />
+      <span class="dim-unit">mm</span>
     </div>
-  </section>
+    <div class="dim-hint">以 10mm 为整数倍，填写黑色方框的真实物理外尺寸</div>
+  </div>
 
-  <!-- Step 1: Upload Images -->
-  <section class="step-card" id="step-upload">
-    <h2>📷 步骤1 — 上传图片</h2>
-    <div class="upload-row">
-      <div class="upload-zone" id="zone-front">
-        <input type="file" id="file-front" accept="image/jpeg,image/png" hidden>
-        <div class="zone-inner" id="zone-inner-front">
-          <span class="zone-icon">📸</span>
-          <span class="zone-label">正面 Front</span>
-          <span class="zone-hint">点击或拖拽上传</span>
-        </div>
-        <img class="zone-preview" id="preview-front" alt="Front preview">
-        <button class="btn btn-sm rectify-toggle" id="btn-rectify-front" hidden title="预览矫正图片">🔄 矫正预览</button>
-        <span class="rectify-badge" id="badge-rectify-front" hidden>已矫正</span>
+  <!-- 1b: 上传正反面图片（两列） -->
+  <div class="upload-row">
+    <!-- 正面 -->
+    <div class="upload-zone" id="zone-front">
+      <div class="zone-label">正面 Front</div>
+      <div class="zone-drop" id="drop-front">
+        <p>拖放或点击上传<br /><small>JPG / PNG</small></p>
+        <input type="file" id="file-front" accept="image/jpeg,image/png" hidden />
       </div>
-      <div class="upload-zone" id="zone-back">
-        <input type="file" id="file-back" accept="image/jpeg,image/png" hidden>
-        <div class="zone-inner" id="zone-inner-back">
-          <span class="zone-icon">📸</span>
-          <span class="zone-label">背面 Back</span>
-          <span class="zone-hint">点击或拖拽上传</span>
-        </div>
-        <img class="zone-preview" id="preview-back" alt="Back preview">
-        <button class="btn btn-sm rectify-toggle" id="btn-rectify-back" hidden title="预览矫正图片">🔄 矫正预览</button>
-        <span class="rectify-badge" id="badge-rectify-back" hidden>已矫正</span>
+      <!-- 矫正预览 toggle (上传后显示，在上方) -->
+      <div class="rectify-row" id="rectify-row-front" hidden>
+        <label>
+          <input type="checkbox" id="rect-toggle-front" checked /> 显示矫正面
+        </label>
       </div>
-    </div>
-  </section>
-
-  <!-- Step 2: Black Frame Setup -->
-  <section class="step-card" id="step-frame">
-    <h2>📏 步骤2 — 先填入尺寸，再扫描黑色方框</h2>
-
-    <!-- Black Frame mode controls -->
-    <div class="cal-panel" id="panel-black-frame">
-      <div class="frame-controls">
-        <div class="frame-size">
-          <label>🖼️ 黑色方框外尺寸（10mm整数倍）</label>
-          <div class="size-input-group">
-            <input type="number" id="frame-w" value="60" min="10" max="200" step="10" class="size-input">
-            <span class="size-sep">×</span>
-            <input type="number" id="frame-h" value="30" min="10" max="200" step="10" class="size-input">
-            <span class="size-unit">mm</span>
-          </div>
-          <p class="muted" style="margin-top:4px;font-size:12px">先填入黑色方框实际尺寸，再点击"扫描黑色方框"自动检测位置</p>
-        </div>
-        <div class="frame-actions">
-          <button class="btn btn-outline" id="btn-scan-frame">🔍 扫描黑色方框</button>
-          <div class="frame-info" id="frame-info">
-            <span class="muted">先上传图片，填入尺寸后点击扫描</span>
-          </div>
-        </div>
+      <!-- Canvas 显示矫正/原始图像 -->
+      <div class="zone-canvas-wrap" id="canvas-wrap-front" hidden>
+        <canvas id="canvas-front" width="560" height="360"></canvas>
       </div>
-      <!-- Frame Comparison Results -->
-      <div class="frame-compare" id="frame-compare" hidden>
-        <h4>📐 方框检测对比</h4>
-        <div class="compare-grid">
-          <div class="compare-item">
-            <span class="compare-label">期望尺寸</span>
-            <span class="compare-value" id="cmp-expected">—</span>
-          </div>
-          <div class="compare-item">
-            <span class="compare-label">检测尺寸</span>
-            <span class="compare-value" id="cmp-detected">—</span>
-          </div>
-          <div class="compare-item">
-            <span class="compare-label">宽高比误差</span>
-            <span class="compare-value" id="cmp-aspect-error">—</span>
-          </div>
-          <div class="compare-item">
-            <span class="compare-label">结果</span>
-            <span class="compare-value" id="cmp-status">—</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- Step 3 & 4: Calibrate + Detect per side -->
-  <section class="step-card" id="step-detect" hidden>
-    <h2>🔬 步骤3 — 标定 & 识别（扫描成功后可操作）</h2>
-    <div class="detect-grid">
-      <!-- Front Column -->
-      <div class="detect-col" data-side="front">
-        <h3>🔵 正面 Front</h3>
-        <div class="detect-actions">
-          <button class="btn btn-primary" id="btn-calibrate-front" disabled>🎯 标定正面</button>
-          <span class="action-hint">透视矫正</span>
-        </div>
-        <div class="canvas-wrap" id="canvas-wrap-front">
-          <canvas id="canvas-front"></canvas>
-          <div class="canvas-overlay" id="overlay-front">
-            <span>等待标定...</span>
-          </div>
-        </div>
-        <div class="detect-stats" id="stats-front"></div>
-        <div class="detect-actions step-actions">
-          <button class="btn btn-outline" id="btn-extract-pcb-front" disabled>✂️ 识别轮廓</button>
-          <span class="action-hint">去白底→去阴影→识别凹槽</span>
-        </div>
-        <div class="step-result" id="extract-result-front" hidden></div>
-        <div class="detect-actions step-actions">
-          <button class="btn btn-outline" id="btn-detect-holes-front" disabled>⭕ 识别孔槽</button>
-          <span class="action-hint">PCB内白色区域</span>
-        </div>
-        <div class="step-result" id="holes-result-front" hidden></div>
-        <div class="detect-actions pad-actions">
-          <button class="btn btn-accent" id="btn-pads-front" disabled>📌 识别焊盘</button>
-          <span class="action-hint">VLM自动标注</span>
-        </div>
-      </div>
-      <!-- Back Column -->
-      <div class="detect-col" data-side="back">
-        <h3>🔴 背面 Back</h3>
-        <div class="detect-actions">
-          <button class="btn btn-primary" id="btn-calibrate-back" disabled>🎯 标定背面</button>
-          <span class="action-hint">透视矫正</span>
-        </div>
-        <div class="canvas-wrap" id="canvas-wrap-back">
-          <canvas id="canvas-back"></canvas>
-          <div class="canvas-overlay" id="overlay-back">
-            <span>等待标定...</span>
-          </div>
-        </div>
-        <div class="detect-stats" id="stats-back"></div>
-        <div class="detect-actions step-actions">
-          <button class="btn btn-outline" id="btn-extract-pcb-back" disabled>✂️ 识别轮廓</button>
-          <span class="action-hint">去白底→去阴影→识别凹槽</span>
-        </div>
-        <div class="step-result" id="extract-result-back" hidden></div>
-        <div class="detect-actions step-actions">
-          <button class="btn btn-outline" id="btn-detect-holes-back" disabled>⭕ 识别孔槽</button>
-          <span class="action-hint">PCB内白色区域</span>
-        </div>
-        <div class="step-result" id="holes-result-back" hidden></div>
-        <div class="detect-actions pad-actions">
-          <button class="btn btn-accent" id="btn-pads-back" disabled>📌 识别焊盘</button>
-          <span class="action-hint">VLM自动标注</span>
-        </div>
-      </div>
+      <div class="zone-status" id="status-front"></div>
     </div>
 
-    <!-- Hole & Pad detail tables -->
-    <div class="results-tables" id="results-tables" hidden>
-      <div class="table-col" id="table-front"></div>
-      <div class="table-col" id="table-back"></div>
+    <!-- 背面 -->
+    <div class="upload-zone" id="zone-back">
+      <div class="zone-label">背面 Back</div>
+      <div class="zone-drop" id="drop-back">
+        <p>拖放或点击上传<br /><small>JPG / PNG</small></p>
+        <input type="file" id="file-back" accept="image/jpeg,image/png" hidden />
+      </div>
+      <div class="rectify-row" id="rectify-row-back" hidden>
+        <label>
+          <input type="checkbox" id="rect-toggle-back" checked /> 显示矫正面
+        </label>
+      </div>
+      <div class="zone-canvas-wrap" id="canvas-wrap-back" hidden>
+        <canvas id="canvas-back" width="560" height="360"></canvas>
+      </div>
+      <div class="zone-status" id="status-back"></div>
     </div>
-  </section>
+  </div>
 
-  <!-- Step 5: Export -->
-  <section class="step-card" id="step-export" hidden>
-    <h2>🚀 步骤4 — 生成设计</h2>
-    <button class="btn btn-success btn-lg" id="btn-generate" disabled>
-      生成 KiCad 工程 →  schematic + PCB + BOM
+  <!-- 1c: 纸张底色模型 (上传后自动显示) -->
+  <div class="paper-model-section" id="paper-model" hidden>
+    <h4>纸张底色模型</h4>
+    <p style="font-size:0.8rem;color:#475569;margin:0 0 8px 0;">
+      自动提取纸张背景信息，用于后续阴影去除
+    </p>
+    <div id="paper-model-content"></div>
+  </div>
+
+  <!-- 1d: 扫描黑色方框按钮 -->
+  <div class="scan-area">
+    <button class="btn btn-outline" id="btn-scan-frame" disabled>矫正预览</button>
+    <div id="frame-info" style="margin-top:6px; font-size:0.85rem;"></div>
+  </div>
+
+  <!-- 1e: 方框检测对比 (矫正预览后显示，正反面分开) -->
+  <div class="frame-compare-grid" id="frame-compare-grid" hidden>
+    <div class="frame-compare-side" id="frame-compare-front">
+      <h4>正面方框检测</h4>
+      <div id="frame-comp-front-content"></div>
+    </div>
+    <div class="frame-compare-side" id="frame-compare-back">
+      <h4>背面方框检测</h4>
+      <div id="frame-comp-back-content"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════ -->
+<!-- Step 2: 获取PCB → 轮廓识别(合并) → 孔槽 → 焊盘 → 一致性校验 -->
+<!-- ═══════════════════════════════════════════════════════ -->
+<section class="step-card" id="step-detect" hidden>
+  <div class="step-header-row">
+    <h2>步骤2 — 获取PCB & 识别</h2>
+    <span class="step-badge waiting" id="badge-step2">等待获取</span>
+  </div>
+  <p style="color:#64748b; font-size:0.85rem; margin:0 0 12px 0;">
+    获取正反面PCB轮廓，校正透视畸变
+  </p>
+
+  <!-- 2a: 获取PCB按钮 per side（两列） -->
+  <div class="detect-grid-combined">
+    <div class="detect-side" id="cal-side-front">
+      <h4>正面 Front — 获取PCB</h4>
+      <button class="btn btn-secondary" id="btn-cal-front" disabled>获取PCB正面</button>
+      <div class="cal-canvas-wrap" id="cal-canvas-wrap-front" hidden>
+        <canvas id="cal-canvas-front" width="560" height="360"></canvas>
+      </div>
+    </div>
+    <div class="detect-side" id="cal-side-back">
+      <h4>背面 Back — 获取PCB</h4>
+      <button class="btn btn-secondary" id="btn-cal-back" disabled>获取PCB反面</button>
+      <div class="cal-canvas-wrap" id="cal-canvas-wrap-back" hidden>
+        <canvas id="cal-canvas-back" width="560" height="360"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2b: 合并轮廓识别按钮 (放在两个图片位置的中间) -->
+  <div class="combined-btn-area">
+    <button class="btn-combined" id="btn-extract-both" disabled>
+      识别轮廓（正反面同时）
     </button>
-    <div id="export-status"></div>
-  </section>
-</main>
+    <p style="color:#94a3b8; font-size:0.78rem; margin:4px 0 0 0;">
+      结合正反面透视结果，交叉验证 PCB 轮廓
+    </p>
+  </div>
 
-<!-- Toast notification -->
-<div id="toast" class="toast"></div>
+  <!-- 2c: 轮廓识别结果 + 孔槽/焊盘/元器件一键识别 -->
+  <div class="detect-grid-combined" id="extract-results-grid" hidden>
+    <div style="text-align:center; margin-bottom:10px;">
+      <button class="btn btn-primary btn-sm" id="btn-detect-all" disabled>一键识别正反面孔槽/焊盘/元器件</button>
+    </div>
+    <div class="detect-side">
+      <h4>正面 Front — 识别结果</h4>
+      <div id="extract-result-front"></div>
+      <div id="holes-result-front" style="margin-top:6px; font-size:0.85rem;"></div>
+      <div id="components-result-front" style="margin-top:6px; font-size:0.85rem;"></div>
+    </div>
+    <div class="detect-side">
+      <h4>背面 Back — 识别结果</h4>
+      <div id="extract-result-back"></div>
+      <div id="holes-result-back" style="margin-top:6px; font-size:0.85rem;"></div>
+      <div id="components-result-back" style="margin-top:6px; font-size:0.85rem;"></div>
+    </div>
+  </div>
+
+  <!-- 2d: 正反面轮廓一致性校验 (识别轮廓后显示) -->
+  <div class="consistency-section" id="contour-match" hidden>
+    <h4>正反面轮廓一致性校验</h4>
+    <div id="contour-match-content"></div>
+  </div>
+
+  <!-- 2e: 识别汇总表格 -->
+  <div class="results-tables" id="results-tables" hidden>
+    <h3>识别汇总</h3>
+    <div id="results-tables-content"></div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════ -->
+<!-- Step 3: 设计参数输入 & 生成 -->
+<!-- ═══════════════════════════════════════════════════════ -->
+<section class="step-card" id="step-export" hidden>
+  <div class="step-header-row">
+    <h2>步骤3 — 设计参数 & 生成</h2>
+    <span class="step-badge waiting" id="badge-step3">等待输入</span>
+  </div>
+
+  <!-- 3a: 电芯信息 -->
+  <div class="param-section">
+    <h3>① 电芯信息（必填）</h3>
+    <div class="param-row">
+      <label>厂商</label>
+      <input type="text" id="cell-manufacturer" placeholder="如 Samsung / Sony / 宁德时代" />
+      <label>型号</label>
+      <input type="text" id="cell-model" placeholder="如 INR18650-25R / VTC6 / 503048" />
+      <button class="btn btn-secondary btn-sm" id="btn-cell-lookup">AI查询参数</button>
+    </div>
+    <div id="cell-result" class="param-result" hidden></div>
+  </div>
+
+  <!-- 3b: 保护IC -->
+  <div class="param-section">
+    <h3>② 保护IC型号（必填）</h3>
+    <div class="param-row">
+      <label>IC型号/丝印</label>
+      <input type="text" id="ic-model" value="DW01" placeholder="输入真实型号或芯片丝印，如 DW01 / 3M1B" />
+      <button class="btn btn-secondary btn-sm" id="btn-ic-resolve">解析IC</button>
+    </div>
+    <div class="param-hint">支持输入丝印（如 3M1B），系统自动映射到真实型号（如 HY2113-MB1B）</div>
+    <div id="ic-result" class="param-result" hidden></div>
+  </div>
+
+  <!-- 3c: 电池组配置 -->
+  <div class="param-section">
+    <h3>③ 电池组配置（必填）</h3>
+    <div class="param-row">
+      <label>串并联</label>
+      <select id="cell-count">
+        <option value="1" selected>1</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4">4</option>
+        <option value="5">5</option>
+      </select>
+      <select id="cell-connection">
+        <option value="series" selected>串联 (S)</option>
+        <option value="parallel">并联 (P)</option>
+      </select>
+      <label style="margin-left:16px;">MOS管型号</label>
+      <input type="text" id="mos-model" placeholder="可选，默认用IC推荐" style="width:130px;" />
+    </div>
+    <div class="param-row" style="margin-top:8px;">
+      <label>目标放电电流</label>
+      <input type="number" id="target-current" placeholder="可选" min="0.1" max="200" step="0.5" style="width:80px;" />
+      <span class="dim-unit">A（可选，不填则从MOS配置推算）</span>
+    </div>
+  </div>
+
+  <!-- 3d: 端口拓扑 & 均衡 -->
+  <div class="param-section">
+    <h3>④ 端口拓扑 & 均衡</h3>
+    <div class="param-row">
+      <label>充放电端口</label>
+      <label class="radio-inline"><input type="radio" name="port-topology" value="auto" checked /> 自动推断</label>
+      <label class="radio-inline"><input type="radio" name="port-topology" value="common" /> 共口</label>
+      <label class="radio-inline"><input type="radio" name="port-topology" value="separate" /> 分口</label>
+    </div>
+    <div id="topology-inferred" class="param-hint" hidden></div>
+    <div class="param-row" style="margin-top:8px;" id="balance-row">
+      <label>均衡功能</label>
+      <label class="radio-inline"><input type="radio" name="balance" value="yes" checked /> 有均衡</label>
+      <label class="radio-inline"><input type="radio" name="balance" value="no" /> 无均衡</label>
+      <span class="dim-unit" id="balance-hint">（2S及以上建议开启）</span>
+    </div>
+  </div>
+
+  <!-- 3e: 生成按钮 -->
+  <div style="margin-top:18px; text-align:center;">
+    <button class="btn btn-primary" id="btn-generate" disabled>生成 KiCad 工程</button>
+  </div>
+  <div id="gen-status" style="margin-top:8px; font-size:0.85rem;"></div>
+  <div id="gen-actions" class="gen-actions" hidden>
+    <h4>下载文件</h4>
+    <div id="gen-downloads"></div>
+  </div>
+</section>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

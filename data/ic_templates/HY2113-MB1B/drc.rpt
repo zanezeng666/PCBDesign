@@ -1,0 +1,222 @@
+** Drc report for pcb.kicad_pcb **
+** Created on 2026-07-26T09:10:19 **
+** Report includes: Errors, Warnings **
+
+** Found 51 DRC violations **
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(4.0000 mm, 12.5400 mm): Track [P-] on B.Cu, length 5.0800 mm
+    @(4.0000 mm, 10.0000 mm): Track [B+] on B.Cu, length 5.0800 mm
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(13.1375 mm, 14.3250 mm): Track [P-] on B.Cu, length 9.3102 mm
+    @(4.0000 mm, 10.0000 mm): Track [B+] on B.Cu, length 5.0800 mm
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(4.0000 mm, 12.5400 mm): Track [P-] on B.Cu, length 5.0800 mm
+    @(4.0000 mm, 15.0800 mm): Track [B+] on B.Cu, length 25.2723 mm
+[shorting_items]: 短路了两个不同网络的项目 (网络 OD 和 MID)
+    Local override; error
+    @(14.8625 mm, 5.5500 mm): Track [OD] on B.Cu, length 8.3061 mm
+    @(14.8625 mm, 6.5000 mm): Via [MID] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 B+ 和 P-)
+    Local override; error
+    @(4.0000 mm, 15.0800 mm): PTH pad 3 [B+] of J1
+    @(4.0000 mm, 12.5400 mm): Track [P-] on B.Cu, length 5.0800 mm
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.1500 mm)
+    Local override; error
+    @(14.8625 mm, 5.5500 mm): Via [OD] on F.Cu - B.Cu
+    @(14.8625 mm, 6.5000 mm): Via [MID] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.0879 mm)
+    Local override; error
+    @(13.1375 mm, 14.3250 mm): Track [P-] on B.Cu, length 9.3102 mm
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(4.0000 mm, 15.0800 mm): Track [B+] on B.Cu, length 25.2723 mm
+    @(14.8625 mm, 6.5000 mm): Track [MID] on B.Cu, length 9.3715 mm
+[shorting_items]: 短路了两个不同网络的项目 (网络 P- 和 B+)
+    Local override; error
+    @(4.0000 mm, 12.5400 mm): PTH pad 2 [P-] of J1
+    @(4.0000 mm, 10.0000 mm): Track [B+] on B.Cu, length 5.0800 mm
+[shorting_items]: 短路了两个不同网络的项目 (网络 VDD 和 B+)
+    Local override; error
+    @(28.8250 mm, 5.0000 mm): Track [VDD] on B.Cu, length 11.7834 mm
+    @(27.1750 mm, 5.0000 mm): Via [B+] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.1500 mm)
+    Local override; error
+    @(14.8625 mm, 7.4500 mm): Via [OC] on F.Cu - B.Cu
+    @(14.8625 mm, 6.5000 mm): Via [MID] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.1000 mm)
+    Local override; error
+    @(13.1375 mm, 13.0250 mm): Track [B-] on F.Cu, length 2.1375 mm
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0000 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(4.0000 mm, 10.0000 mm): Track [B+] on B.Cu, length 5.0800 mm
+    @(4.0000 mm, 12.5400 mm): PTH pad 2 [P-] of J1
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.0500 mm)
+    Local override; error
+    @(13.1375 mm, 13.6750 mm): Pad 2 [OD] of Q1 on F.Cu
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.1000 mm)
+    Local override; error
+    @(13.1375 mm, 14.3250 mm): Track [P-] on B.Cu, length 9.3102 mm
+    @(13.1375 mm, 14.9750 mm): Via [OC] on F.Cu - B.Cu
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(14.8625 mm, 5.5500 mm): Track [OD] on B.Cu, length 8.3061 mm
+    @(4.0000 mm, 15.0800 mm): Track [B+] on B.Cu, length 25.2723 mm
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.0500 mm)
+    Local override; error
+    @(13.1375 mm, 14.9750 mm): Pad 4 [OC] of Q1 on F.Cu
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(4.0000 mm, 15.0800 mm): Track [B+] on B.Cu, length 25.2723 mm
+    @(17.1375 mm, 6.5000 mm): Track [VDD] on B.Cu, length 10.6774 mm
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0000 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(28.8250 mm, 5.0000 mm): Track [VDD] on B.Cu, length 11.7834 mm
+    @(27.1750 mm, 5.0000 mm): Via [B+] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 P- 和 OD)
+    Local override; error
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(4.0000 mm, 15.0800 mm): Track [B+] on B.Cu, length 25.2723 mm
+    @(14.8625 mm, 7.4500 mm): Track [OC] on B.Cu, length 7.7202 mm
+[shorting_items]: 短路了两个不同网络的项目 (网络 OD 和 MID)
+    Local override; error
+    @(14.8625 mm, 5.5500 mm): Track [OD] on B.Cu, length 8.3061 mm
+    @(14.8625 mm, 6.5000 mm): Track [MID] on B.Cu, length 9.3715 mm
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0500 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.1500 mm)
+    Local override; error
+    @(14.8625 mm, 7.4500 mm): Via [OC] on F.Cu - B.Cu
+    @(14.8625 mm, 6.5000 mm): Via [MID] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 OC 和 MID)
+    Local override; error
+    @(14.8625 mm, 7.4500 mm): Via [OC] on F.Cu - B.Cu
+    @(14.8625 mm, 6.5000 mm): Track [MID] on B.Cu, length 9.3715 mm
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.0905 mm)
+    Local override; error
+    @(14.8625 mm, 5.5500 mm): Track [OD] on B.Cu, length 8.3061 mm
+    @(14.8625 mm, 7.4500 mm): Track [OC] on B.Cu, length 7.7202 mm
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(4.0000 mm, 15.0800 mm): Track [B+] on B.Cu, length 25.2723 mm
+    @(28.8250 mm, 5.0000 mm): Track [VDD] on B.Cu, length 11.7834 mm
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0000 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(14.8625 mm, 5.5500 mm): Track [OD] on B.Cu, length 8.3061 mm
+    @(14.8625 mm, 6.5000 mm): Via [MID] on F.Cu - B.Cu
+[tracks_crossing]: Tracks crossing
+    Local override; error
+    @(4.0000 mm, 15.0800 mm): Track [B+] on B.Cu, length 25.2723 mm
+    @(13.1375 mm, 14.3250 mm): Track [P-] on B.Cu, length 9.3102 mm
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.1055 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(14.8625 mm, 6.5000 mm): Track [MID] on B.Cu, length 9.3715 mm
+    @(14.8625 mm, 7.4500 mm): Via [OC] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.0500 mm)
+    Local override; error
+    @(13.1375 mm, 13.0250 mm): Pad 1 [B-] of Q1 on F.Cu
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 OC 和 P-)
+    Local override; error
+    @(13.1375 mm, 14.9750 mm): Via [OC] on F.Cu - B.Cu
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 OC 和 OD)
+    Local override; error
+    @(14.8625 mm, 7.4500 mm): Track [OC] on B.Cu, length 7.7202 mm
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.1500 mm)
+    Local override; error
+    @(14.8625 mm, 5.5500 mm): Via [OD] on F.Cu - B.Cu
+    @(14.8625 mm, 6.5000 mm): Via [MID] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 OD 和 OC)
+    Local override; error
+    @(14.8625 mm, 5.5500 mm): Track [OD] on B.Cu, length 8.3061 mm
+    @(14.8625 mm, 7.4500 mm): Via [OC] on F.Cu - B.Cu
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0000 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(14.8625 mm, 7.4500 mm): Track [OC] on B.Cu, length 7.7202 mm
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0500 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(13.1375 mm, 14.9750 mm): Via [OC] on F.Cu - B.Cu
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0000 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(4.0000 mm, 12.5400 mm): Track [P-] on B.Cu, length 5.0800 mm
+    @(4.0000 mm, 15.0800 mm): PTH pad 3 [B+] of J1
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0946 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(14.8625 mm, 5.5500 mm): Track [OD] on B.Cu, length 8.3061 mm
+    @(14.8625 mm, 7.4500 mm): Via [OC] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 OC 和 P-)
+    Local override; error
+    @(14.8625 mm, 7.4500 mm): Track [OC] on B.Cu, length 7.7202 mm
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.0500 mm)
+    Local override; error
+    @(13.1375 mm, 14.3250 mm): Pad 3 [P-] of Q1 on F.Cu
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.1500 mm)
+    Local override; error
+    @(14.8625 mm, 5.5500 mm): Track [OD] on B.Cu, length 8.3061 mm
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0000 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(14.8625 mm, 7.4500 mm): Track [OC] on B.Cu, length 7.7202 mm
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 OC 和 P-)
+    Local override; error
+    @(14.8625 mm, 7.4500 mm): Track [OC] on B.Cu, length 7.7202 mm
+    @(13.1375 mm, 14.3250 mm): Track [P-] on B.Cu, length 9.3102 mm
+[shorting_items]: 短路了两个不同网络的项目 (网络 P- 和 OD)
+    Local override; error
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0500 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+    @(13.1375 mm, 13.6750 mm): Via [OD] on F.Cu - B.Cu
+[shorting_items]: 短路了两个不同网络的项目 (网络 OC 和 P-)
+    Local override; error
+    @(13.1375 mm, 14.9750 mm): Via [OC] on F.Cu - B.Cu
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[hole_clearance]: 孔间距违规 (<电路板配置> 中的 "孔" 约束 间距 0.2500 mm; 实际 0.0500 mm)
+    Rule: <电路板配置> 中的 "孔" 约束; error
+    @(13.1375 mm, 14.9750 mm): Via [OC] on F.Cu - B.Cu
+    @(13.1375 mm, 14.3250 mm): Via [P-] on F.Cu - B.Cu
+[clearance]: 间距违规 ( 间距 0.2000 mm; 实际 0.0500 mm)
+    Local override; error
+    @(13.1375 mm, 14.3250 mm): Pad 3 [P-] of Q1 on F.Cu
+    @(13.1375 mm, 14.9750 mm): Via [OC] on F.Cu - B.Cu
+[solder_mask_bridge]: 底层阻焊开窗区域与不同网络的项目相连
+    Rule: <电路板配置> 中的 "阻焊层最小宽度"; error
+    @(4.0000 mm, 10.0000 mm): Track [B+] on B.Cu, length 5.0800 mm
+    @(4.0000 mm, 12.5400 mm): PTH pad 2 [P-] of J1
+[solder_mask_bridge]: 底层阻焊开窗区域与不同网络的项目相连
+    Rule: <电路板配置> 中的 "阻焊层最小宽度"; error
+    @(4.0000 mm, 12.5400 mm): Track [P-] on B.Cu, length 5.0800 mm
+    @(4.0000 mm, 15.0800 mm): PTH pad 3 [B+] of J1
+
+** Found 0 unconnected pads **
+
+** Found 0 Footprint errors **
+
+** Ignored checks **
+    - Footprint has no courtyard defined
+    - Track endpoint not centered on via
+    - Tuning profile track geometries
+    - Footprint doesn't match symbol's footprint filters
+    - Footprint component type doesn't match footprint pads
+
+** End of Report **

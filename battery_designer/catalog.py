@@ -19,6 +19,19 @@ def normalize_mpn(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", value.upper())
 
 
+# 丝印分行分隔符：用户可能用 "/"、空格、换行、";" 连接多行丝印
+_LINE_SEPARATORS = re.compile(r"[/\s;]+")
+
+
+def first_marking_line(value: str) -> str:
+    """提取多行丝印的第一行。
+
+    IC 丝印常为两行，第二行通常是随芯片变化的日期/批次码
+    （如 '3M1B/N607' → '3M1B'），只有第一行是固定的产品码。
+    """
+    return _LINE_SEPARATORS.split(value.strip())[0]
+
+
 @dataclass(frozen=True)
 class DevicePackage:
     requested_model: str
@@ -110,14 +123,21 @@ class IcCatalog:
         return candidates
 
     def resolve(self, requested_model: str) -> DevicePackage:
+        local = self._local_candidates()
+        # 依次尝试各候选匹配键（先完整串，再首行），兼容多行丝印输入
+        for requested in self._match_keys(requested_model):
+            matched = [item for item in local if self._matches(item, requested)]
+            if matched:
+                return self._apply_validation(DevicePackage.from_dict(self._rank(matched, requested)[0], requested_model))
+        # 本地未命中：用完整归一化键查缓存/在线解析
         requested = normalize_mpn(requested_model)
-        local = [item for item in self._local_candidates() if normalize_mpn(item["full_mpn"]) == requested or requested in [normalize_mpn(v) for v in item.get("aliases", [])]]
-        if local:
-            return self._apply_validation(DevicePackage.from_dict(self._rank(local, requested)[0], requested_model))
         cached = self.cache_dir / f"{requested}.json"
         if cached.exists():
             payload = json.loads(cached.read_text(encoding="utf-8"))
-            return self._apply_validation(DevicePackage.from_dict(self._rank(payload, requested)[0], requested_model))
+            items = payload if isinstance(payload, list) else [payload]
+            matched_cached = [item for item in items if self._matches(item, requested)]
+            if matched_cached:
+                return self._apply_validation(DevicePackage.from_dict(self._rank(matched_cached, requested)[0], requested_model))
         if not self.resolver_endpoint:
             raise DesignError(
                 "IC_NOT_RESOLVED",
@@ -136,6 +156,42 @@ class IcCatalog:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         cached.write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding="utf-8")
         return self._apply_validation(DevicePackage.from_dict(self._rank(candidates, requested)[0], requested_model))
+
+    @staticmethod
+    def _match_keys(requested_model: str) -> list[str]:
+        """生成用于目录匹配的候选键。
+
+        丝印常为多行（如 '3M1B/N607'，第二行是日期码），因此除了完整归一化串，
+        还要尝试首行，避免因日期码干扰导致匹配失败。
+        """
+        keys: list[str] = []
+        full = normalize_mpn(requested_model)
+        if full:
+            keys.append(full)
+        first = normalize_mpn(first_marking_line(requested_model))
+        if first and first != full:
+            keys.append(first)
+        return keys
+
+    @staticmethod
+    def _matches(item: dict[str, Any], requested: str) -> bool:
+        """Check if a catalog item matches the requested model.
+
+        Matching priority:
+          1. Exact full_mpn match
+          2. Alias match
+          3. Silk-screen marking match (marking.first_line)
+        """
+        if normalize_mpn(item.get("full_mpn", "")) == requested:
+            return True
+        if requested in [normalize_mpn(v) for v in item.get("aliases", [])]:
+            return True
+        # Silk-screen marking → real MPN mapping
+        marking = item.get("marking", {})
+        first_line = marking.get("first_line", "")
+        if first_line and normalize_mpn(first_line) == requested:
+            return True
+        return False
 
     def promote(self, device: DevicePackage, validation: dict[str, Any]) -> DevicePackage:
         if not device.template_dir:

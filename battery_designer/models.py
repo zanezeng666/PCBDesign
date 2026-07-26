@@ -203,15 +203,28 @@ class PhotoCaptureSpec(BaseModel):
     alignment_error_mm: float | None = Field(default=None, ge=0)
 
 
+class DetectedComponent(BaseModel):
+    """元器件识别结果中的单个元器件。"""
+    type: str = Field(description="ic|mosfet|resistor|capacitor|diode|ntc|led|other")
+    silkscreen: str = Field(default="", description="丝印文字")
+    package: str = Field(default="", description="封装")
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+
 class DesignSpec(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     protection_ic: str = Field(min_length=2, max_length=80)
     battery: BatterySpec
     mos_count: int = Field(ge=1, le=20, description="板上MOS管封装个数")
+    mos_mpn: str | None = Field(default=None, max_length=80, description="用户指定的MOS管型号（丝印或完整MPN）")
     outline: BoardOutline
     terminals: list[Terminal] = Field(min_length=4, max_length=30)
     manufacturing: ManufacturingSpec = Field(default_factory=ManufacturingSpec)
     photo_capture: PhotoCaptureSpec = Field(default_factory=PhotoCaptureSpec)
+    detected_components: list[DetectedComponent] = Field(
+        default_factory=list,
+        description="VLM识别到的PCB板载元器件清单",
+    )
 
     @model_validator(mode="after")
     def terminal_contract(self) -> "DesignSpec":

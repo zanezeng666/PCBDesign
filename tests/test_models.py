@@ -94,7 +94,7 @@ def test_unknown_battery_type_is_rejected():
         BatterySpec(count=1, connection=ConnectionMode.SERIES, battery_type="nuclear-42")
 
 
-def test_mos_count_required():
+def test_mos_count_required(common_spec):
     data = common_spec.model_dump(mode="json")
     assert data.pop("mos_count", None) is not None
     with pytest.raises(ValidationError):

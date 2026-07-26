@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>步骤3 测试 — 设计参数 & 生成</title>
+<link rel="stylesheet" href="/static/styles.css" />
+<style>
+/* ── Layout / Container ── */
+.app-container {
+  max-width: 960px; margin: 24px auto;
+  padding: 0 16px 80px;
+  display: flex; flex-direction: column; gap: 20px;
+}
+header {
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 18px 24px;
+  text-align: center;
+}
+header h1 { font-size: 1.3rem; margin: 0 0 4px 0; }
+.subtitle { font-size: 0.85rem; color: var(--muted); margin: 0; }
+
+/* ── Text helpers ── */
+.ok { color: #16a34a; font-weight: 500; }
+.ng { color: #dc2626; font-weight: 500; }
+
+/* ── Step card ── */
+.step-card {
+  background: var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 20px 24px;
+}
+.step-header-row {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 14px;
+}
+.step-header-row h2 { font-size: 1.05rem; margin: 0; }
+.step-badge {
+  font-size: 0.75rem; padding: 3px 12px; border-radius: 999px;
+  font-weight: 600;
+}
+.step-badge.waiting { background: #fef3c7; color: #92400e; }
+.step-badge.ready   { background: #dcfce7; color: #166534; }
+
+/* ── Buttons ── */
+.btn {
+  display: inline-block; cursor: pointer;
+  border: none; border-radius: 8px;
+  padding: 9px 20px; font-size: .88rem; font-weight: 600;
+  transition: opacity .15s;
+}
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn-primary   { background: #2563eb; color: #fff; }
+.btn-secondary { background: #e2e8f0; color: #334155; }
+.btn-outline   { background: transparent; border: 1px solid #94a3b8; color: #334155; text-decoration: none; }
+.btn-sm { padding: 6px 14px; font-size: .8rem; }
+.btn-done { background: #16a34a !important; color: #fff !important; }
+
+/* ── Parameter sections ── */
+.param-section {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin-bottom: 14px;
+}
+.param-section h3 {
+  margin: 0 0 10px 0;
+  font-size: 0.95rem;
+  color: #334155;
+}
+.param-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.param-row label { font-size: 0.85rem; color: #475569; font-weight: 500; }
+.param-row input[type="text"],
+.param-row input[type="number"],
+.param-row select {
+  padding: 5px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.88rem;
+}
+.param-row input[type="text"] { width: 160px; }
+.param-hint {
+  margin-top: 6px;
+  font-size: 0.78rem;
+  color: #94a3b8;
+}
+.param-result {
+  margin-top: 10px;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.82rem;
+  color: #166534;
+}
+.param-result.result-error {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #dc2626;
+}
+.radio-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.85rem;
+  color: #475569;
+  cursor: pointer;
+}
+.dim-unit { font-size: 0.78rem; color: #94a3b8; }
+.spinner {
+  display: inline-block;
+  width: 12px; height: 12px;
+  border: 2px solid #94a3b8;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: middle;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ── Recognition load section ── */
+.cal-select-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.cal-select-row select {
+  padding: 5px 10px; border: 1px solid #cbd5e1; border-radius: 6px;
+  font-size: 0.85rem; max-width: 480px;
+}
+.recog-preview {
+  margin-top: 12px;
+  display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap;
+}
+.recog-preview img {
+  max-width: 320px; max-height: 220px;
+  border: 1px solid #e2e8f0; border-radius: 8px;
+  background: #fff;
+}
+.recog-info { font-size: 0.82rem; color: #475569; line-height: 1.7; }
+.recog-info .pad-chip {
+  display: inline-block; background: #e0e7ff; color: #3730a3;
+  border-radius: 6px; padding: 1px 8px; margin: 2px; font-weight: 600;
+  font-size: 0.78rem;
+}
+
+/* ── Generate / Download ── */
+.gen-actions { margin-top: 14px; }
+.gen-actions h4 { font-size: .9rem; margin: 0 0 8px 0; }
+.gen-actions .btn { margin: 4px; }
+
+/* ── Responsive ── */
+@media (max-width: 900px) {
+  .app-container { padding: 0 8px 60px; }
+}
+</style>
+</head>
+<body>
+<div class="app-container">
+
+<header>
+  <h1>步骤3 测试 — 设计参数 & 生成</h1>
+  <p class="subtitle">独立测试页：从已有识别结果加载 PCB 轮廓与焊盘，无需重新走完整识别流程 · <a href="/">返回完整流程</a></p>
+</header>
+
+<!-- ═══════════════════════════════════════════════════════ -->
+<!-- Section 0: 加载已有识别结果 -->
+<!-- ═══════════════════════════════════════════════════════ -->
+<section class="step-card">
+  <div class="step-header-row">
+    <h2>⓪ 加载已有识别结果</h2>
+    <span class="step-badge waiting" id="badge-recog">未加载</span>
+  </div>
+  <div class="cal-select-row">
+    <label>正面校准（P+/P- 焊盘）</label>
+    <select id="cal-select-front"><option value="">— 加载中 —</option></select>
+    <button class="btn btn-secondary btn-sm" id="btn-load-front">加载正面</button>
+  </div>
+  <div class="cal-select-row" style="margin-top:8px;">
+    <label>背面校准（B+/B- 焊盘，可选）</label>
+    <select id="cal-select-back"><option value="">— 不加载背面 —</option></select>
+    <button class="btn btn-secondary btn-sm" id="btn-load-back">加载背面</button>
+  </div>
+  <div style="margin-top:8px;">
+    <button class="btn btn-outline btn-sm" id="btn-refresh-list">刷新列表</button>
+  </div>
+  <div class="param-hint">焊盘通常分布在正反面：正面为 P+/P-（充放电），背面为 B+/B-（电池）。需分别加载后才能凑齐全部端子。</div>
+  <div id="recog-status" style="margin-top:8px; font-size:0.85rem;"></div>
+  <div class="recog-preview" id="recog-preview" hidden>
+    <img id="recog-img" alt="PCB 预览" />
+    <div class="recog-info" id="recog-info"></div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════════ -->
+<!-- Section 1: 设计参数输入 & 生成 -->
+<!-- ═══════════════════════════════════════════════════════ -->
+<section class="step-card">
+  <div class="step-header-row">
+    <h2>设计参数 & 生成</h2>
+    <span class="step-badge waiting" id="badge-step3">等待输入</span>
+  </div>
+
+  <!-- ① 电芯信息 -->
+  <div class="param-section">
+    <h3>① 电芯信息（必填）</h3>
+    <div class="param-row">
+      <label>厂商</label>
+      <input type="text" id="cell-manufacturer" placeholder="如 Samsung / Sony / 宁德时代" />
+      <label>型号</label>
+      <input type="text" id="cell-model" placeholder="如 INR18650-25R / VTC6 / 503048" />
+      <button class="btn btn-secondary btn-sm" id="btn-cell-lookup">AI查询参数</button>
+    </div>
+    <div id="cell-result" class="param-result" hidden></div>
+  </div>
+
+  <!-- ② 保护IC -->
+  <div class="param-section">
+    <h3>② 保护IC型号（必填）</h3>
+    <div class="param-row">
+      <label>IC型号/丝印</label>
+      <input type="text" id="ic-model" value="DW01" placeholder="输入真实型号或芯片丝印，如 DW01 / 3M1B" />
+      <button class="btn btn-secondary btn-sm" id="btn-ic-resolve">解析IC</button>
+    </div>
+    <div class="param-hint">支持输入丝印（如 3M1B），系统自动映射到真实型号（如 HY2113-MB1B）</div>
+    <div id="ic-result" class="param-result" hidden></div>
+  </div>
+
+  <!-- ③ 电池组配置 -->
+  <div class="param-section">
+    <h3>③ 电池组配置（必填）</h3>
+    <div class="param-row">
+      <label>串并联</label>
+      <select id="cell-count">
+        <option value="1" selected>1</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4">4</option>
+        <option value="5">5</option>
+      </select>
+      <select id="cell-connection">
+        <option value="series" selected>串联 (S)</option>
+        <option value="parallel">并联 (P)</option>
+      </select>
+      <label style="margin-left:16px;">MOS管型号</label>
+      <input type="text" id="mos-model" placeholder="可选，默认用IC推荐" style="width:130px;" />
+    </div>
+    <div class="param-row" style="margin-top:8px;">
+      <label>目标放电电流</label>
+      <input type="number" id="target-current" placeholder="可选" min="0.1" max="200" step="0.5" style="width:80px;" />
+      <span class="dim-unit">A（可选，不填则从MOS配置推算）</span>
+    </div>
+  </div>
+
+  <!-- ④ 端口拓扑 & 均衡 -->
+  <div class="param-section">
+    <h3>④ 端口拓扑 & 均衡</h3>
+    <div class="param-row">
+      <label>充放电端口</label>
+      <label class="radio-inline"><input type="radio" name="port-topology" value="auto" checked /> 自动推断</label>
+      <label class="radio-inline"><input type="radio" name="port-topology" value="common" /> 共口</label>
+      <label class="radio-inline"><input type="radio" name="port-topology" value="separate" /> 分口</label>
+    </div>
+    <div id="topology-inferred" class="param-hint" hidden></div>
+    <div class="param-row" style="margin-top:8px;">
+      <label>均衡功能</label>
+      <label class="radio-inline"><input type="radio" name="balance" value="yes" checked /> 有均衡</label>
+      <label class="radio-inline"><input type="radio" name="balance" value="no" /> 无均衡</label>
+      <span class="dim-unit">（2S及以上建议开启）</span>
+    </div>
+  </div>
+
+  <!-- 生成按钮 -->
+  <div style="margin-top:18px; text-align:center;">
+    <button class="btn btn-primary" id="btn-generate" disabled>生成 KiCad 工程</button>
+  </div>
+  <div id="gen-status" style="margin-top:8px; font-size:0.85rem;"></div>
+  <div id="gen-actions" class="gen-actions" hidden>
+    <h4>下载文件</h4>
+    <div id="gen-downloads"></div>
+  </div>
+</section>
+
+</div>
+
+<script src="/static/step3.js"></script>
+</body>
+</html>

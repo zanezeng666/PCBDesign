@@ -1,970 +1,1416 @@
-/* ═══════════════════════════════════════════════════════════════════════
-   Battery Protection Board Designer — Interactive App Logic
-   Flow: Upload → Input dimensions → Scan black frame → Calibrate → Generate
-   ═══════════════════════════════════════════════════════════════════════ */
+/* ──────────────────────────────────────────────────
+ *  Battery Designer  —  Frontend App Logic
+ *  FLOW:
+ *    Step 1: Frame dims → Upload → Preview Frame → Scan Frame → Compare
+ *    Step 2: Get PCB per side → Combined Extract Outlines → Holes/Pads/Components → Contour Match
+ *    Step 3: Generate KiCad
+ * ────────────────────────────────────────────────── */
 
-const API = '/api/vision';
-let state = {
-  calibration: { front: null, back: null },
-  detection: { front: null, back: null },
-  padDetection: { front: null, back: null },
+const $ = (sel, ctx = document) => ctx.querySelector(sel);
+const $$ = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
+
+// ── Global state ──
+const STATE = {
+  autoTest: false,
   frameW: 60, frameH: 30,
-  frameScanned: false,
-  frameScanResult: null,
-  rectifiedPreview: { front: false, back: false },
-  originalSrc: { front: '', back: '' },
+  uploaded: { front: false, back: false },
+  // Original image blob URLs for toggle preview
+  origSrc: { front: null, back: null },
+  // Calibration data per side
+  cal: { front: null, back: null },
+  // Frame detection per side (from preview-black-frame)
+  scanned: { front: null, back: null },
+  // Extract-pcb results per side
+  extract: { front: null, back: null },
+  // Holes & pads results per side
+  holes: { front: null, back: null },
+  pads: { front: null, back: null },
+  // Component detection results per side
+  components: { front: null, back: null },
+  // Rectify toggle state per side (step 1)
+  rectShow: { front: true, back: true },
+  // Raw File objects for deferred calibration (step 2)
+  rawFile: { front: null, back: null },
+  // Step 3: design parameters
+  cellParams: null,   // AI cell lookup result
+  icDevice: null,     // resolved IC device package
+  inferredTopology: null,  // 'common' | 'separate' from pad labels
 };
 
-/** Safely extract an error message from a failed Response. */
-async function safeErrorText(res) {
-  try {
-    const body = await res.json();
-    if (body.error) {
-      let msg = body.error.message || '';
-      const details = body.error.details;
-      if (details && typeof details === 'object') {
-        const parts = [];
-        if (details.detected_aspect !== undefined) parts.push(`检测宽高比=${details.detected_aspect}`);
-        if (details.expected_aspect !== undefined) parts.push(`期望=${details.expected_aspect}`);
-        if (details.aspect_error_pct !== undefined) parts.push(`误差=${details.aspect_error_pct}%`);
-        if (details.detected_w_px !== undefined) parts.push(`检测=${details.detected_w_px}x${details.detected_h_px}px`);
-        if (parts.length) msg += ' [' + parts.join(', ') + ']';
-      }
-      return msg || body.detail || JSON.stringify(body);
-    }
-    return body.detail || JSON.stringify(body);
-  } catch {
-    try {
-      const text = await res.text();
-      return (text || '').substring(0, 200) || `HTTP ${res.status}`;
-    } catch {
-      return `HTTP ${res.status}`;
-    }
-  }
+// ── Helpers ──
+function setBadge(stepId, text, cls) {
+  const b = $(`#badge-${stepId}`);
+  if (!b) return;
+  b.textContent = text;
+  b.className = `step-badge ${cls}`;
 }
+function show(el) { el.hidden = false; }
+function hide(el) { el.hidden = true; }
+function setHTML(el, html) { el.innerHTML = html; }
+function toggle(el, visible) { el.hidden = !visible; }
 
-// ═══ Import Helpers ════════════════════════════════════════════════
-function applySuggestedDimensions(w, h) {
-  document.getElementById('frame-w').value = w;
-  document.getElementById('frame-h').value = h;
-  state.frameW = w;
-  state.frameH = h;
-  toast(`尺寸已更新为 ${w}×${h}mm，请重新扫描`, 'info');
-  scanBlackFrame();
-}
+// ══════════════════════════════════════════════════════════
+//  INITIALIZATION
+// ══════════════════════════════════════════════════════════
+async function init() {
+  // Read frame dimensions from inputs
+  const fw = $('#frame-w'), fh = $('#frame-h');
+  STATE.frameW = parseFloat(fw.value) || 60;
+  STATE.frameH = parseFloat(fh.value) || 30;
+  fw.addEventListener('input', () => { STATE.frameW = parseFloat(fw.value) || 60; });
+  fh.addEventListener('input', () => { STATE.frameH = parseFloat(fh.value) || 60; });
 
-// ═══ Init ═══════════════════════════════════════════════════════
-document.addEventListener('DOMContentLoaded', () => {
-  loadIcCatalog();
   setupUploadZones();
-  setupFrameControls();
-  setupCalibrateButtons();
-  setupExtractPcbButtons();
-  setupDetectHolesButtons();
-  setupPadButtons();
-  setupExport();
-  setupRectifyToggles();
-  runSimulation();
-});
 
-// ═══ Toast ═════════════════════════════════════════════════════
-function toast(msg, kind = '') {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = 'toast show ' + kind;
-  setTimeout(() => el.classList.remove('show'), 3000);
-}
+  // Step 1: rectify toggle inside upload zones
+  $('#rect-toggle-front').addEventListener('change', e => {
+    STATE.rectShow.front = e.target.checked;
+    drawUploadCanvas('front');
+  });
+  $('#rect-toggle-back').addEventListener('change', e => {
+    STATE.rectShow.back = e.target.checked;
+    drawUploadCanvas('back');
+  });
 
-// ═══ Pre-Simulation on Page Load ═══════════════════════════════
-async function runSimulation() {
-  const simSection = document.getElementById('step-sim');
-  const simIcon = document.getElementById('sim-icon');
-  const simText = document.getElementById('sim-text');
-  const simDetails = document.getElementById('sim-details');
+  // Scan black frame button
+  $('#btn-scan-frame').addEventListener('click', scanBlackFrame);
 
-  simSection.hidden = false;
-  simIcon.textContent = '⏳';
-  simText.textContent = '正在模拟完整流程，确保一切就绪...';
+  // Step 2: calibrate buttons per side
+  $('#btn-cal-front').addEventListener('click', () => calibrateSide('front'));
+  $('#btn-cal-back').addEventListener('click', () => calibrateSide('back'));
 
+  // Step 2: combined extract outlines
+  $('#btn-extract-both').addEventListener('click', extractBoth);
+
+  // Step 2: detect all (holes + pads + components) for both sides
+  $('#btn-detect-all').addEventListener('click', detectAll);
+
+  // Step 3: design parameter buttons
+  $('#btn-cell-lookup').addEventListener('click', lookupCell);
+  $('#btn-ic-resolve').addEventListener('click', resolveIc);
+  $('#btn-generate').addEventListener('click', generateProject);
+
+  // Auto-test: check if input/front.jpg and input/back.jpg exist
   try {
-    const form = new FormData();
-    form.append('frame_w_mm', state.frameW);
-    form.append('frame_h_mm', state.frameH);
-
-    const res = await fetch('/api/simulate', { method: 'POST', body: form });
-    const result = await res.json();
-
-    if (!result.success) {
-      simIcon.textContent = '⚠️';
-      simText.textContent = `模拟完成：${result.total_images}张图片中有问题，请检查详情`;
-    } else {
-      simIcon.textContent = '✅';
-      simText.textContent = `模拟通过！${result.total_images}张图片全部检测成功`;
-
-      // Auto-scan succeeded → enable the UI
-      state.frameScanned = true;
-      state.frameScanResult = result;
-
-      // Update frame comparison
-      updateFrameComparison(result);
-
-      // Show Step 3
-      document.getElementById('step-detect').hidden = false;
-      document.getElementById('step-export').hidden = false;
-
-      // Enable calibrate buttons for images that were calibrated
-      for (const step of result.steps) {
-        const side = step.side === 'front' ? 'front' :
-                     step.side === 'back' ? 'back' : null;
-        if (side && step.calibration_success) {
-          state.calibration[side] = {
-            calibration_id: step.calibration_id,
-            pixels_per_mm: step.pixels_per_mm,
-            width_mm: step.rectified_w_mm,
-            height_mm: step.rectified_h_mm,
-            confidence: step.confidence,
-            rectified_png_base64: step.rectified_png_base64,
-          };
-          document.getElementById(`btn-calibrate-${side}`).disabled = false;
-          if (step.rectified_png_base64) {
-            showRectifiedBadge(side);
-          }
-          document.getElementById(`btn-pads-${side}`).disabled = false;
-        }
-      }
-    }
-
-    // Build details HTML
-    let detailsHtml = '';
-    for (const step of result.steps) {
-      const sideLabel = step.side === 'front' ? '正面' :
-                        step.side === 'back' ? '背面' : step.side;
-      const frameOk = step.frame_detected && step.aspect_ok
-                    ? '<span class="pass">✔ 黑框检测通过</span>'
-                    : '<span class="fail">✘ 黑框检测失败</span>';
-      const calOk = step.calibration_success
-                  ? '<span class="pass">✔ 标定成功</span>'
-                  : `<span class="fail">✘ 标定失败: ${step.calibration_error_msg || 'N/A'}</span>`;
-      const aspectInfo = step.frame_detected
-        ? `检测=${step.detected_aspect_ratio} vs 期望=${step.expected_aspect_ratio} (误差${step.aspect_error_pct}%)`
-        : '未检测到方框';
-
-      let hintHtml = '';
-      if (step.orientation_hint) {
-        hintHtml = `<br><span class="warn" style="display:inline-block;margin-top:4px">💡 ${step.orientation_hint}</span>`;
-      }
-      if (step.suggested_w_mm && step.suggested_h_mm) {
-        hintHtml += `<br><button class="btn btn-sm" style="margin-top:4px;padding:2px 8px;font-size:.7rem"
-          onclick="applySuggestedDimensions(${step.suggested_w_mm},${step.suggested_h_mm})">
-          直接应用 ${step.suggested_w_mm}×${step.suggested_h_mm}mm</button>`;
-      }
-
-      detailsHtml += `<div class="sim-step">
-        📄 <strong>${step.image}</strong> (${sideLabel}):
-        ${frameOk} ·
-        ${calOk} ·
-        <span class="info">${aspectInfo}</span>
-        ${hintHtml}
-      </div>`;
-    }
-    simDetails.innerHTML = detailsHtml;
-
-  } catch (e) {
-    simIcon.textContent = '❌';
-    simText.textContent = `模拟失败: ${e.message}`;
-    simDetails.innerHTML = `<div class="sim-step"><span class="fail">${e.message}</span></div>`;
-  }
-}
-
-function updateFrameComparison(result) {
-  const compareEl = document.getElementById('frame-compare');
-  compareEl.hidden = false;
-
-  // Aggregate info from the first successful step
-  const okSteps = result.steps.filter(s => s.frame_detected);
-  if (okSteps.length > 0) {
-    const s = okSteps[0];
-    document.getElementById('cmp-expected').textContent =
-      `${s.frame_w_mm}×${s.frame_h_mm} mm (宽高比 ${s.expected_aspect_ratio})`;
-    document.getElementById('cmp-detected').textContent =
-      `~${s.detected_w_px}×${s.detected_h_px} px (宽高比 ${s.detected_aspect_ratio})`;
-    document.getElementById('cmp-aspect-error').textContent = `${s.aspect_error_pct}%`;
-    document.getElementById('cmp-aspect-error').className =
-      'compare-value ' + (s.aspect_ok ? 'ok' : 'ng');
-    document.getElementById('cmp-status').textContent = s.aspect_ok ? '✅ 匹配' : '❌ 不匹配';
-    document.getElementById('cmp-status').className =
-      'compare-value ' + (s.aspect_ok ? 'ok' : 'ng');
-  } else {
-    document.getElementById('cmp-expected').textContent = `${result.frame_w_mm}×${result.frame_h_mm} mm`;
-    document.getElementById('cmp-detected').textContent = '—';
-    document.getElementById('cmp-aspect-error').textContent = '—';
-    document.getElementById('cmp-status').textContent = '❌ 未检测到';
-    document.getElementById('cmp-status').className = 'compare-value ng';
-  }
-}
-
-// ═══ Load IC Catalog ════════════════════════════════════════════
-async function loadIcCatalog() {
-  try {
-    const res = await fetch('/data/ic_catalog/.index.json');
-    if (!res.ok) return;
-    const list = await res.json();
-    const icSel = document.getElementById('param-ic');
-    (list || []).forEach(item => {
-      const opt = document.createElement('option');
-      opt.value = item.model || item;
-      opt.textContent = item.model || item;
-      icSel.appendChild(opt);
+    const resp = await fetch('/api/health');
+    if (!resp.ok) throw new Error('server not ready');
+    const imgFront = new Image();
+    imgFront.src = '/static/../input/front.jpg?' + Date.now();
+    await new Promise((resolve, reject) => {
+      imgFront.onload = resolve;
+      imgFront.onerror = reject;
+      setTimeout(() => reject(new Error('timeout')), 2000);
     });
-  } catch (e) { /* silent */ }
-
-  try {
-    const res = await fetch('/api/mos/list');
-    if (res.ok) {
-      const mosList = await res.json();
-      const mosSel = document.getElementById('param-mos');
-      (mosList || []).forEach(m => {
-        const opt = document.createElement('option');
-        opt.value = m.model || m;
-        opt.textContent = m.model || m;
-        mosSel.appendChild(opt);
-      });
-    }
-  } catch (e) { /* silent */ }
+    STATE.autoTest = true;
+    console.log('Auto-test mode: input images found');
+    $('#btn-scan-frame').disabled = false;
+  } catch {
+    STATE.autoTest = false;
+    console.log('Upload mode: no pre-placed images');
+  }
 }
 
-// ═══ Image Upload ═══════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════
+//  STEP 1 — Upload & Rectify Preview
+// ══════════════════════════════════════════════════════════
 function setupUploadZones() {
-  for (const side of ['front', 'back']) {
-    const zone = document.getElementById(`zone-${side}`);
-    const fileInput = document.getElementById(`file-${side}`);
-    const preview = document.getElementById(`preview-${side}`);
+  ['front', 'back'].forEach(side => {
+    const drop = $(`#drop-${side}`);
+    const input = $(`#file-${side}`);
+    const status = $(`#status-${side}`);
 
-    zone.addEventListener('click', (e) => {
-      if (e.target.closest('button')) return; // don't open file dialog for button clicks
-      fileInput.click();
-    });
-
-    zone.addEventListener('dragover', e => { e.preventDefault(); zone.style.borderColor = '#3b82f6'; });
-    zone.addEventListener('dragleave', () => zone.style.borderColor = '');
-    zone.addEventListener('drop', e => {
+    drop.addEventListener('click', () => input.click());
+    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag-over'); });
+    drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
+    drop.addEventListener('drop', e => {
       e.preventDefault();
-      zone.style.borderColor = '';
-      if (e.dataTransfer.files.length) handleFile(side, e.dataTransfer.files[0]);
+      drop.classList.remove('drag-over');
+      if (e.dataTransfer.files.length) handleUpload(side, e.dataTransfer.files[0]);
     });
-
-    fileInput.addEventListener('change', () => {
-      if (fileInput.files.length) handleFile(side, fileInput.files[0]);
+    input.addEventListener('change', () => {
+      if (input.files.length) handleUpload(side, input.files[0]);
     });
-  }
-}
-
-function handleFile(side, file) {
-  if (!file.type.match(/image\/(jpeg|png)/)) {
-    toast('仅支持 JPEG/PNG 格式', 'error');
-    return;
-  }
-  const reader = new FileReader();
-  reader.onload = e => {
-    const preview = document.getElementById(`preview-${side}`);
-    preview.src = e.target.result;
-    state.originalSrc[side] = e.target.result;
-    document.getElementById(`zone-${side}`).classList.add('has-image');
-    // Hide rectified badge on new upload
-    // Show rectify toggle button immediately after upload
-    document.getElementById(`badge-rectify-${side}`).hidden = true;
-    document.getElementById(`btn-rectify-${side}`).hidden = false;
-    state.rectifiedPreview[side] = false;
-  };
-  reader.readAsDataURL(file);
-
-  // NO auto-scan — user must input dimensions first in Step 2
-  checkCalibrateReady();
-}
-
-// ═══ Frame Controls: Dimensions First, Then Scan ═══════════════
-function setupFrameControls() {
-  const wInput = document.getElementById('frame-w');
-  const hInput = document.getElementById('frame-h');
-
-  wInput.addEventListener('input', e => {
-    state.frameW = parseInt(e.target.value) || 60;
-    document.getElementById('frame-w').value = state.frameW;
   });
-  hInput.addEventListener('input', e => {
-    state.frameH = parseInt(e.target.value) || 30;
-    document.getElementById('frame-h').value = state.frameH;
-  });
-
-  // Initialize with current state
-  wInput.value = state.frameW;
-  hInput.value = state.frameH;
-
-  document.getElementById('btn-scan-frame').addEventListener('click', scanBlackFrame);
 }
 
-async function scanBlackFrame() {
-  const w = state.frameW;
-  const h = state.frameH;
+async function handleUpload(side, file) {
+  const status = $(`#status-${side}`);
+  setHTML(status, '<span class="spinner"></span> 上传中...');
 
-  // Validate dimensions first
-  if (!w || !h || w < 10 || h < 10 || w > 200 || h > 200) {
-    toast('请先填入有效的黑色方框尺寸 (10-200mm)', 'error');
-    return;
-  }
+  // Store original image for toggle preview (blob URL)
+  if (STATE.origSrc[side]) URL.revokeObjectURL(STATE.origSrc[side]);
+  STATE.origSrc[side] = URL.createObjectURL(file);
 
-  const infoEl = document.getElementById('frame-info');
-  infoEl.innerHTML = '<span class="spinner"></span> 正在扫描黑色方框...';
-  infoEl.className = 'frame-info';
+  // Store file reference for later calibration (step 2)
+  STATE.rawFile[side] = file;
 
-  const compareEl = document.getElementById('frame-compare');
-  compareEl.hidden = true;
+  try {
+    STATE.uploaded[side] = true;
+    setHTML(status, `<span class="ok">已上传 (${(file.size / 1024).toFixed(0)} KB)</span>`);
 
-  // Scan all uploaded images
-  const sides = [];
-  const frontFile = document.getElementById('file-front').files[0];
-  const backFile = document.getElementById('file-back').files[0];
-  if (frontFile) sides.push({ side: 'front', file: frontFile });
-  if (backFile) sides.push({ side: 'back', file: backFile });
+    // Enable scan button
+    $('#btn-scan-frame').disabled = false;
+    setBadge('step1', '可扫描', 'ready');
 
-  if (sides.length === 0) {
-    toast('请先上传图片', 'error');
-    infoEl.innerHTML = '<span class="muted">请先上传图片，再扫描方框</span>';
-    return;
-  }
-
-  let anyFound = false;
-  let allResults = [];
-  let firstOkResult = null;
-
-  for (const { side, file } of sides) {
-    const form = new FormData();
-    form.append('file', file);
-
+    // Preview black frame to get detection data (no calibration yet)
+    const pForm = new FormData();
+    pForm.append('file', file);
+    pForm.append('frame_w_mm', STATE.frameW);
+    pForm.append('frame_h_mm', STATE.frameH);
     try {
-      const res = await fetch(`${API}/preview-black-frame`, { method: 'POST', body: form });
-      if (!res.ok) {
-        const msg = await safeErrorText(res);
-        allResults.push({ side, found: false, error: msg });
-        continue;
+      const pResp = await fetch('/api/vision/preview-black-frame', { method: 'POST', body: pForm });
+      if (pResp.ok) {
+        const pData = await pResp.json();
+        STATE.scanned[side] = {
+          frame_detected: pData.found,
+          detected_aspect_ratio: pData.aspect_ratio || 0,
+          avg_width_px: pData.avg_width_px || 0,
+          avg_height_px: pData.avg_height_px || 0,
+        };
       }
-      const data = await res.json();
-      allResults.push({ side, ...data });
+    } catch { /* preview failure is non-fatal */ }
 
-      if (data.found) {
-        anyFound = true;
+    // Show original uploaded image immediately
+    show($(`#rectify-row-${side}`));
+    show($(`#canvas-wrap-${side}`));
+    $(`#rect-toggle-${side}`).checked = false;
+    STATE.rectShow[side] = false;
+    drawUploadCanvas(side);
 
-        // Compare aspect ratio
-        const detectedAspect = data.aspect_ratio;
-        const expectedAspect = w / Math.max(h, 1);
-        const aspectError = Math.abs(detectedAspect - expectedAspect) / Math.max(expectedAspect, 0.1);
-        const aspectOk = aspectError <= 0.35;
+  } catch (err) {
+    setHTML(status, `<span class="ng">${err.message}</span>`);
+  }
+}
 
-        if (!firstOkResult && aspectOk) {
-          firstOkResult = {
-            side,
-            expectedAspect,
-            detectedAspect,
-            aspectError,
-            aspectOk,
-            avgW: data.avg_width_px,
-            avgH: data.avg_height_px,
+/**
+ * Draw the upload-zone canvas (step 1).
+ * Toggle between original image (from blob URL) and rectified image (from base64).
+ */
+function drawUploadCanvas(side) {
+  const canvas = $(`#canvas-${side}`);
+  if (!canvas) return;
+
+  const showRect = STATE.rectShow[side];
+  const cal = STATE.cal[side];
+  const orig = STATE.origSrc[side];
+
+  let src = null;
+  if (cal) {
+    const rect = cal.rect_b64 ? `data:image/png;base64,${cal.rect_b64}` : '';
+    src = (showRect && rect) ? rect : (orig || rect);
+  } else {
+    // No calibration yet – show original uploaded image
+    src = orig;
+  }
+  if (!src) return;
+
+  const img = new Image();
+  img.onload = () => {
+    const maxW = 900, maxH = 520;
+    const scale = Math.min(maxW / img.width, maxH / img.height);
+    canvas.width = Math.round(img.width * scale);
+    canvas.height = Math.round(img.height * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  };
+  img.src = src;
+}
+
+// ══════════════════════════════════════════════════════════
+//  STEP 1 — Scan Black Frame & Compare
+// ══════════════════════════════════════════════════════════
+async function scanBlackFrame() {
+  const btn = $('#btn-scan-frame');
+  btn.disabled = true;
+  btn.textContent = '扫描中...';
+
+  // Auto-test mode: call /api/simulate (reads input/*.jpg)
+  if (STATE.autoTest) {
+    try {
+      const fm = new FormData();
+      fm.append('frame_w_mm', STATE.frameW);
+      fm.append('frame_h_mm', STATE.frameH);
+      const resp = await fetch('/api/simulate', { method: 'POST', body: fm });
+      const data = await resp.json();
+      console.log('Scan result:', data);
+
+      data.steps.forEach(s => {
+        STATE.scanned[s.side] = s;
+        if (s.calibration_success) {
+          STATE.cal[s.side] = {
+            id: s.calibration_id,
+            ppm: s.pixels_per_mm,
+            rect_b64: s.rectified_png_base64,
+            transparent_pcb_b64: s.transparent_pcb_base64 || '',
+            transparent_pcb_outline: s.transparent_pcb_outline_mm || [],
+            w_mm: s.rectified_w_mm || STATE.frameW,
+            h_mm: s.rectified_h_mm || STATE.frameH,
+            frameW: s.frame_w_mm || STATE.frameW,
+            frameH: s.frame_h_mm || STATE.frameH,
           };
+          STATE.uploaded[s.side] = true;
         }
-      }
-    } catch (e) {
-      allResults.push({ side, found: false, error: e.message });
-    }
-  }
+      });
+      STATE.contourMatch = data.contour_match || null;
 
-  // Update frame comparison section
-  if (firstOkResult) {
-    compareEl.hidden = false;
-    document.getElementById('cmp-expected').textContent =
-      `${w}×${h} mm (宽高比 ${firstOkResult.expectedAspect.toFixed(3)})`;
-    document.getElementById('cmp-detected').textContent =
-      `~${firstOkResult.avgW.toFixed(0)}×${firstOkResult.avgH.toFixed(0)} px (宽高比 ${firstOkResult.detectedAspect.toFixed(3)})`;
-    document.getElementById('cmp-aspect-error').textContent = `${(firstOkResult.aspectError * 100).toFixed(1)}%`;
-    document.getElementById('cmp-aspect-error').className =
-      'compare-value ' + (firstOkResult.aspectOk ? 'ok' : 'ng');
-    document.getElementById('cmp-status').textContent =
-      firstOkResult.aspectOk ? '✅ 匹配 — 宽高比一致' : '⚠️ 不匹配 — 请检查尺寸';
-    document.getElementById('cmp-status').className =
-      'compare-value ' + (firstOkResult.aspectOk ? 'ok' : 'ng');
-  } else if (allResults.length > 0) {
-    compareEl.hidden = false;
-    document.getElementById('cmp-expected').textContent = `${w}×${h} mm`;
-    document.getElementById('cmp-detected').textContent = '—';
-    document.getElementById('cmp-aspect-error').textContent = '—';
-    document.getElementById('cmp-status').textContent = '❌ 未检测到黑色方框';
-    document.getElementById('cmp-status').className = 'compare-value ng';
-  }
-
-  if (anyFound) {
-    state.frameScanned = true;
-    // Build detailed message
-    let msg = [];
-    for (const r of allResults) {
-      if (r.found) {
-        const epx = w / Math.max(h, 1);
-        const err = Math.abs(r.aspect_ratio - epx) / Math.max(epx, 0.1);
-        msg.push(`${r.side === 'front' ? '正面' : '背面'}: 检测到 (宽高比${r.aspect_ratio.toFixed(2)}, 误差${(err*100).toFixed(1)}%)`);
+      const allOk = data.steps.every(s => s.calibration_success);
+      if (allOk) {
+        setHTML($('#frame-info'), '<span class="ok">方框检测成功</span>');
+        setBadge('step1', '已完成', 'ready');
       } else {
-        msg.push(`${r.side === 'front' ? '正面' : '背面'}: 未检测到`);
+        const badSide = data.steps.find(s => !s.calibration_success);
+        setHTML($('#frame-info'), `<span class="ng">${badSide?.side || ''} 方框检测失败</span>`);
+        setBadge('step1', '需修正', 'waiting');
       }
+    } catch (err) {
+      btn.textContent = '矫正预览';
+      btn.disabled = false;
+      setHTML($('#frame-info'), `<span class="ng">扫描失败: ${err.message}</span>`);
+      return;
     }
-    infoEl.innerHTML = '✅ ' + msg.join(' | ');
-    infoEl.className = 'frame-info success';
-
-    // Show Step 3 and enable calibrate buttons
-    document.getElementById('step-detect').hidden = false;
-    document.getElementById('step-export').hidden = false;
-    checkCalibrateReady();
-  } else {
-    infoEl.innerHTML = '⚠️ 未检测到黑色方框，请确认图片和尺寸';
-    infoEl.className = 'frame-info error';
   }
-}
 
-function checkCalibrateReady() {
-  const hasFront = !!document.getElementById('file-front').files[0];
-  const hasBack = !!document.getElementById('file-back').files[0];
-  document.getElementById('btn-calibrate-front').disabled = !hasFront;
-  document.getElementById('btn-calibrate-back').disabled = !hasBack;
-}
-
-// ═══ Rectification Preview Toggle ═════════════════════════════
-function setupRectifyToggles() {
-  for (const side of ['front', 'back']) {
-    const btn = document.getElementById(`btn-rectify-${side}`);
-    btn.addEventListener('click', (e) => toggleRectifyPreview(side, e));
-  }
-}
-
-function showRectifiedBadge(side) {
-  document.getElementById(`badge-rectify-${side}`).hidden = false;
-  document.getElementById(`btn-rectify-${side}`).hidden = false;
-}
-
-function toggleRectifyPreview(side, e) {
-  // Stop event bubbling to prevent upload zone from opening file dialog
-  if (e) e.stopPropagation();
-
-  const calData = state.calibration[side];
-  const preview = document.getElementById(`preview-${side}`);
-  const btn = document.getElementById(`btn-rectify-${side}`);
-  const isRectified = state.rectifiedPreview[side];
-
-  if (isRectified) {
-    // Switch back to original
-    preview.src = state.originalSrc[side] || '';
-    btn.textContent = '🔄 矫正预览';
-    btn.classList.remove('active');
-    state.rectifiedPreview[side] = false;
-  } else {
-    if (calData && calData.rectified_png_base64) {
-      // Show rectified image (calibration already done)
-      preview.src = `data:image/png;base64,${calData.rectified_png_base64}`;
-      btn.textContent = '🔄 显示原图';
-      btn.classList.add('active');
-      state.rectifiedPreview[side] = true;
+  // Upload mode: actually calibrate both sides at once
+  if (!STATE.autoTest) {
+    const bothOk = STATE.uploaded.front && STATE.uploaded.back;
+    if (bothOk) {
+      try {
+        await Promise.all([
+          calibrateSide('front'),
+          calibrateSide('back'),
+        ]);
+        setHTML($('#frame-info'), '<span class="ok">矫正预览完成</span>');
+        setBadge('step1', '已完成', 'ready');
+      } catch (err) {
+        setHTML($('#frame-info'), `<span class="ng">矫正失败: ${err.message}</span>`);
+        setBadge('step1', '需修正', 'waiting');
+        btn.textContent = '矫正预览';
+        btn.disabled = false;
+        return;
+      }
     } else {
-      // No calibration yet — just show original in "preview mode"
-      btn.textContent = '🔄 显示原图';
-      btn.classList.add('active');
-      state.rectifiedPreview[side] = true;
+      setHTML($('#frame-info'), '<span class="ng">请先上传正反面图片</span>');
+      setBadge('step1', '需修正', 'waiting');
+      btn.textContent = '矫正预览';
+      btn.disabled = false;
+      return;
     }
+  }
+
+  // Show frame comparison results (per side, in step 1)
+  updateFrameCompare();
+
+  // Auto-test mode: show canvases with rectified images
+  if (STATE.autoTest) {
+    ['front', 'back'].forEach(side => {
+      if (STATE.cal[side]) {
+        show($(`#rectify-row-${side}`));
+        show($(`#canvas-wrap-${side}`));
+        $(`#rect-toggle-${side}`).checked = true;
+        STATE.rectShow[side] = true;
+        drawUploadCanvas(side);
+      }
+    });
+
+    // Auto-test mode: enable step 2 (upload mode handles via calibrateSide)
+    show($('#step-detect'));
+    setBadge('step2', '可获取', 'ready');
+    enableCalButtons();
+    checkExtractReady();
+    checkGenerateReady();
+  } else {
+    // Upload mode: show step 2 (calibrateSide already enabled cal buttons etc.)
+    show($('#step-detect'));
+  }
+
+  btn.textContent = STATE.autoTest ? '重新扫描' : '矫正预览';
+  btn.disabled = false;
+}
+
+function updateFrameCompare() {
+  const hasData = STATE.scanned.front || STATE.scanned.back;
+  toggle($('#frame-compare-grid'), hasData);
+  if (STATE.scanned.front) displayFrameScanResult('front');
+  if (STATE.scanned.back) displayFrameScanResult('back');
+}
+
+function displayFrameScanResult(side) {
+  const data = STATE.scanned[side];
+  if (!data) return;
+  const container = $(`#frame-comp-${side}-content`);
+  if (!container) return;
+
+  const frameDetected = data.frame_detected ?? data.calibration_success;
+  if (frameDetected) {
+    const ar = data.detected_aspect_ratio || 0;
+    const expectedAR = STATE.frameW / STATE.frameH;
+    const errPct = expectedAR > 0 ? Math.abs(ar - expectedAR) / expectedAR * 100 : 0;
+    const cls = errPct <= 25 ? 'ok' : 'ng';
+    setHTML(container, `
+      <span class="${cls}">方框已检测</span><br>
+      检测尺寸: ${(data.avg_width_px || 0).toFixed(0)} &times; ${(data.avg_height_px || 0).toFixed(0)} px<br>
+      宽高比: ${ar.toFixed(3)} (期望 ${expectedAR.toFixed(3)}, 误差 ${errPct.toFixed(1)}%)<br>
+      设定: ${STATE.frameW} &times; ${STATE.frameH} mm
+    `);
+  } else {
+    setHTML(container, '<span class="ng">未检测到方框</span>');
   }
 }
 
-// ═══ Calibrate + Detect Outline & Holes ═════════════════════
-function setupCalibrateButtons() {
-  document.getElementById('btn-calibrate-front').addEventListener('click', () => calibrateSide('front'));
-  document.getElementById('btn-calibrate-back').addEventListener('click', () => calibrateSide('back'));
+// ══════════════════════════════════════════════════════════
+//  STEP 2 — Get PCB per side
+// ══════════════════════════════════════════════════════════
+function enableCalButtons() {
+  ['front', 'back'].forEach(side => {
+    const btn = $(`#btn-cal-${side}`);
+    if (STATE.uploaded[side]) {
+      btn.disabled = false;
+      btn.textContent = side === 'front' ? '获取PCB正面' : '获取PCB反面';
+    } else {
+      btn.disabled = true;
+    }
+  });
 }
 
 async function calibrateSide(side) {
-  const file = document.getElementById(`file-${side}`).files[0];
-  if (!file) { toast('请先上传图片', 'error'); return; }
-
-  const btn = document.getElementById(`btn-calibrate-${side}`);
-  const overlay = document.getElementById(`overlay-${side}`);
-  const stats = document.getElementById(`stats-${side}`);
-  btn.classList.add('loading');
+  const btn = $(`#btn-cal-${side}`);
+  btn.textContent = '处理中...';
   btn.disabled = true;
-  overlay.innerHTML = '<span class="spinner"></span> 标定中...';
-  overlay.classList.remove('hidden');
+  btn.classList.remove('btn-done');
 
-  try {
-    // Step 1: calibrate with black frame (rectification only)
-    const calForm = new FormData();
-    calForm.append('file', file);
-    calForm.append('frame_w_mm', state.frameW);
-    calForm.append('frame_h_mm', state.frameH);
-
-    const calRes = await fetch(`${API}/calibrate-black-frame`, { method: 'POST', body: calForm });
-    if (!calRes.ok) {
-      const errMsg = await safeErrorText(calRes);
-      throw new Error(`标定失败 (${calRes.status}): ${errMsg}`);
-    }
-    const calData = await calRes.json();
-    state.calibration[side] = calData;
-
-    // Show rectified preview toggle
-    showRectifiedBadge(side);
-    // Auto-switch to rectified preview
-    toggleRectifyPreview(side);
-
-    stats.innerHTML = `分辨率 ${calData.pixels_per_mm?.toFixed(1)} px/mm — 点击下方按钮逐步识别`;
-
-    overlay.classList.add('hidden');
-    drawCalibrationCanvas(side, calData, null);
-
-    // Enable the step-by-step identification buttons
-    document.getElementById(`btn-extract-pcb-${side}`).disabled = false;
-    document.getElementById(`btn-detect-holes-${side}`).disabled = true;
-    document.getElementById(`btn-pads-${side}`).disabled = true;
-
-    // Reset step results
-    document.getElementById(`extract-result-${side}`).hidden = true;
-    document.getElementById(`holes-result-${side}`).hidden = true;
-
-    toast(`✅ ${side === 'front' ? '正面' : '背面'} 透视矫正完成`, 'success');
-  } catch (e) {
-    overlay.innerHTML = `❌ ${e.message}`;
-    toast(e.message, 'error');
-  } finally {
-    btn.classList.remove('loading');
+  // Read file from stored reference
+  const file = STATE.rawFile[side];
+  if (!file) {
+    btn.textContent = '未上传文件';
     btn.disabled = false;
+    return;
   }
-}
 
-// ═══ Canvas Drawing ═══════════════════════════════════════════
-function drawCalibrationCanvas(side, calData, detData) {
-  const canvas = document.getElementById(`canvas-${side}`);
-  const ctx = canvas.getContext('2d');
-  canvas.width = canvas.parentElement.clientWidth;
-  canvas.height = canvas.parentElement.clientHeight;
-
-  if (calData.rectified_png_base64) {
-    const img = new Image();
-    img.onload = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
-      const dx = (canvas.width - img.width * scale) / 2;
-      const dy = (canvas.height - img.height * scale) / 2;
-      ctx.drawImage(img, dx, dy, img.width * scale, img.height * scale);
-
-      if (detData?.outline?.length) {
-        drawPolygon(ctx, detData.outline[0], calData, scale, dx, dy, '#00ff88', 2.5, 'rgba(0,255,136,.15)');
-      }
-      (detData?.holes || []).forEach(h => {
-        drawPolygon(ctx, h, calData, scale, dx, dy, '#ff6b6b', 1.5, 'rgba(255,107,107,.2)');
-      });
-    };
-    img.src = `data:image/png;base64,${calData.rectified_png_base64}`;
-  }
-}
-
-function drawPadCanvas(side, calData, padDetect) {
-  const canvas = document.getElementById(`canvas-${side}`);
-  const ctx = canvas.getContext('2d');
-  canvas.width = canvas.parentElement.clientWidth;
-  canvas.height = canvas.parentElement.clientHeight;
-
-  if (calData.rectified_png_base64) {
-    const img = new Image();
-    img.onload = () => {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
-      const dx = (canvas.width - img.width * scale) / 2;
-      const dy = (canvas.height - img.height * scale) / 2;
-      ctx.drawImage(img, dx, dy, img.width * scale, img.height * scale);
-
-      const det = state.detection[side];
-      if (det?.outline?.length) {
-        drawPolygon(ctx, det.outline[0], calData, scale, dx, dy, '#00ff88', 2, 'rgba(0,255,136,.1)');
-      }
-      if (det?.holes) {
-        det.holes.forEach(h => drawPolygon(ctx, h, calData, scale, dx, dy, '#ff6b6b', 1, 'rgba(255,107,107,.15)'));
-      }
-
-      const pads = padDetect?.pads || [];
-      const colors = ['#facc15', '#60a5fa', '#f472b6', '#34d399', '#a78bfa',
-                       '#fb923c', '#38bdf8', '#f87171'];
-      pads.forEach((pad, i) => {
-        const color = colors[i % colors.length];
-        drawPolygon(ctx, pad, calData, scale, dx, dy, color, 2.5, 'rgba(255,255,255,.08)');
-
-        const vr = pad.visible_region || {};
-        const center = vr.center || pad.visible_position || {};
-        const cx = center.x_mm * (calData.pixels_per_mm || 1) * scale + dx;
-        const cy = center.y_mm * (calData.pixels_per_mm || 1) * scale + dy;
-        const label = pad.label || `P${i+1}`;
-
-        ctx.fillStyle = color;
-        ctx.font = `bold ${Math.max(11, 14*scale)}px sans-serif`;
-        const tw = ctx.measureText(label).width;
-        ctx.fillStyle = 'rgba(0,0,0,.7)';
-        ctx.fillRect(cx - tw/2 - 4, cy - 8, tw + 8, 18);
-        ctx.fillStyle = color;
-        ctx.fillText(label, cx - tw/2, cy + 5);
-      });
-    };
-    img.src = `data:image/png;base64,${calData.rectified_png_base64}`;
-  }
-}
-
-function drawPolygon(ctx, item, calData, scale, dx, dy, strokeColor, lineWidth, fillColor) {
-  const vr = item.visible_region || item;
-  const poly = vr.polygon || [];
-  if (poly.length < 3) return;
-
-  const ppm = calData.pixels_per_mm || 1;
-
-  ctx.beginPath();
-  poly.forEach((pt, i) => {
-    const px = pt.x_mm * ppm * scale + dx;
-    const py = pt.y_mm * ppm * scale + dy;
-    if (i === 0) ctx.moveTo(px, py);
-    else ctx.lineTo(px, py);
-  });
-  ctx.closePath();
-
-  if (fillColor) { ctx.fillStyle = fillColor; ctx.fill(); }
-  ctx.strokeStyle = strokeColor;
-  ctx.lineWidth = lineWidth;
-  ctx.lineJoin = 'round';
-  ctx.stroke();
-}
-
-// ═══ Step-by-Step PCB Extraction ══════════════════════════════
-function setupExtractPcbButtons() {
-  for (const side of ['front', 'back']) {
-    document.getElementById(`btn-extract-pcb-${side}`).addEventListener('click', () => extractPcb(side));
-  }
-}
-
-async function extractPcb(side) {
-  const calData = state.calibration[side];
-  if (!calData) { toast('请先完成标定', 'error'); return; }
-
-  const btn = document.getElementById(`btn-extract-pcb-${side}`);
-  const resultDiv = document.getElementById(`extract-result-${side}`);
-  const stats = document.getElementById(`stats-${side}`);
-  btn.classList.add('loading');
-  btn.disabled = true;
+  const form = new FormData();
+  form.append('file', file);
+  form.append('frame_w_mm', STATE.frameW);
+  form.append('frame_h_mm', STATE.frameH);
 
   try {
-    const form = new FormData();
-    form.append('calibration_id', calData.calibration_id);
-
-    const res = await fetch(`${API}/extract-pcb`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error(`轮廓提取失败 (${res.status}): ${await safeErrorText(res)}`);
-    const data = await res.json();
-
-    // Store outline in detection state
-    if (!state.detection[side]) state.detection[side] = {};
-    state.detection[side].outline = [{
-      visible_region: { polygon: data.outline, type: 'board_outline' },
-      grooves: data.grooves || [],
-    }];
-    state.detection[side]._pcbCutout = data;
-
-    // Build step-by-step result HTML
-    let html = '';
-    const stepLabels = ['① 去除白色底色', '② 去除阴影', '③ 识别凹槽'];
-    (data.steps || []).forEach((step, i) => {
-      const s = step.stats || {};
-      let statsHtml = '';
-      if (s.foreground_ratio !== undefined) statsHtml += `<span>前景: ${(s.foreground_ratio * 100).toFixed(1)}%</span>`;
-      if (s.shadow_removed_pct !== undefined) statsHtml += `<span>阴影: -${s.shadow_removed_pct}%</span>`;
-      if (s.groove_count !== undefined) statsHtml += `<span>凹槽: ${s.groove_count}</span>`;
-      if (s.solidity !== undefined) statsHtml += `<span>solidity: ${s.solidity}</span>`;
-
-      html += `<div class="step-item">
-        <span class="step-num done">${i + 1}</span>
-        <img class="step-thumb" src="data:image/png;base64,${step.mask_png_base64}" alt="${step.step_name}" title="点击放大"
-             onclick="window.open('data:image/png;base64,${step.mask_png_base64}', '_blank')">
-        <div class="step-info">
-          <div class="step-title">${stepLabels[i] || step.step_name}</div>
-          <div class="step-desc">${step.description}</div>
-          <div class="step-stats">${statsHtml}</div>
-        </div>
-      </div>`;
+    // ── Phase 1: Black frame calibration (perspective rectification) ──
+    const resp = await fetch('/api/vision/calibrate-black-frame', {
+      method: 'POST',
+      body: form,
     });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || err.message || '校准失败');
+    }
+    const data = await resp.json();
 
-    // Add transparent PNG preview
-    if (data.transparent_png_base64) {
-      html += `<div class="transparent-preview">
-        <img src="data:image/png;base64,${data.transparent_png_base64}"
-             alt="PCB透明背景" title="透明PCB图"
-             onclick="window.open('data:image/png;base64,${data.transparent_png_base64}', '_blank')">
-      </div>`;
+    // Store calibration result (basic HSV extraction as fallback)
+    STATE.cal[side] = {
+      id: data.calibration_id,
+      ppm: data.pixels_per_mm,
+      rect_b64: data.rectified_png_base64,
+      transparent_pcb_b64: data.transparent_pcb_b64 || '',
+      transparent_pcb_outline: data.transparent_pcb_outline_mm || [],
+      w_mm: data.rectified_w_mm || STATE.frameW,
+      h_mm: data.rectified_h_mm || STATE.frameH,
+      frameW: data.rectified_w_mm || STATE.frameW,
+      frameH: data.rectified_h_mm || STATE.frameH,
+    };
+
+    // Show rectify toggle + rectified canvas in upload zone
+    show($(`#rectify-row-${side}`));
+    show($(`#canvas-wrap-${side}`));
+    STATE.rectShow[side] = true;
+    $(`#rect-toggle-${side}`).checked = true;
+    drawUploadCanvas(side);
+
+    // ── Phase 2: Paper model shadow removal + refined transparent PCB ──
+    // This is the original "标定" logic: build paper background model,
+    // subtract shadows, produce clean transparent PCB with accurate outline.
+    btn.textContent = '去除阴影中...';
+    try {
+      const fm2 = new FormData();
+      fm2.append('calibration_id', data.calibration_id);
+      const resp2 = await fetch('/api/vision/extract-pcb', { method: 'POST', body: fm2 });
+      if (resp2.ok) {
+        const edata = await resp2.json();
+        // Overwrite with paper-model shadow-removed transparent PCB
+        if (edata.transparent_pcb_b64) {
+          STATE.cal[side].transparent_pcb_b64 = edata.transparent_pcb_b64;
+        }
+        if (edata.outline && edata.outline.length > 0) {
+          STATE.cal[side].transparent_pcb_outline = edata.outline;
+        }
+        // Show paper model success label
+        if (edata.paper_model) {
+          show($('#paper-model'));
+          setHTML($('#paper-model-content'), `
+            <span style="font-size:0.78rem;color:#64748b;">
+              ${side === 'front' ? '正面' : '反面'} - 阴影去除完成（纸张底色建模）
+            </span>
+          `);
+        }
+      }
+    } catch (e) {
+      // Non-fatal: continue with basic HSV extraction from Phase 1
+      console.warn(`Shadow removal for ${side} (non-fatal):`, e);
     }
 
-    resultDiv.innerHTML = html;
-    resultDiv.hidden = false;
+    // Show calibration canvas with shadow-removed transparent PCB
+    show($(`#cal-canvas-wrap-${side}`));
+    drawCalCanvas(side);
 
-    // Update stats
-    const grooveCount = (data.grooves || []).length;
-    const outlineCount = (data.outline || []).length;
-    const ppm = calData.pixels_per_mm?.toFixed(1) || '?';
-    stats.innerHTML = `分辨率 ${ppm} px/mm · 轮廓 ${outlineCount}点 · 凹槽 ${grooveCount}个`;
+    checkExtractReady();
+    checkGenerateReady();
 
-    // Always show result (groove warnings still shown)
-    if (data.groove_warning) {
-      resultDiv.innerHTML += `<div class="step-item" style="background:#fff3cd">
-        <span class="step-num">⚠</span>
-        <div class="step-info">
-          <div class="step-title" style="color:#cc8800">凹槽提示</div>
-          <div class="step-desc">${data.groove_warning}</div>
-        </div>
-      </div>`;
+    btn.textContent = '获取完成';
+    btn.classList.add('btn-done');
+
+    // Check if both sides calibrated
+    if (STATE.cal.front && STATE.cal.back) {
+      setBadge('step2', '可识别', 'ready');
     }
-
-    // Draw outline on canvas
-    drawCalibrationCanvas(side, calData, state.detection[side]);
-
-    // Enable next steps
-    document.getElementById(`btn-detect-holes-${side}`).disabled = false;
-    document.getElementById(`btn-pads-${side}`).disabled = false;
-
-    toast(`✅ 轮廓提取完成: ${outlineCount}点, ${grooveCount}个凹槽`, 'success');
-  } catch (e) {
-    toast(e.message, 'error');
-    resultDiv.innerHTML = `<div class="step-item"><span class="step-num">!</span><div class="step-info"><div class="step-title" style="color:#e74c3c">提取失败</div><div class="step-desc">${e.message}</div></div></div>`;
-    resultDiv.hidden = false;
-  } finally {
-    btn.classList.remove('loading');
+  } catch (err) {
+    btn.textContent = '获取失败';
     btn.disabled = false;
+    console.error(`calibrateSide ${side}:`, err);
   }
 }
 
-// ═══ Hole Detection ═══════════════════════════════════════════
-function setupDetectHolesButtons() {
-  for (const side of ['front', 'back']) {
-    document.getElementById(`btn-detect-holes-${side}`).addEventListener('click', () => detectHoles(side));
+/**
+ * Draw calibration canvas in step 2 (shows rectified image)
+ */
+function drawCalCanvas(side) {
+  const cal = STATE.cal[side];
+  if (!cal) return;
+
+  const canvas = $(`#cal-canvas-${side}`);
+  if (!canvas) return;
+
+  // If pads detected with PCB image, use PCB-only image as background
+  const pads = STATE.pads[side];
+  const usePcbImg = pads?.pcb_image_b64;
+
+  const src = usePcbImg
+    ? `data:image/png;base64,${pads.pcb_image_b64}`
+    : (cal.transparent_pcb_b64
+      ? `data:image/png;base64,${cal.transparent_pcb_b64}`
+      : `data:image/png;base64,${cal.rect_b64}`);
+
+  const img = new Image();
+  img.onload = () => {
+    const maxW = 900, maxH = 520;
+    const scale = Math.min(maxW / img.width, maxH / img.height);
+    canvas.width = Math.round(img.width * scale);
+    canvas.height = Math.round(img.height * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    // Draw pad markers if pads have been detected
+    const candidates = pads?.candidates || [];
+    if (!candidates.length) return;
+
+    // ppm: use PCB coordinate system if available (PCB-relative coords)
+    const ppm = usePcbImg && pads.coordinate_system
+      ? img.width / pads.coordinate_system.pcb_width_mm
+      : (cal.ppm || (img.width / (cal.frameW || 60)));
+    const colors = ['#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899'];
+    candidates.forEach((c, idx) => {
+      const color = colors[idx % colors.length];
+      const vr = c.visible_region || c;
+      const polygon = vr.polygon;
+      const bbox = vr.bbox || {};
+      const cx = vr.center?.x_mm ?? (bbox.x_mm + (bbox.width_mm || 0) / 2);
+      const cy = vr.center?.y_mm ?? (bbox.y_mm + (bbox.height_mm || 0) / 2);
+
+      // mm → canvas px helper
+      const toX = (mm) => mm * ppm * scale;
+      const toY = (mm) => mm * ppm * scale;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+
+      // Draw symmetric rounded rect (PCB pads are symmetric)
+      // Compute bbox from polygon, then symmetrize around center.
+      // Damage (e.g. chipped copper) makes polygon asymmetric;
+      // the intact side's max extent determines the true pad size.
+      let bx1, by1, bx2, by2;
+      if (polygon && polygon.length >= 3) {
+        const pxs = polygon.map(p => toX(p.x_mm));
+        const pys = polygon.map(p => toY(p.y_mm));
+        const cxp = toX(cx), cyp = toY(cy);
+        // Max half-extent from center on each axis (symmetry repair)
+        let hw = 0, hh = 0;
+        for (let i = 0; i < pxs.length; i++) {
+          hw = Math.max(hw, Math.abs(pxs[i] - cxp));
+          hh = Math.max(hh, Math.abs(pys[i] - cyp));
+        }
+        bx1 = cxp - hw; by1 = cyp - hh;
+        bx2 = cxp + hw; by2 = cyp + hh;
+      } else {
+        const bw = (bbox.width_mm || 3) * ppm * scale;
+        const bh = (bbox.height_mm || 3) * ppm * scale;
+        bx1 = toX(cx) - bw / 2; by1 = toY(cy) - bh / 2;
+        bx2 = toX(cx) + bw / 2; by2 = toY(cy) + bh / 2;
+      }
+      const sw = bx2 - bx1, sh = by2 - by1;
+      // Corner radius: use unified corner_radius_mm from alignment if available,
+      // otherwise estimate from polygon shape with symmetry constraint.
+      let r;
+      if (c.corner_radius_mm != null) {
+        // Backend-computed unified corner radius (mm → canvas px)
+        r = c.corner_radius_mm * ppm * scale;
+      } else if (polygon && polygon.length >= 4) {
+        const short = Math.min(sw, sh);
+        const searchR = short * 0.45;
+        const corners = [[bx1,by1],[bx2,by1],[bx2,by2],[bx1,by2]];
+        const radii = [];
+        for (const [ccx, ccy] of corners) {
+          let minD = Infinity;
+          for (let i = 0; i < polygon.length; i++) {
+            const ppx = toX(polygon[i].x_mm), ppy = toY(polygon[i].y_mm);
+            if (Math.abs(ppx - ccx) > searchR || Math.abs(ppy - ccy) > searchR) continue;
+            const d = Math.hypot(ppx - ccx, ppy - ccy);
+            if (d < minD) minD = d;
+          }
+          if (minD > 0 && minD < Infinity) {
+            radii.push(minD / (Math.SQRT2 - 1));
+          }
+        }
+        if (radii.length >= 3) {
+          const sorted = [...radii].sort((a,b) => a - b);
+          const n = sorted.length;
+          const median = n % 2 === 1 ? sorted[Math.floor(n/2)]
+            : (sorted[n/2 - 1] + sorted[n/2]) / 2;
+          const good = radii.filter(v => v >= 0.6 * median && v <= 1.4 * median);
+          const avg = good.length > 0
+            ? good.reduce((a,b)=>a+b,0) / good.length
+            : median;
+          r = Math.min(avg, short / 2);
+        } else if (radii.length > 0) {
+          r = Math.min(radii.reduce((a,b)=>a+b,0) / radii.length, short / 2);
+        } else {
+          r = short * 0.1;
+        }
+      } else {
+        r = Math.min(sw, sh) * 0.1;
+      }
+      r = Math.max(r, 1);
+
+      // Draw rounded rectangle with estimated radius
+      ctx.beginPath();
+      ctx.moveTo(bx1 + r, by1);
+      ctx.lineTo(bx2 - r, by1);
+      ctx.arcTo(bx2, by1, bx2, by1 + r, r);
+      ctx.lineTo(bx2, by2 - r);
+      ctx.arcTo(bx2, by2, bx2 - r, by2, r);
+      ctx.lineTo(bx1 + r, by2);
+      ctx.arcTo(bx1, by2, bx1, by2 - r, r);
+      ctx.lineTo(bx1, by1 + r);
+      ctx.arcTo(bx1, by1, bx1 + r, by1, r);
+      ctx.closePath();
+      ctx.fillStyle = color + '30';
+      ctx.fill();
+      ctx.stroke();
+
+      // Label text above the pad
+      const label = c.label || `#${idx + 1}`;
+      const labelY = polygon && polygon.length >= 3
+        ? Math.min(...polygon.map(p => toY(p.y_mm))) - 4
+        : toY(cy) - (bbox.height_mm || 3) * ppm * scale / 2 - 4;
+      ctx.font = 'bold 12px sans-serif';
+      ctx.fillStyle = color;
+      ctx.textAlign = 'center';
+      ctx.fillText(label, toX(cx), labelY);
+    });
+  };
+  img.src = src;
+}
+
+// ══════════════════════════════════════════════════════════
+//  STEP 2 — Combined Extract Outlines (centered button)
+// ══════════════════════════════════════════════════════════
+function checkExtractReady() {
+  const bothOk = STATE.cal.front && STATE.cal.back;
+  const btn = $('#btn-extract-both');
+  btn.disabled = !bothOk;
+  if (bothOk) {
+    setBadge('step2', '可识别', 'ready');
+  }
+}
+
+async function extractBoth() {
+  const btn = $('#btn-extract-both');
+  btn.disabled = true;
+  btn.textContent = '识别轮廓中（正反面）...';
+
+  try {
+    // Pass 1: extract both sides independently (in parallel). This writes each
+    // side's pcb_outline.json to disk so the other side can read it.
+    const [frontData1, backData1] = await Promise.all([
+      extractPcbSide('front'),
+      extractPcbSide('back'),
+    ]);
+
+    // Pass 2: front⇄back cross-validation (mask consensus). Each side is
+    // re-extracted using the other side's outline (now on disk) to remove
+    // one-sided edge artifacts (burrs/shadows visible in only one photo).
+    let frontData = frontData1, backData = backData1;
+    const frontId = STATE.cal.front?.id, backId = STATE.cal.back?.id;
+    if (frontId && backId) {
+      try {
+        btn.textContent = '正反面交叉校验中...';
+        const [frontData2, backData2] = await Promise.all([
+          extractPcbSide('front', backId),
+          extractPcbSide('back', frontId),
+        ]);
+        frontData = frontData2;
+        backData = backData2;
+      } catch (e) {
+        console.warn('extractBoth: consensus pass failed, using pass-1 results', e);
+      }
+    }
+
+    STATE.extract.front = frontData;
+    STATE.extract.back = backData;
+
+    // Update cal state with refined transparent PCB from extract-pcb
+    // so that drawCalCanvas (used by pad detection overlay) shows the
+    // contour-extracted transparent image instead of the initial calibration one.
+    if (frontData?.transparent_pcb_b64 && STATE.cal.front) {
+      STATE.cal.front.transparent_pcb_b64 = frontData.transparent_pcb_b64;
+    }
+    if (frontData?.outline?.length > 0 && STATE.cal.front) {
+      STATE.cal.front.transparent_pcb_outline = frontData.outline;
+    }
+    if (backData?.transparent_pcb_b64 && STATE.cal.back) {
+      STATE.cal.back.transparent_pcb_b64 = backData.transparent_pcb_b64;
+    }
+    if (backData?.outline?.length > 0 && STATE.cal.back) {
+      STATE.cal.back.transparent_pcb_outline = backData.outline;
+    }
+    // Redraw canvases with updated transparent PCB
+    drawCalCanvas('front');
+    drawCalCanvas('back');
+
+    // ── Run Edge Chamfer Distance contour matching ──
+    // If contourMatch was already set by /api/simulate (auto-test), keep it.
+    // Otherwise (upload mode), call the dedicated endpoint.
+    if (!STATE.contourMatch || !STATE.contourMatch.message) {
+      try {
+        const matchFm = new FormData();
+        matchFm.append('front_calibration_id', STATE.cal.front?.id || '');
+        matchFm.append('back_calibration_id', STATE.cal.back?.id || '');
+        const matchResp = await fetch('/api/vision/contour-match', {
+          method: 'POST', body: matchFm,
+        });
+        if (matchResp.ok) {
+          STATE.contourMatch = await matchResp.json();
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    // Show per-side results
+    displayExtractResult('front', frontData);
+    displayExtractResult('back', backData);
+    show($('#extract-results-grid'));
+
+    // Enable holes & pads buttons
+    enableHolesPadsButtons();
+
+    // Show contour consistency check (Chamfer-based)
+    displayContourMatch();
+
+    btn.textContent = '轮廓识别完成';
+    btn.classList.add('btn-done');
+    setBadge('step2', '识别完成', 'ready');
+  } catch (err) {
+    btn.textContent = '识别失败，点击重试';
+    btn.disabled = false;
+    console.error('extractBoth error:', err);
+  }
+}
+
+async function extractPcbSide(side, otherCalibrationId) {
+  const cal = STATE.cal[side];
+  if (!cal) throw new Error(`No calibration for ${side}`);
+
+  const fm = new FormData();
+  fm.append('calibration_id', cal.id);
+  if (otherCalibrationId) {
+    // Enable front⇄back cross-validation (mask consensus) on the backend.
+    fm.append('other_calibration_id', otherCalibrationId);
+  }
+
+  const resp = await fetch('/api/vision/extract-pcb', { method: 'POST', body: fm });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+    throw new Error(err.detail || `Extract ${side} failed`);
+  }
+  const data = await resp.json();
+
+  // Show paper model if available (step 1 area)
+  if (data.debug_steps && data.debug_steps['02_paper_model']) {
+    const pm = data.debug_steps['02_paper_model'];
+    if (pm && pm.base64) {
+      show($('#paper-model'));
+      setHTML($('#paper-model-content'), `
+        <div class="img-grid">
+          <img src="data:image/png;base64,${pm.base64}" alt="纸张底色模型" />
+        </div>
+        <p style="font-size:0.78rem;color:#64748b;margin:4px 0 0 0;">
+          ${pm.note || '纸张底色模型提取完成'}
+        </p>
+      `);
+    }
+  }
+
+  return data;
+}
+
+function displayExtractResult(side, data) {
+  const container = $(`#extract-result-${side}`);
+  const outline = data.outline || [];
+  const grooves = data.grooves || [];
+  const consensus = data.consensus_msg || '';
+  let imgHtml = '';
+  if (data.transparent_pcb_b64) {
+    imgHtml = `<div class="img-grid">
+      <img src="data:image/png;base64,${data.transparent_pcb_b64}" alt="${side} PCB" />
+    </div>`;
+  } else if (data.pcb_mask_b64) {
+    imgHtml = `<div class="img-grid">
+      <img src="data:image/png;base64,${data.pcb_mask_b64}" alt="${side} mask" />
+    </div>`;
+  }
+  setHTML(container, `
+    <p style="font-size:0.85rem; margin:4px 0;">
+      顶点: <strong>${outline.length}</strong> &nbsp; 槽口: <strong>${grooves.length}</strong>
+      ${consensus ? `<br><span style="color:#6366f1;">${consensus}</span>` : ''}
+    </p>
+    ${imgHtml}
+  `);
+}
+
+// ── Contour Consistency Check (shown after extract) ──
+// Uses Edge Chamfer Distance Matching results from backend
+function displayContourMatch() {
+  const cm = STATE.contourMatch;
+  show($('#contour-match'));
+
+  // Use backend Chamfer data if available
+  if (cm && cm.message) {
+    const areaPct = cm.mismatch_area_pct != null ? cm.mismatch_area_pct : 0;
+    const mergedPts = cm.merged_outline_mm?.length || 0;
+    const mergedArea = cm.merged_area_mm2 || 0;
+    const ok = cm.ok;
+
+    setHTML($('#contour-match-content'), `
+      <p>
+        <strong>Edge Chamfer 匹配</strong> —
+        <span class="${ok ? 'match-ok' : 'match-ng'}">${ok ? '通过' : '偏差较大'}</span><br>
+        ${cm.message}<br>
+        合并后轮廓: <strong>${mergedPts}</strong> 顶点 &nbsp;|&nbsp;
+        面积: <strong>${mergedArea.toFixed(0)} mm²</strong> &nbsp;|&nbsp;
+        偏差: <strong>${areaPct.toFixed(1)}%</strong>
+      </p>
+    `);
+    return;
+  }
+
+  // Fallback: no Chamfer data yet (upload mode before scan)
+  const frontOutline = STATE.extract.front?.outline || [];
+  const backOutline = STATE.extract.back?.outline || [];
+  const frontPts = frontOutline.length;
+  const backPts = backOutline.length;
+
+  if (frontPts >= 3 && backPts >= 3) {
+    const w = STATE.cal.front?.frameW || STATE.frameW;
+    const h = STATE.cal.front?.frameH || STATE.frameH;
+    setHTML($('#contour-match-content'), `
+      <p>
+        正面顶点: <strong>${frontPts}</strong> &nbsp;|&nbsp;
+        背面顶点: <strong>${backPts}</strong><br>
+        方框尺寸: ${w.toFixed(1)} &times; ${h.toFixed(1)} mm<br>
+        <span style="color:#94a3b8;font-size:0.78rem;">
+          Edge Chamfer 匹配数据待扫描后获取
+        </span>
+      </p>
+    `);
+  } else {
+    setHTML($('#contour-match-content'), `
+      <p class="match-ng">轮廓数据不完整，无法校验
+      (正面${frontPts}顶点, 背面${backPts}顶点)</p>
+    `);
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  STEP 2 — Holes & Pads (per side)
+// ══════════════════════════════════════════════════════════
+function enableHolesPadsButtons() {
+  // 只要任意一面有轮廓提取结果就启用一键识别按钮
+  const anyExtract = !!(STATE.extract.front || STATE.extract.back);
+  $('#btn-detect-all').disabled = !anyExtract;
+}
+
+async function detectAll() {
+  const btn = $('#btn-detect-all');
+  btn.disabled = true;
+  btn.textContent = '识别中...';
+  const sides = [];
+  if (STATE.extract.front) sides.push('front');
+  if (STATE.extract.back) sides.push('back');
+  try {
+    for (const side of sides) {
+      btn.textContent = `识别${side === 'front' ? '正面' : '背面'}中...`;
+      await detectHoles(side);
+      await detectPads(side);
+      await detectComponents(side);
+    }
+    btn.textContent = '识别完成';
+    btn.classList.add('btn-done');
+  } catch (e) {
+    btn.textContent = '部分识别失败';
+  } finally {
+    btn.disabled = false;
   }
 }
 
 async function detectHoles(side) {
-  const calData = state.calibration[side];
-  if (!calData) { toast('请先完成标定', 'error'); return; }
+  const btn = document.getElementById(`btn-holes-${side}`);  // may be null (merged into detectAll)
+  if (btn) { btn.disabled = true; btn.textContent = '检测中...'; }
 
-  const det = state.detection[side];
-  if (!det?.outline?.length) { toast('请先识别轮廓', 'error'); return; }
-
-  const btn = document.getElementById(`btn-detect-holes-${side}`);
-  const resultDiv = document.getElementById(`holes-result-${side}`);
-  const stats = document.getElementById(`stats-${side}`);
-  btn.classList.add('loading');
-  btn.disabled = true;
+  const cal = STATE.cal[side];
+  const extract = STATE.extract[side];
+  if (!cal || !extract) return;
 
   try {
-    const form = new FormData();
-    form.append('calibration_id', calData.calibration_id);
-    // Send the outline polygon
-    const outlinePoly = det.outline[0]?.visible_region?.polygon || det.outline[0] || [];
-    form.append('outline_json', JSON.stringify({ outline: outlinePoly }));
+    const fm = new FormData();
+    fm.append('calibration_id', cal.id);
+    fm.append('outline_json', JSON.stringify({ outline: extract.outline }));
 
-    const res = await fetch(`${API}/detect-holes`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error(`孔槽检测失败 (${res.status}): ${await safeErrorText(res)}`);
-    const data = await res.json();
+    const resp = await fetch('/api/vision/detect-holes', { method: 'POST', body: fm });
+    if (!resp.ok) throw new Error('Holes detection failed');
+    const data = await resp.json();
+    STATE.holes[side] = data;
 
-    state.detection[side].holes = data.holes || [];
+    setHTML($(`#holes-result-${side}`), `
+      <span class="ok">孔位: ${data.hole_count || data.holes?.length || 0}</span>
+    `);
+    if (btn) { btn.textContent = '重新检测'; btn.disabled = false; }
 
-    // Build result HTML
-    const holes = data.holes || [];
-    let html = `<div class="step-item">
-      <span class="step-num done">✓</span>
-      <div class="step-info">
-        <div class="step-title">检测到 ${holes.length} 个孔槽</div>`;
-
-    // Group by type
-    const byType = {};
-    holes.forEach(h => { byType[h.hole_type || h.shape || '?'] = (byType[h.hole_type || h.shape || '?'] || 0) + 1; });
-    const typeStr = Object.entries(byType).map(([t, c]) => `${t}: ${c}`).join(' · ');
-    html += `<div class="step-desc">${typeStr}</div>`;
-
-    if (holes.length > 0) {
-      html += '<div class="step-stats">';
-      holes.slice(0, 8).forEach((h, i) => {
-        const c = h.visible_region?.center || h.visible_position || {};
-        html += `<span>${h.label || 'h' + (i + 1)}: (${c.x_mm?.toFixed(1) || '?'}, ${c.y_mm?.toFixed(1) || '?'}) ${h.width_mm?.toFixed(1) || ''}×${h.height_mm?.toFixed(1) || ''}mm</span>`;
-      });
-      if (holes.length > 8) html += `<span>... +${holes.length - 8} more</span>`;
-      html += '</div>';
-    }
-    html += '</div></div>';
-
-    resultDiv.innerHTML = html;
-    resultDiv.hidden = false;
-
-    // Update canvas
-    drawCalibrationCanvas(side, calData, state.detection[side]);
-
-    // Update stats
-    const ppm = calData.pixels_per_mm?.toFixed(1) || '?';
-    const outlineCount = (det.outline || []).length;
-    stats.innerHTML = `分辨率 ${ppm} px/mm · 轮廓 ${outlineCount}点 · 孔槽 ${holes.length}个`;
-
-    checkGenerateReady();
-    toast(`✅ 检测到 ${holes.length} 个孔槽`, 'success');
-  } catch (e) {
-    toast(e.message, 'error');
-    resultDiv.innerHTML = `<div class="step-item"><span class="step-num">!</span><div class="step-info"><div class="step-title" style="color:#e74c3c">检测失败</div><div class="step-desc">${e.message}</div></div></div>`;
-    resultDiv.hidden = false;
-  } finally {
-    btn.classList.remove('loading');
-    btn.disabled = false;
+    updateResultsTables();
+  } catch (err) {
+    if (btn) { btn.textContent = '检测失败'; btn.disabled = false; }
   }
-}
-
-// ═══ Pad Detection ════════════════════════════════════════════
-function setupPadButtons() {
-  document.getElementById('btn-pads-front').addEventListener('click', () => detectPads('front'));
-  document.getElementById('btn-pads-back').addEventListener('click', () => detectPads('back'));
 }
 
 async function detectPads(side) {
-  const calData = state.calibration[side];
-  if (!calData) { toast('请先完成标定', 'error'); return; }
+  const btn = document.getElementById(`btn-pads-${side}`);  // may be null (merged into detectAll)
+  if (btn) { btn.disabled = true; btn.textContent = '识别中...'; }
 
-  const btn = document.getElementById(`btn-pads-${side}`);
-  const stats = document.getElementById(`stats-${side}`);
-  btn.classList.add('loading');
-  btn.disabled = true;
+  const cal = STATE.cal[side];
+  if (!cal) return;
 
   try {
-    // Always call VLM for pad detection
-    const form = new FormData();
-    form.append('calibration_id', calData.calibration_id);
-    form.append('side', side);
-    const res = await fetch(`${API}/detect-all`, { method: 'POST', body: form });
-    if (!res.ok) throw new Error(`焊盘检测失败 (${res.status}): ${await safeErrorText(res)}`);
-    const vlmResult = await res.json();
-    state.padDetection[side] = vlmResult;
+    const fm = new FormData();
+    fm.append('calibration_id', cal.id);
+    fm.append('side', side);
+    const resp = await fetch('/api/vision/detect-terminals', { method: 'POST', body: fm });
+    if (!resp.ok) throw new Error('Pad detection failed');
+    const data = await resp.json();
+    STATE.pads[side] = data;
 
-    // Merge VLM pads into detection state (keep our CV outline/holes)
-    if (!state.detection[side]) state.detection[side] = {};
-    if (!state.detection[side].outline && vlmResult.outline) {
-      state.detection[side].outline = vlmResult.outline;
-    }
-    if (!state.detection[side].holes && vlmResult.holes) {
-      state.detection[side].holes = vlmResult.holes;
-    }
+    const tc = data.candidate_count || data.candidates?.length || 0;
+    if (btn) { btn.textContent = `${tc} 焊盘`; btn.classList.add('btn-done'); btn.disabled = false; }
 
-    const pads = vlmResult.pads || [];
-    const det = state.detection[side] || {};
-    const outlineCount = (det.outline || []).length;
-    const holeCount = (det.holes || []).length;
-    const ppm = calData.pixels_per_mm?.toFixed(1) || '?';
-    stats.innerHTML = `分辨率 ${ppm} px/mm · 轮廓 ${outlineCount} · 孔槽 ${holeCount} · 焊盘 ${pads.length}`;
-
-    drawPadCanvas(side, calData, vlmResult);
-    renderPadTable(side, pads);
-
+    updateResultsTables();
     checkGenerateReady();
-    toast(`✅ ${pads.length} 个焊盘已标注`, 'success');
-  } catch (e) {
-    toast(e.message, 'error');
-  } finally {
-    btn.classList.remove('loading');
-    btn.disabled = false;
+    drawCalCanvas(side);
+  } catch (err) {
+    if (btn) { btn.textContent = '识别失败'; btn.disabled = false; }
   }
 }
 
-function renderPadTable(side, pads) {
-  const tableDiv = document.getElementById(`table-${side}`);
-  const resultsTables = document.getElementById('results-tables');
-  if (!pads.length) {
-    tableDiv.innerHTML = '<h4>' + (side === 'front' ? '🟢 正面' : '🔴 背面') + ' 焊盘</h4><p class="muted">未检测到焊盘</p>';
-    resultsTables.hidden = false;
-    return;
+
+// ── Component detection (元器件识别) ──────────────────────
+const COMP_TYPE_LABELS = {
+  ic: 'IC芯片', mosfet: 'MOSFET', resistor: '电阻', capacitor: '电容',
+  diode: '二极管', ntc: 'NTC热敏', led: 'LED', other: '其他'
+};
+
+async function detectComponents(side) {
+  const btn = document.getElementById(`btn-components-${side}`);  // may be null (merged into detectAll)
+  if (btn) { btn.disabled = true; btn.textContent = '识别中...'; }
+
+  const cal = STATE.cal[side];
+  if (!cal) return;
+
+  try {
+    const fm = new FormData();
+    fm.append('calibration_id', cal.id);
+    fm.append('side', side);
+    const resp = await fetch('/api/vision/detect-components', { method: 'POST', body: fm });
+    if (!resp.ok) throw new Error('Component detection failed');
+    const data = await resp.json();
+    STATE.components[side] = data;
+
+    const comps = data.components || [];
+    if (btn) { btn.textContent = `${comps.length} 元器件`; btn.classList.add('btn-done'); btn.disabled = false; }
+
+    // Display component results
+    const resultEl = $(`#components-result-${side}`);
+    if (resultEl && comps.length > 0) {
+      let html = `<div style="margin-top:4px;"><b>${side === 'front' ? '正面' : '背面'}元器件:</b></div>`;
+      html += '<table style="font-size:0.8rem; border-collapse:collapse; width:100%; margin-top:4px;">';
+      html += '<tr style="background:#f1f5f9;"><th style="padding:2px 6px; text-align:left;">类型</th><th style="padding:2px 6px; text-align:left;">丝印</th><th style="padding:2px 6px; text-align:left;">封装</th><th style="padding:2px 6px;">置信度</th></tr>';
+      comps.forEach(c => {
+        const label = COMP_TYPE_LABELS[c.type] || c.type;
+        const silk = c.silkscreen || '<span style="color:#94a3b8;">未读取</span>';
+        const pkg = c.package || '-';
+        const conf = (c.confidence * 100).toFixed(0) + '%';
+        html += `<tr><td style="padding:2px 6px;">${label}</td><td style="padding:2px 6px; font-family:monospace; font-weight:600;">${silk}</td><td style="padding:2px 6px;">${pkg}</td><td style="padding:2px 6px; text-align:center;">${conf}</td></tr>`;
+      });
+      html += '</table>';
+      setHTML(resultEl, html);
+    }
+
+    // Auto-fill IC and MOS model fields
+    autoFillFromComponents();
+
+    updateResultsTables();
+    checkGenerateReady();
+  } catch (err) {
+    if (btn) { btn.textContent = '识别失败'; btn.disabled = false; }
+    console.error('detectComponents error:', err);
+  }
+}
+
+function autoFillFromComponents() {
+  // Scan both sides for IC and MOSFET components, auto-fill input fields
+  let icModel = null;
+  let mosModel = null;
+
+  for (const side of ['front', 'back']) {
+    const data = STATE.components[side];
+    if (!data) continue;
+    for (const comp of (data.components || [])) {
+      if (comp.type === 'ic' && comp.silkscreen && !icModel) {
+        icModel = comp.silkscreen;
+      }
+      if (comp.type === 'mosfet' && comp.silkscreen && !mosModel) {
+        mosModel = comp.silkscreen;
+      }
+    }
   }
 
-  let html = `<h4>${side === 'front' ? '🟢 正面' : '🔴 背面'} 焊盘 (${pads.length}个)</h4>`;
-  html += '<table class="pad-table"><thead><tr><th>标签</th><th>中心 X</th><th>中心 Y</th><th>宽度</th><th>高度</th><th>置信度</th></tr></thead><tbody>';
-  pads.forEach(p => {
-    const vr = p.visible_region || {};
-    const center = vr.center || p.visible_position || {};
-    const bbox = vr.bbox || {};
+  // Fill IC model field if empty and we found one
+  const icInput = $('#ic-model');
+  if (icModel && icInput && (!icInput.value || icInput.value === 'DW01')) {
+    icInput.value = icModel;
+    // Show a hint that it was auto-filled
+    icInput.style.borderColor = '#22c55e';
+    setTimeout(() => { icInput.style.borderColor = ''; }, 3000);
+  }
+
+  // Fill MOS model field if empty and we found one
+  const mosInput = $('#mos-model');
+  if (mosModel && mosInput && !mosInput.value) {
+    mosInput.value = mosModel;
+    mosInput.style.borderColor = '#22c55e';
+    setTimeout(() => { mosInput.style.borderColor = ''; }, 3000);
+  }
+}
+
+function updateResultsTables() {
+  show($('#results-tables'));
+  const content = $('#results-tables-content');
+  let html = '<table class="results-table"><thead><tr><th>面</th><th>轮廓顶点</th><th>槽口</th><th>孔位</th><th>焊盘</th><th>元器件</th></tr></thead><tbody>';
+  ['front', 'back'].forEach(side => {
+    const ext = STATE.extract[side];
+    const holes = STATE.holes[side];
+    const pads = STATE.pads[side];
+    const comps = STATE.components[side];
     html += `<tr>
-      <td><strong>${p.label || '?'}</strong></td>
-      <td>${center.x_mm?.toFixed(2) || '-'}</td>
-      <td>${center.y_mm?.toFixed(2) || '-'}</td>
-      <td>${bbox.width_mm?.toFixed(2) || '-'}</td>
-      <td>${bbox.height_mm?.toFixed(2) || '-'}</td>
-      <td class="pad-conf">${(p.confidence ?? 0).toFixed(2)}</td>
+      <td>${side === 'front' ? '正面' : '背面'}</td>
+      <td>${ext?.outline?.length || '-'}</td>
+      <td>${ext?.grooves?.length ?? '-'}</td>
+      <td>${holes?.hole_count ?? '-'}</td>
+      <td>${pads?.candidate_count ?? pads?.candidates?.length ?? '-'}</td>
+      <td>${comps?.components?.length ?? '-'}</td>
     </tr>`;
   });
   html += '</tbody></table>';
-  tableDiv.innerHTML = html;
-  resultsTables.hidden = false;
+  setHTML(content, html);
 }
 
-// ═══ Export ════════════════════════════════════════════════════
-function setupExport() {
-  document.getElementById('btn-generate').addEventListener('click', generateProject);
+// ══════════════════════════════════════════════════════════
+//  STEP 3 — Design Parameters & Generate KiCad
+// ══════════════════════════════════════════════════════════
+
+// ── Cell lookup (AI) ──
+// 将AI返回的电芯参数格式化为分组展示HTML（聚焦保护板设计相关参数，null显示为'-'）
+function fmtCellParams(d) {
+  const v = (x, unit) => (x === null || x === undefined || x === '') ? '-' : `${x}${unit || ''}`;
+  const range = (a, unit) => (Array.isArray(a) && a.length === 2) ? `${a[0]}~${a[1]}${unit || ''}` : '-';
+  const L = [];
+  L.push(`<b>✅ ${d.manufacturer || ''} ${d.model || ''}</b>`);
+  L.push(`【基本】容量 ${v(d.nominal_capacity_mah, 'mAh')} ｜ 标称 ${v(d.nominal_voltage_v, 'V')} ｜ 化学 ${v(d.chemistry)} ｜ 封装 ${v(d.form_factor)}`);
+  L.push(`【电压保护】充电截止 ${v(d.charge_cutoff_voltage_v, 'V')} ｜ 放电截止 ${v(d.discharge_cutoff_voltage_v, 'V')}`);
+  L.push(`【电流保护】标准充电 ${v(d.standard_charge_current_a, 'A')} ｜ 最大充电 ${v(d.max_charge_current_a, 'A')} ｜ 标准放电 ${v(d.standard_discharge_current_a, 'A')} ｜ 持续放电 ${v(d.max_continuous_discharge_a, 'A')} ｜ 脉冲 ${v(d.max_pulse_discharge_a, 'A')} ｜ 内阻 ${v(d.internal_resistance_mohm, 'mΩ')}`);
+  L.push(`【温度保护】充电 ${range(d.operating_temp_charge_c, '℃')} ｜ 放电 ${range(d.operating_temp_discharge_c, '℃')}`);
+  if (d.notes) L.push(`<span style="color:#8a8f98">💡 ${d.notes}</span>`);
+  return L.join('<br/>');
+}
+
+async function lookupCell() {
+  const btn = $('#btn-cell-lookup');
+  const resultEl = $('#cell-result');
+  const manufacturer = $('#cell-manufacturer').value.trim();
+  const model = $('#cell-model').value.trim();
+  if (!model) {
+    show(resultEl);
+    resultEl.className = 'param-result result-error';
+    setHTML(resultEl, '请输入电芯型号');
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = 'AI查询中...';
+  show(resultEl);
+  resultEl.className = 'param-result';
+  setHTML(resultEl, '<span class="spinner"></span> 正在通过AI获取电芯参数...');
+  try {
+    const resp = await fetch('/api/cell/lookup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ manufacturer, model }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error?.message || data.detail || '查询失败');
+    STATE.cellParams = data;
+    setHTML(resultEl, fmtCellParams(data));
+    checkGenerateReady();
+  } catch (err) {
+    STATE.cellParams = null;
+    resultEl.className = 'param-result result-error';
+    setHTML(resultEl, `❌ ${err.message}`);
+  }
+  btn.disabled = false;
+  btn.textContent = 'AI查询参数';
+}
+
+// ── IC resolve (marking → real MPN) ──
+async function resolveIc() {
+  const btn = $('#btn-ic-resolve');
+  const resultEl = $('#ic-result');
+  const model = $('#ic-model').value.trim();
+  if (!model) return;
+  btn.disabled = true;
+  btn.textContent = '解析中...';
+  show(resultEl);
+  resultEl.className = 'param-result';
+  setHTML(resultEl, '正在解析IC型号...');
+  try {
+    const resp = await fetch(`/api/ic/resolve?model=${encodeURIComponent(model)}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error?.message || data.detail || '解析失败');
+    STATE.icDevice = data;
+    const markingNote = data.resolved_from === 'marking'
+      ? `<br/>🔍 丝印 <b>${model}</b> → 实际型号 <b>${data.full_mpn}</b>`
+      : '';
+    setHTML(resultEl, `
+      <b>✅ ${data.full_mpn}</b> (${data.manufacturer})<br/>
+      封装: ${data.package} ｜ 支持串数: ${data.supported_series.join('/')}S ｜ 端口: ${data.port_topologies.join('/')}${markingNote}
+    `);
+    checkGenerateReady();
+  } catch (err) {
+    STATE.icDevice = null;
+    resultEl.className = 'param-result result-error';
+    setHTML(resultEl, `❌ ${err.message}`);
+  }
+  btn.disabled = false;
+  btn.textContent = '解析IC';
+}
+
+// ── Port topology inference from detected pads ──
+function inferPortTopology() {
+  const pads = STATE.pads.front?.candidates || STATE.pads.front?.pads || [];
+  const labels = pads.map(p => (p.label || '').toUpperCase());
+  const hasC = labels.includes('C+') && labels.includes('C-');
+  const hasP = labels.includes('P+') && labels.includes('P-');
+  let inferred = null;
+  if (hasP && hasC) inferred = 'separate';
+  else if (hasP && !hasC) inferred = 'common';
+  if (inferred) {
+    STATE.inferredTopology = inferred;
+    const el = $('#topology-inferred');
+    show(el);
+    setHTML(el, `🔍 根据焊盘丝印推断: <b>${inferred === 'common' ? '共口' : '分口'}</b>（${hasC ? '检测到C+/C-和P+/P-' : '仅检测到P+/P-'}），可手动覆盖`);
+  }
+  return inferred;
+}
+
+function getSelectedTopology() {
+  const sel = document.querySelector('input[name="port-topology"]:checked')?.value || 'auto';
+  if (sel !== 'auto') return sel;
+  return STATE.inferredTopology || 'common';
 }
 
 function checkGenerateReady() {
-  const frontOk = state.calibration.front && state.detection.front && state.padDetection.front;
-  const backOk = state.calibration.back && state.detection.back && state.padDetection.back;
-  const hasBack = !!document.getElementById('file-back').files[0];
-  // Enable generate when front side has outline + holes + pads
-  const frontReady = state.calibration.front && state.detection.front?.outline && state.padDetection.front?.pads;
-  document.getElementById('btn-generate').disabled = !frontReady;
+  const recognitionOk = !!(STATE.cal.front && STATE.extract.front);
+  const cellOk = !!STATE.cellParams;
+  const icOk = !!STATE.icDevice;
+  const ok = recognitionOk && cellOk && icOk;
+  const btn = $('#btn-generate');
+  btn.disabled = !ok;
+  if (recognitionOk) {
+    show($('#step-export'));
+    inferPortTopology();
+  }
+  if (ok) {
+    setBadge('step3', '可生成', 'ready');
+  } else {
+    const missing = [];
+    if (!recognitionOk) missing.push('PCB识别');
+    if (!cellOk) missing.push('电芯参数');
+    if (!icOk) missing.push('IC解析');
+    setBadge('step3', `缺少: ${missing.join(', ')}`, 'waiting');
+  }
+}
+
+// ── Map detected pad candidates → DesignSpec terminals ──
+const LABEL_ROLES = {
+  'B+':  { roles: ['battery'], polarity: 'positive' },
+  'B-':  { roles: ['battery'], polarity: 'negative' },
+  'P+':  { roles: ['charge', 'discharge'], polarity: 'positive' },
+  'P-':  { roles: ['charge', 'discharge'], polarity: 'negative' },
+  'C+':  { roles: ['charge'], polarity: 'positive' },
+  'C-':  { roles: ['charge'], polarity: 'negative' },
+  'NTC': { roles: ['temperature'], polarity: null },
+  'TH':  { roles: ['temperature'], polarity: null },
+  'N':   { roles: ['temperature'], polarity: null },
+  'ID':  { roles: ['identification'], polarity: null },
+};
+
+function buildTerminals() {
+  // 合并正反面焊盘，side 直接使用检测结果来源面。
+  const terminals = [];
+  let idx = 0;
+  for (const side of ['front', 'back']) {
+    const padData = STATE.pads[side];
+    const pads = padData?.candidates || [];
+    // detect-terminals 返回 PCB 相对坐标（origin=焊盘裁剪框左上角），而轮廓是
+    // 全幅框架坐标；加上裁剪偏移 crop_offset_mm 统一坐标系，否则端子会落在
+    // 轮廓外导致 point_in_polygon 校验失败。
+    const off = padData?.coordinate_system?.crop_offset_mm || { x: 0, y: 0 };
+    for (const pad of pads) {
+      const label = (pad.label || '').toUpperCase().trim();
+      const mapping = LABEL_ROLES[label];
+      if (!mapping) continue;
+      const region = pad.visible_region || (pad.matched_regions || [])[0] || {};
+      const center = region.center || {};
+      const poly = region.polygon || [];
+      if (!center.x_mm && center.x_mm !== 0) continue;
+      // Estimate width/height from polygon bbox
+      let w = 2.0, h = 2.0;
+      if (poly.length >= 3) {
+        const xs = poly.map(p => p.x_mm), ys = poly.map(p => p.y_mm);
+        w = Math.max(Math.max(...xs) - Math.min(...xs), 0.5);
+        h = Math.max(Math.max(...ys) - Math.min(...ys), 0.5);
+      }
+      // Build source_region with polygon for accurate pad shape rendering
+      const sourceRegion = {
+        type: 'solder_pad',
+        visual_class: 'pad',
+        shape: 'rect',
+        center: { x_mm: center.x_mm + off.x, y_mm: center.y_mm + off.y },
+        bbox: { x_mm: center.x_mm + off.x - w / 2, y_mm: center.y_mm + off.y - h / 2, width_mm: w, height_mm: h },
+        polygon: poly.map(p => ({ x_mm: p.x_mm + off.x, y_mm: p.y_mm + off.y })),
+        source: 'vlm',
+      };
+      terminals.push({
+        id: `T${++idx}_${label.replace(/[^A-Z0-9]/g, '')}`,
+        position: { x_mm: center.x_mm + off.x, y_mm: center.y_mm + off.y },
+        roles: mapping.roles,
+        polarity: mapping.polarity,
+        side,
+        shape: 'rect',
+        width_mm: Math.min(w, 50),
+        height_mm: Math.min(h, 50),
+        source_region: sourceRegion,
+      });
+    }
+  }
+  return terminals;
+}
+
+function deriveBatteryType() {
+  const cell = STATE.cellParams;
+  if (!cell) return '18650';
+  const chem = (cell.chemistry || '').toLowerCase();
+  if (chem.includes('fepo4') || chem.includes('lfp')) return 'LFP';
+  if (chem.includes('lipo') || chem.includes('polymer') || (cell.form_factor || '').includes('软包')) return 'LiPo';
+  const ff = (cell.form_factor || '').toLowerCase();
+  if (ff.includes('21700')) return '21700';
+  return '18650';
 }
 
 async function generateProject() {
-  const btn = document.getElementById('btn-generate');
-  const status = document.getElementById('export-status');
+  const btn = $('#btn-generate');
   btn.disabled = true;
-  btn.classList.add('loading');
-  btn.innerHTML = '<span class="spinner"></span> 生成中...';
+  btn.textContent = '生成中...';
+
+  const fId = STATE.cal.front?.id;
+  const bId = STATE.cal.back?.id;
+  const ic = STATE.icDevice?.full_mpn || $('#ic-model').value || 'DW01';
+
+  // Build outline from extraction result
+  const outlinePts = STATE.extract.front?.outline || [];
+  // Build terminals from detected pads
+  const terminals = buildTerminals();
+  const topology = getSelectedTopology();
+  const count = parseInt($('#cell-count').value) || 1;
+  const connection = $('#cell-connection').value || 'series';
+  const batteryType = deriveBatteryType();
+  const balance = document.querySelector('input[name="balance"]:checked')?.value === 'yes';
+  const targetCurrent = parseFloat($('#target-current').value) || null;
+  const mosModel = $('#mos-model').value.trim() || null;
+
+  // ── 合并正反面元器件识别结果 ──
+  const detectedComponents = [];
+  for (const side of ['front', 'back']) {
+    const cr = STATE.components[side];
+    if (cr && Array.isArray(cr.components)) {
+      for (const c of cr.components) {
+        detectedComponents.push({
+          type: c.type || 'other',
+          silkscreen: c.silkscreen || '',
+          package: c.package || '',
+          confidence: c.confidence ?? 0.5,
+        });
+      }
+    }
+  }
+  // 从识别结果推断 mos_count：统计 type=mosfet 的个数，至少为 1，否则默认 2
+  const mosDetected = detectedComponents.filter(c => c.type === 'mosfet').length;
+  const mosCount = mosDetected >= 1 ? mosDetected : 2;
 
   try {
-    const spec = buildDesignSpec();
-    const res = await fetch('/api/projects', {
+    const spec = {
+      name: `抄板_${ic}_${count}${connection === 'series' ? 'S' : 'P'}_${new Date().toISOString().slice(0, 10)}`,
+      protection_ic: ic,
+      battery: { count, connection, battery_type: batteryType },
+      mos_count: mosCount,
+      mos_mpn: mosModel,
+      outline: { points: outlinePts, source: 'photo', confirmed: true },
+      terminals,
+      photo_capture: {
+        front_calibration_id: fId || null,
+        back_calibration_id: bId || null,
+      },
+      detected_components: detectedComponents,
+    };
+
+    const resp = await fetch('/api/projects', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(spec),
     });
-    if (!res.ok) throw new Error(`创建失败 (${res.status}): ${await safeErrorText(res)}`);
-    const project = await res.json();
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      throw new Error(err.detail || err.error?.message || 'Generation failed');
+    }
+    const proj = await resp.json();
+    const projId = proj.id || proj.project_id;
 
-    status.innerHTML = `✅ 项目已创建: <strong>${project.id}</strong>`;
-    toast('KiCad 工程已生成！', 'success');
-  } catch (e) {
-    status.innerHTML = `❌ ${e.message}`;
-    toast(e.message, 'error');
-  } finally {
-    btn.classList.remove('loading');
+    let statusHtml = `<span class="ok">项目已创建: ${projId}</span>`;
+    statusHtml += ` ｜ 端口拓扑: <b>${proj.port_topology === 'common' ? '共口' : proj.port_topology === 'separate' ? '分口' : proj.port_topology}</b>`;
+    if (topology && proj.port_topology && topology !== 'auto' && proj.port_topology !== topology) {
+      statusHtml += ` <span class="ng">（与选择不一致，请检查焊盘识别）</span>`;
+    }
+    if (proj.directory) {
+      statusHtml += `<br/>项目目录: <code style="font-size:.8rem">${proj.directory}</code>`;
+    }
+    setHTML($('#gen-status'), statusHtml);
+    show($('#gen-actions'));
+    
+    if (projId) {
+      // 生成制造文件；器件为候选模板时先自动审批样板试产，再重试。
+      let mResp = await fetch(`/api/projects/${projId}/manufacturing`, { method: 'POST' });
+      if (!mResp.ok) {
+        const mErr = await mResp.json().catch(() => ({}));
+        if ((mErr.error?.code || '') === 'CANDIDATE_APPROVAL_REQUIRED') {
+          await fetch(`/api/projects/${projId}/approve-candidate`, { method: 'POST' });
+          mResp = await fetch(`/api/projects/${projId}/manufacturing`, { method: 'POST' });
+        }
+      }
+      if (mResp.ok) {
+        const mData = await mResp.json();
+        const files = mData.manifest?.files || [];
+        let dlHtml = '<h4 style="margin:0 0 6px 0">生成文件清单（共 ' + files.length + ' 个）</h4>';
+        dlHtml += files.map(f =>
+          `<a class="btn btn-outline" style="margin:3px" href="/api/projects/${projId}/artifacts/output/${f.path}" download>${f.path}</a>`
+        ).join('');
+        if (mData.package) {
+          dlHtml += `<div style="margin-top:8px"><a class="btn btn-primary" href="/api/projects/${projId}/artifacts/${mData.package}" download>⬇ 下载完整包 (ZIP)</a></div>`;
+        }
+        setHTML($('#gen-downloads'), dlHtml);
+      } else {
+        const mErr = await mResp.json().catch(() => ({}));
+        setHTML($('#gen-downloads'),
+          `<span class="ng">制造文件未生成：${mErr.error?.message || mResp.statusText}</span>`);
+      }
+    }
+
+    btn.textContent = '生成完成';
+    btn.classList.add('btn-done');
+    setBadge('step3', '已完成', 'ready');
+  } catch (err) {
+    setHTML($('#gen-status'), `<span class="ng">${err.message}</span>`);
+    btn.textContent = '重试生成';
     btn.disabled = false;
   }
 }
 
-function buildDesignSpec() {
-  const ic = document.getElementById('param-ic').value || 'DW01-G';
-  const cellConfig = document.getElementById('param-cell').value;
-  const cellCount = parseInt(cellConfig) || 1;
-  const maxCurrent = parseFloat(document.getElementById('param-current').value) || 5;
-  const vmin = parseFloat(document.getElementById('param-vmin').value) || 3.0;
-  const vmax = parseFloat(document.getElementById('param-vmax').value) || 4.25;
+// ── Image Lightbox (click to zoom) ──
+function initLightbox() {
+  // Create overlay element
+  const overlay = document.createElement('div');
+  overlay.id = 'lightbox-overlay';
+  overlay.innerHTML = '<img src="" alt="放大预览" />';
+  document.body.appendChild(overlay);
 
-  return {
-    protection_ic: ic,
-    cell_count: cellCount,
-    max_discharge_current_a: maxCurrent,
-    undervoltage_threshold_v: vmin,
-    overvoltage_threshold_v: vmax,
-    port_topology: 'common_port',
-    photo_capture: {
-      front_calibration_id: state.calibration.front?.calibration_id || '',
-      back_calibration_id: state.calibration.back?.calibration_id || '',
-      back_transform: 'none',
-    },
-  };
+  // Click on any .img-grid img → open lightbox
+  document.addEventListener('click', e => {
+    const img = e.target.closest('.img-grid img');
+    if (img) {
+      overlay.querySelector('img').src = img.src;
+      overlay.classList.add('active');
+      return;
+    }
+    // Click on .cal-canvas-wrap canvas → open lightbox (convert canvas to image)
+    const canvas = e.target.closest('.cal-canvas-wrap canvas');
+    if (canvas && canvas.width > 0) {
+      overlay.querySelector('img').src = canvas.toDataURL('image/png');
+      overlay.classList.add('active');
+    }
+  });
+
+  // Click overlay → close
+  overlay.addEventListener('click', () => {
+    overlay.classList.remove('active');
+  });
+
+  // ESC → close
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') overlay.classList.remove('active');
+  });
 }
+
+// ── Initialize ──
+document.addEventListener('DOMContentLoaded', () => {
+  init();
+  initLightbox();
+});
