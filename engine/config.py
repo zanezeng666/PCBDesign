@@ -27,6 +27,8 @@ def _find_kicad_root() -> Path:
         for ver in ("9.0", "8.0", "7.0"):
             candidates.append(Path(f"C:\\Program Files\\KiCad\\{ver}"))
             candidates.append(Path(f"C:\\Program Files (x86)\\KiCad\\{ver}"))
+        for drive in ("E", "D", "C"):
+            candidates.append(Path(f"{drive}:\\KiCad"))
     elif sys.platform == "darwin":
         candidates.append(Path("/Applications/KiCad/KiCad.app/Contents/Applications"))
     else:

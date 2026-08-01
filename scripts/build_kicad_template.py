@@ -112,13 +112,14 @@ IC_MODEL: str = "DW01-G"  # 默认值，由命令行参数覆盖
 
 
 # ── 网表定义 ──────────────────────────────────────────────
-# 每个网络: 名称 -> [(ref, pin_number), ...]
+# 每个网络：名称 -> [(ref, pin_number), ...]
+# 注意：J1 拆分为 4 个独立焊盘（B+/B-/P+/P-），不是单个连接器
 NETS: dict[str, list[tuple[str, str]]] = {
-    "B+": [("J1", "1"), ("J1", "3"), ("R1", "1")],
+    "B+": [("J_B+", "1"), ("J_P+", "1"), ("R1", "1")],
     "VDD": [("R1", "2"), ("U1", "5"), ("C1", "1"), ("C2", "1")],
     "B-": [("U1", "6"), ("Q1", "1"), ("C1", "2"), ("C2", "2"), ("R3", "2"), ("R4", "2"), ("C3", "2")],
     "MID": [("U1", "2"), ("Q1", "5"), ("Q1", "6"), ("Q1", "7"), ("Q1", "8"), ("R2", "1")],
-    "P-": [("Q1", "3"), ("J1", "2"), ("J1", "4")],
+    "P-": [("Q1", "3"), ("J_B-", "1"), ("J_P-", "1")],
     "OD": [("U1", "1"), ("Q1", "2")],
     "OC": [("U1", "3"), ("Q1", "4")],
     "TH": [("R2", "2"), ("R3", "1"), ("C3", "1"), ("TP_TH", "1")],
@@ -221,20 +222,17 @@ def symbol_library() -> str:
     L.append("    )")
     L.append("  )")
 
-    # 4Pin 连接器
-    L.append('  (symbol "Conn_01x04"')
+    # 单引脚端子符号（用于 B+/B-/P+/P- 独立焊盘）
+    L.append('  (symbol "Conn_01x01"')
     L.append("    (pin_names (offset 1.016) hide) (in_bom yes) (on_board yes)")
-    L.append('    (property "Reference" "J" (at 0 5.08 0) (effects (font (size 1.27 1.27))))')
-    L.append('    (property "Value" "Conn_01x04" (at 0 -7.62 0) (effects (font (size 1.27 1.27))))')
+    L.append('    (property "Reference" "J" (at 0 3.81 0) (effects (font (size 1.27 1.27))))')
+    L.append('    (property "Value" "Conn_01x01" (at 0 -3.81 0) (effects (font (size 1.27 1.27))))')
     L.append('    (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))')
     L.append('    (property "Datasheet" "~" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))')
-    L.append('    (symbol "Conn_01x04_1_1"')
-    L.append("      (rectangle (start -1.27 3.81) (end 1.27 -6.35)")
+    L.append('    (symbol "Conn_01x01_1_1"')
+    L.append("      (circle (center 0 0) (radius 1.27)")
     L.append("        (stroke (width 0.254) (type default)) (fill (type background)))")
-    L.append(_pin("1", "1", -3.81, 2.54, 0))
-    L.append(_pin("2", "2", -3.81, 0, 0))
-    L.append(_pin("3", "3", -3.81, -2.54, 0))
-    L.append(_pin("4", "4", -3.81, -5.08, 0))
+    L.append(_pin("1", "1", -3.81, 0, 0))
     L.append("    )")
     L.append("  )")
 
@@ -259,6 +257,10 @@ def symbol_library() -> str:
 # ── 元件布局与引脚几何 ──────────────────────────────
 # 引脚几何: pin_number -> (px, py, angle)【符号局部坐标，y 向上】
 PIN_GEOM: dict[str, dict[str, tuple[float, float, int]]] = {
+    "J_B+": {"1": (-3.81, 0, 0)},
+    "J_P+": {"1": (-3.81, 0, 0)},
+    "J_B-": {"1": (-3.81, 0, 0)},
+    "J_P-": {"1": (-3.81, 0, 0)},
     "U1": {"1": (-7.62, 2.54, 0), "2": (-7.62, 0, 0), "3": (-7.62, -2.54, 0),
            "4": (7.62, -2.54, 180), "5": (7.62, 0, 180), "6": (7.62, 2.54, 180)},
     "Q1": {"1": (-7.62, 3.81, 0), "2": (7.62, 3.81, 180), "3": (-7.62, 1.27, 0),
@@ -273,13 +275,15 @@ PIN_GEOM: dict[str, dict[str, tuple[float, float, int]]] = {
     "C3": {"1": (0, 5.08, 270), "2": (0, -5.08, 90)},
     "TP_TH": {"1": (0, 2.54, 270)},
     "TP_ID": {"1": (0, 2.54, 270)},
-    "J1": {"1": (-3.81, 2.54, 0), "2": (-3.81, 0, 0), "3": (-3.81, -2.54, 0), "4": (-3.81, -5.08, 0)},
 }
 
-# 元件实例: ref -> (lib_symbol, value, footprint, sx, sy)
+# 元件实例：ref -> (lib_symbol, value, footprint, sx, sy)
 def _components() -> dict[str, tuple[str, str, str, float, float]]:
     return {
-        "J1": ("Conn_01x04", "B+/B-/P+/P-", "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical", 25.4, 60.96),
+        "J_B+": ("Conn_01x01", "B+", "Connector_PinHeader_2.54mm:PinHeader_1x01_P2.54mm_Vertical", 25.4, 50.0),
+        "J_P+": ("Conn_01x01", "P+", "Connector_PinHeader_2.54mm:PinHeader_1x01_P2.54mm_Vertical", 25.4, 55.0),
+        "J_B-": ("Conn_01x01", "B-", "Connector_PinHeader_2.54mm:PinHeader_1x01_P2.54mm_Vertical", 25.4, 65.0),
+        "J_P-": ("Conn_01x01", "P-", "Connector_PinHeader_2.54mm:PinHeader_1x01_P2.54mm_Vertical", 25.4, 70.0),
         "U1": (IC_MODEL, IC_MODEL, "Package_TO_SOT_SMD:SOT-23-6", 76.2, 60.96),
         "Q1": ("FS8205A", "FS8205A", "Package_SO:TSSOP-8_4.4x3mm_P0.65mm", 76.2, 111.76),
         "R1": ("R", "100", "Resistor_SMD:R_0603_1608Metric", 127.0, 35.56),
@@ -295,22 +299,28 @@ def _components() -> dict[str, tuple[str, str, str, float, float]]:
 
 COMPONENTS: dict[str, tuple[str, str, str, float, float]] = {}
 
-# 画导线版专用布局（重新排列元件，让走线更清晰）：
-#   J1 最左 → U1 中左 → Q1 中右（与 U1 同高，OD/OC 水平直连）
-#   R1/C1/C2 右侧竖直链式（B+→VDD→B- 电源路径）
+# 画导线版专用布局（紧凑信号流向优化）：
+#   布局策略：
+#     - 4 个端子焊盘分散在左侧（B+/P+ 在上，B-/P- 在下）
+#     - U1/Q1 紧密排列在中间
+#     - 被动元件按功能分组，紧凑排列在右侧
+#     - 最小化长距离走线
 WIRED_POSITIONS: dict[str, tuple[float, float]] = {
-    "J1": (22.86, 71.12),
-    "U1": (63.5, 78.74),
-    "Q1": (111.76, 78.74),
-    "R1": (152.4, 58.42),
-    "R2": (88.9, 58.42),
-    "R3": (22.86, 139.7),
-    "R4": (48.26, 139.7),
-    "C1": (152.4, 83.82),
-    "C2": (152.4, 109.22),
-    "C3": (35.56, 139.7),
-    "TP_TH": (10.16, 139.7),
-    "TP_ID": (60.96, 139.7),
+    "J_B+": (50.0, 50.0),    # B+ 焊盘（左上）
+    "J_P+": (50.0, 60.0),    # P+ 焊盘（B+ 下方）
+    "J_B-": (50.0, 100.0),   # B- 焊盘（左下）
+    "J_P-": (50.0, 110.0),   # P- 焊盘（B- 下方）
+    "U1": (100.0, 75.0),     # 保护 IC（中间偏上）
+    "Q1": (100.0, 100.0),    # MOSFET（U1 正下方，引脚对齐）
+    "R1": (127.0, 35.0),     # B+ 限流电阻（右上）
+    "R2": (120.0, 50.0),     # TH 分压电阻（U1/Q1 之间右侧）
+    "C1": (170.0, 60.0),     # VDD 滤波电容（右侧）
+    "C2": (170.0, 95.0),     # VDD 大电容（C1 下方）
+    "C3": (30.0, 85.0),      # B- 滤波电容（左侧）
+    "R3": (30.0, 115.0),     # B- 下拉电阻（C3 下方）
+    "R4": (30.0, 135.0),     # ID 上拉电阻（R3 下方）
+    "TP_TH": (15.0, 115.0),  # TH 测试点（R3 左侧）
+    "TP_ID": (15.0, 135.0),  # ID 测试点（R4 左侧）
 }
 
 # 引脚角度 ->  outward 单位向量（原理图坐标，y 向下）
@@ -379,16 +389,19 @@ def _net_labels() -> str:
 
 
 def _net_wires(positions: dict[str, tuple[float, float]] | None = None) -> str:
-    """为每个网络生成可见导线连接（L 型曼哈顿布线）。
+    """为每个网络生成可见导线连接（所有走线严格连接引脚端点，不穿过元件本体）。
 
-    对同一网络的所有引脚，按顺序两两用“水平+垂直”折线连接，
-    并在每个引脚端点加短引出线。
-    不同网络导线交叉处加“跳线弧”（bridge/hop），同网络连接点加 junction 圆点。
-    positions 用于覆盖默认元件布局（画导线版使用优化布局）。
+    布局策略：
+    - U1/Q1 垂直对齐在中间（x=100），引脚面对面
+    - B+ 水平总线在顶部 (y=25)
+    - VDD/B- 垂直总线在右侧 (x=185)，C1/C2 水平连线不穿越本体
+    - P- 水平总线在底部 (y=125)
+    - OD/OC 用折线绕过 U1/Q1 本体
+    - MID 用左侧垂直总线 (x=85) 连接 U1.CS 和 Q1.D 引脚
+    positions 用于覆盖默认元件布局。
     """
     import math
     L: list[str] = []
-    # 收集所有线段: (x1, y1, x2, y2, net_name)
     segments: list[tuple[float, float, float, float, str]] = []
 
     def add_seg(x1, y1, x2, y2, net):
@@ -406,12 +419,10 @@ def _net_wires(positions: dict[str, tuple[float, float]] | None = None) -> str:
         L.append(f"    (uuid {uid()}))")
 
     def emit_hop(cx, cy, horizontal=True):
-        """在 (cx,cy) 处画一个小弧形跳线（表示导线跨过不连接）。
-        用 3 段折线近似半圆，半径 0.76mm。"""
         r = 0.76
         pts = []
-        for i in range(5):  # 5点近似半圆
-            angle = math.pi * i / 4  # 0 ~ pi
+        for i in range(5):
+            angle = math.pi * i / 4
             if horizontal:
                 px = cx - r * math.cos(angle)
                 py = cy - r * math.sin(angle)
@@ -426,31 +437,257 @@ def _net_wires(positions: dict[str, tuple[float, float]] | None = None) -> str:
         L.append("    (stroke (width 0) (type default))")
         L.append(f"    (uuid {uid()}))")
 
+    def pin_ep(ref, pin):
+        """获取引脚端点坐标"""
+        ex, ey, angle = _pin_endpoint(ref, pin, positions)
+        ox, oy = _OUTWARD[angle]
+        stub_x, stub_y = ex + ox * 2.54, ey + oy * 2.54
+        return ex, ey, stub_x, stub_y, angle
+
     # no_connect 标记
     for (ref, pin) in NO_CONNECT_PINS:
         ex, ey, _ = _pin_endpoint(ref, pin, positions)
         L.append(f"  (no_connect (at {ex} {ey}) (uuid {uid()}))")
 
-    # ── 第 1 遍：收集所有线段 ──
-    net_endpoints: dict[str, list[tuple[float, float]]] = {}
-    for net, conns in NETS.items():
-        endpoints = []
-        for (ref, pin) in conns:
-            ex, ey, angle = _pin_endpoint(ref, pin, positions)
-            ox, oy = _OUTWARD[angle]
-            stub_x, stub_y = ex + ox * 2.54, ey + oy * 2.54
-            add_seg(ex, ey, stub_x, stub_y, net)
-            endpoints.append((stub_x, stub_y))
-        for i in range(len(endpoints) - 1):
-            x1, y1 = endpoints[i]
-            x2, y2 = endpoints[i + 1]
-            # L 型：先水平后垂直
-            add_seg(x1, y1, x2, y1, net)
-            add_seg(x2, y1, x2, y2, net)
-        net_endpoints[net] = endpoints
+    # ── 为每个网络生成显式布线路径 ──
+    # 所有走线严格连接引脚端点，不穿过任何元件本体。
 
-    # ── 第 2 遍：找不同网络导线的交叉点 ──
-    crossings: list[tuple[float, float, bool]] = []  # (x, y, hop_is_horizontal)
+    # === B+ 网络：J_B+.1, J_P+.1, R1.1 ===
+    bplus_bus_y = 25.0  # B+ 水平总线（所有元件上方）
+
+    for ref, pin in [("J_B+", "1"), ("J_P+", "1")]:
+        ex, ey, sx, sy, angle = pin_ep(ref, pin)
+        add_seg(ex, ey, sx, sy, "B+")       # stub 从引脚端点
+        add_seg(sx, sy, sx, bplus_bus_y, "B+")  # 垂直到 B+ 总线
+        emit_junction(sx, bplus_bus_y)
+
+    # B+ 水平总线
+    r1_1_ex, r1_1_ey, r1_1_sx, r1_1_sy, _ = pin_ep("R1", "1")
+    j_pins_x = [pin_ep(ref, p)[2] for ref, p in [("J_B+", "1"), ("J_P+", "1")]]
+    add_seg(min(j_pins_x), bplus_bus_y, r1_1_sx, bplus_bus_y, "B+")
+    # R1.1 垂直 stub 从总线到引脚
+    add_seg(r1_1_sx, bplus_bus_y, r1_1_sx, r1_1_sy, "B+")
+    emit_junction(r1_1_sx, bplus_bus_y)
+
+    # === VDD 网络：R1.2, U1.5, C1.1, C2.1 ===
+    vdd_bus_x = 185.0  # VDD 垂直总线（C1/C2 右侧，不穿过元件）
+
+    # R1.2 → 向右 → VDD 总线
+    r1_2_ex, r1_2_ey, r1_2_sx, r1_2_sy, _ = pin_ep("R1", "2")
+    add_seg(r1_2_ex, r1_2_ey, r1_2_sx, r1_2_sy, "VDD")
+    add_seg(r1_2_sx, r1_2_sy, vdd_bus_x, r1_2_sy, "VDD")
+    emit_junction(vdd_bus_x, r1_2_sy)
+
+    # U1.5 → 向右 → VDD 总线
+    u1_5_ex, u1_5_ey, u1_5_sx, u1_5_sy, _ = pin_ep("U1", "5")
+    add_seg(u1_5_ex, u1_5_ey, u1_5_sx, u1_5_sy, "VDD")
+    add_seg(u1_5_sx, u1_5_sy, vdd_bus_x, u1_5_sy, "VDD")
+    emit_junction(vdd_bus_x, u1_5_sy)
+
+    # C1.1/C2.1 → 向右 → VDD 总线
+    for ref, pin in [("C1", "1"), ("C2", "1")]:
+        ex, ey, sx, sy, angle = pin_ep(ref, pin)
+        add_seg(ex, ey, sx, sy, "VDD")
+        add_seg(sx, sy, vdd_bus_x, sy, "VDD")
+        emit_junction(vdd_bus_x, sy)
+
+    # VDD 垂直总线
+    vdd_ys = [r1_2_sy, u1_5_sy]
+    for ref, pin in [("C1", "1"), ("C2", "1")]:
+        _, _, _, sy, _ = pin_ep(ref, pin)
+        vdd_ys.append(sy)
+    add_seg(vdd_bus_x, min(vdd_ys), vdd_bus_x, max(vdd_ys), "VDD")
+
+    # === B- 网络：U1.6, Q1.1, C1.2, C2.2, R3.2, R4.2, C3.2 ===
+    bminus_bus_x = 185.0  # B- 垂直总线（C1/C2 右侧）
+
+    # U1.6 → 向右 → B- 总线
+    u1_6_ex, u1_6_ey, u1_6_sx, u1_6_sy, _ = pin_ep("U1", "6")
+    add_seg(u1_6_ex, u1_6_ey, u1_6_sx, u1_6_sy, "B-")
+    add_seg(u1_6_sx, u1_6_sy, bminus_bus_x, u1_6_sy, "B-")
+    emit_junction(bminus_bus_x, u1_6_sy)
+
+    # Q1.1 → 向右 → B- 总线
+    q1_1_ex, q1_1_ey, q1_1_sx, q1_1_sy, _ = pin_ep("Q1", "1")
+    add_seg(q1_1_ex, q1_1_ey, q1_1_sx, q1_1_sy, "B-")
+    add_seg(q1_1_sx, q1_1_sy, bminus_bus_x, q1_1_sy, "B-")
+    emit_junction(bminus_bus_x, q1_1_sy)
+
+    # C1.2/C2.2 → 向下/上 → B- 总线
+    for ref, pin in [("C1", "2"), ("C2", "2")]:
+        ex, ey, sx, sy, angle = pin_ep(ref, pin)
+        add_seg(ex, ey, sx, sy, "B-")
+        add_seg(sx, sy, bminus_bus_x, sy, "B-")
+        emit_junction(bminus_bus_x, sy)
+
+    # C3.2 → 向右 → B- 总线
+    c3_2_ex, c3_2_ey, c3_2_sx, c3_2_sy, _ = pin_ep("C3", "2")
+    add_seg(c3_2_ex, c3_2_ey, c3_2_sx, c3_2_sy, "B-")
+    add_seg(c3_2_sx, c3_2_sy, bminus_bus_x, c3_2_sy, "B-")
+    emit_junction(bminus_bus_x, c3_2_sy)
+
+    # R3.2/R4.2 → 向右 → B- 总线
+    for ref, pin in [("R3", "2"), ("R4", "2")]:
+        ex, ey, sx, sy, angle = pin_ep(ref, pin)
+        add_seg(ex, ey, sx, sy, "B-")
+        add_seg(sx, sy, bminus_bus_x, sy, "B-")
+        emit_junction(bminus_bus_x, sy)
+
+    # B- 垂直总线
+    bminus_ys = [u1_6_sy, q1_1_sy, c3_2_sy]
+    for ref, pin in [("C1", "2"), ("C2", "2"), ("R3", "2"), ("R4", "2")]:
+        _, _, _, sy, _ = pin_ep(ref, pin)
+        bminus_ys.append(sy)
+    add_seg(bminus_bus_x, min(bminus_ys), bminus_bus_x, max(bminus_ys), "B-")
+
+    # === MID 网络: U1.2, Q1.5-8, R2.1 ===
+    # 使用左侧垂直总线 x=85（在 U1/Q1 本体左侧），避免穿越本体
+    mid_bus_x = 85.0
+
+    # U1.2(CS) → 向左 → 向下 → 向右到 R2.1（绕过 MID 总线上方）
+    u1_2_ex, u1_2_ey, u1_2_sx, u1_2_sy, _ = pin_ep("U1", "2")
+    r2_1_ex, r2_1_ey, r2_1_sx, r2_1_sy, _ = pin_ep("R2", "1")
+    add_seg(u1_2_ex, u1_2_ey, u1_2_sx, u1_2_sy, "MID")
+    # 向左到 MID 总线左侧
+    add_seg(u1_2_sx, u1_2_sy, 90.0, u1_2_sy, "MID")
+    # 向上到 R2 高度上方
+    add_seg(90.0, u1_2_sy, 90.0, 48.0, "MID")
+    # 向右到 R2.1
+    add_seg(90.0, 48.0, r2_1_sx, 48.0, "MID")
+    add_seg(r2_1_sx, 48.0, r2_1_sx, r2_1_sy, "MID")
+    add_seg(r2_1_ex, r2_1_ey, r2_1_sx, r2_1_sy, "MID")
+    emit_junction(90.0, 48.0)
+
+    # MID 垂直总线 x=85: 从 y=48 到 Q1 最低引脚
+    q1_pins_y = [pin_ep("Q1", p)[3] for p in ["5", "6", "7", "8"]]
+    mid_bus_y_top = 48.0
+    mid_bus_y_bot = max(q1_pins_y)
+    add_seg(mid_bus_x, mid_bus_y_top, mid_bus_x, mid_bus_y_bot, "MID")
+
+    # Q1.5/Q1.6（左侧引脚）→ 向左到 MID 总线
+    for pin in ["5", "6"]:
+        ex, ey, sx, sy, angle = pin_ep("Q1", pin)
+        add_seg(ex, ey, sx, sy, "MID")
+        add_seg(sx, sy, mid_bus_x, sy, "MID")
+        emit_junction(mid_bus_x, sy)
+
+    # Q1.7/Q1.8（右侧引脚）→ 向下 → 向左 → 到 MID 总线
+    r2_2_ex, r2_2_ey, r2_2_sx, r2_2_sy, _ = pin_ep("R2", "2")
+    route_y = max(q1_pins_y) + 2.0  # Q1 本体下方
+    for pin in ["7", "8"]:
+        ex, ey, sx, sy, angle = pin_ep("Q1", pin)
+        add_seg(ex, ey, sx, sy, "MID")
+        add_seg(sx, sy, sx, route_y, "MID")
+        add_seg(sx, route_y, mid_bus_x, route_y, "MID")
+        emit_junction(mid_bus_x, route_y)
+
+    # MID 总线与 R2.1 的连接点
+    emit_junction(mid_bus_x, 48.0)
+
+    # === OD 网络: U1.1 → Q1.2 (折线绕过本体) ===
+    u1_od = pin_ep("U1", "1")
+    q1_g1 = pin_ep("Q1", "2")
+    add_seg(u1_od[0], u1_od[1], u1_od[2], u1_od[3], "OD")
+    # 从 U1.OD stub 向上到 U1 上方
+    od_route_y = u1_od[3] - 5.0  # U1 本体上方
+    add_seg(u1_od[2], u1_od[3], u1_od[2], od_route_y, "OD")
+    # 水平到 Q1.G2 x 坐标
+    add_seg(u1_od[2], od_route_y, q1_g1[2], od_route_y, "OD")
+    # 向下到 Q1.G2
+    add_seg(q1_g1[2], od_route_y, q1_g1[2], q1_g1[3], "OD")
+    add_seg(q1_g1[0], q1_g1[1], q1_g1[2], q1_g1[3], "OD")
+
+    # === OC 网络: U1.3 → Q1.4 (折线绕过本体) ===
+    u1_oc = pin_ep("U1", "3")
+    q1_g2 = pin_ep("Q1", "4")
+    add_seg(u1_oc[0], u1_oc[1], u1_oc[2], u1_oc[3], "OC")
+    # 从 U1.OC stub 向左
+    oc_left_x = u1_oc[2] - 2.54
+    add_seg(u1_oc[2], u1_oc[3], oc_left_x, u1_oc[3], "OC")
+    # 向下到 Q1 上方
+    oc_route_y = u1_oc[3] + 5.0
+    add_seg(oc_left_x, u1_oc[3], oc_left_x, oc_route_y, "OC")
+    # 水平到 Q1.G4
+    add_seg(oc_left_x, oc_route_y, q1_g2[2], oc_route_y, "OC")
+    # 向下到 Q1.G4
+    add_seg(q1_g2[2], oc_route_y, q1_g2[2], q1_g2[3], "OC")
+    add_seg(q1_g2[0], q1_g2[1], q1_g2[2], q1_g2[3], "OC")
+
+    # === P- 网络：Q1.3, J_B-.1, J_P-.1 ===
+    pminus_bus_y = 125.0  # P- 水平总线（J_B-/J_P- 下方）
+
+    # Q1.3 → 向下 → P- 总线
+    q1_3_ex, q1_3_ey, q1_3_sx, q1_3_sy, _ = pin_ep("Q1", "3")
+    add_seg(q1_3_ex, q1_3_ey, q1_3_sx, q1_3_sy, "P-")
+    add_seg(q1_3_sx, q1_3_sy, q1_3_sx, pminus_bus_y, "P-")
+    emit_junction(q1_3_sx, pminus_bus_y)
+
+    # J_B-/J_P- → 向下 → P- 总线
+    for ref, pin in [("J_B-", "1"), ("J_P-", "1")]:
+        ex, ey, sx, sy, angle = pin_ep(ref, pin)
+        add_seg(ex, ey, sx, sy, "P-")
+        add_seg(sx, sy, sx, pminus_bus_y, "P-")
+        emit_junction(sx, pminus_bus_y)
+
+    # P- 水平总线
+    j_p_pins_x = [pin_ep(ref, p)[2] for ref, p in [("J_B-", "1"), ("J_P-", "1")]]
+    add_seg(min(j_p_pins_x), pminus_bus_y, q1_3_sx, pminus_bus_y, "P-")
+
+    # === TH 网络: R2.2, R3.1, C3.1, TP_TH.1 ===
+    th_bus_y = 135.0
+
+    # R2.2 → 向下 → TH 总线
+    r2_2_ex2, r2_2_ey2, r2_2_sx2, r2_2_sy2, _ = pin_ep("R2", "2")
+    add_seg(r2_2_sx2, r2_2_sy2, r2_2_sx2, th_bus_y, "TH")
+    emit_junction(r2_2_sx2, th_bus_y)
+
+    # R3.1 → TH 总线
+    r3_1_ex, r3_1_ey, r3_1_sx, r3_1_sy, _ = pin_ep("R3", "1")
+    add_seg(r3_1_ex, r3_1_ey, r3_1_sx, r3_1_sy, "TH")
+    add_seg(r3_1_sx, r3_1_sy, r3_1_sx, th_bus_y, "TH")
+    emit_junction(r3_1_sx, th_bus_y)
+
+    # C3.1 → TH 总线
+    c3_1_ex, c3_1_ey, c3_1_sx, c3_1_sy, _ = pin_ep("C3", "1")
+    add_seg(c3_1_ex, c3_1_ey, c3_1_sx, c3_1_sy, "TH")
+    add_seg(c3_1_sx, c3_1_sy, c3_1_sx, th_bus_y, "TH")
+    emit_junction(c3_1_sx, th_bus_y)
+
+    # TP_TH.1 → TH 总线
+    tp_th_ex, tp_th_ey, tp_th_sx, tp_th_sy, _ = pin_ep("TP_TH", "1")
+    add_seg(tp_th_ex, tp_th_ey, tp_th_sx, tp_th_sy, "TH")
+    add_seg(tp_th_sx, tp_th_sy, tp_th_sx, th_bus_y, "TH")
+    emit_junction(tp_th_sx, th_bus_y)
+
+    # TH 水平总线
+    th_xs = [r2_2_sx2, r3_1_sx, c3_1_sx, tp_th_sx]
+    add_seg(min(th_xs), th_bus_y, max(th_xs), th_bus_y, "TH")
+
+    # === ID 网络: R4.1, TP_ID.1 ===
+    id_bus_y = 140.0
+
+    # R4.1 → ID 总线
+    r4_1_ex, r4_1_ey, r4_1_sx, r4_1_sy, _ = pin_ep("R4", "1")
+    add_seg(r4_1_ex, r4_1_ey, r4_1_sx, r4_1_sy, "ID")
+    add_seg(r4_1_sx, r4_1_sy, r4_1_sx, id_bus_y, "ID")
+    emit_junction(r4_1_sx, id_bus_y)
+
+    # TP_ID.1 → ID 总线
+    tp_id_ex, tp_id_ey, tp_id_sx, tp_id_sy, _ = pin_ep("TP_ID", "1")
+    add_seg(tp_id_ex, tp_id_ey, tp_id_sx, tp_id_sy, "ID")
+    add_seg(tp_id_sx, tp_id_sy, tp_id_sx, id_bus_y, "ID")
+    emit_junction(tp_id_sx, id_bus_y)
+
+    # ID 水平总线
+    id_xs = [r4_1_sx, tp_id_sx]
+    add_seg(min(id_xs), id_bus_y, max(id_xs), id_bus_y, "ID")
+
+    # ── 输出所有导线 ──
+    for (x1, y1, x2, y2, net) in segments:
+        emit_wire(x1, y1, x2, y2)
+
+    # ── 交叉检测 + 跳线弧 ──
+    crossings = []
     for i, (ax1, ay1, ax2, ay2, net_a) in enumerate(segments):
         a_horiz = abs(ay1 - ay2) < 0.001
         for j, (bx1, by1, bx2, by2, net_b) in enumerate(segments):
@@ -458,8 +695,7 @@ def _net_wires(positions: dict[str, tuple[float, float]] | None = None) -> str:
                 continue
             b_horiz = abs(by1 - by2) < 0.001
             if a_horiz == b_horiz:
-                continue  # 平行线段不交叉
-            # 一横一竖，求交点
+                continue
             if a_horiz:
                 hx1, hx2 = min(ax1, ax2), max(ax1, ax2)
                 vy1, vy2 = min(by1, by2), max(by1, by2)
@@ -472,32 +708,12 @@ def _net_wires(positions: dict[str, tuple[float, float]] | None = None) -> str:
                 cx, cy = ax1, by1
                 if hx1 < cx < hx2 and vy1 < cy < vy2:
                     crossings.append((cx, cy, False))
-
-    # 去重（同一位置可能有多个交叉）
     seen = set()
-    unique_crossings = []
     for cx, cy, h in crossings:
         key = (round(cx, 2), round(cy, 2))
         if key not in seen:
             seen.add(key)
-            unique_crossings.append((cx, cy, h))
-
-    # ── 第 3 遍：输出所有导线（不切断，保持电气连通） ──
-    for (x1, y1, x2, y2, net) in segments:
-        emit_wire(x1, y1, x2, y2)
-
-    # ── 第 4 遍：画跳线弧 + 同网络连接点 ──
-    for cx, cy, h in unique_crossings:
-        emit_hop(cx, cy, horizontal=h)
-
-    # 同网络链式连接的拐点加 junction（表示这些点是连通的）
-    for net, eps in net_endpoints.items():
-        for i in range(len(eps) - 1):
-            x1, y1 = eps[i]
-            x2, y2 = eps[i + 1]
-            # L 型拐点 (x2, y1) 是同网络导线的连接点
-            if abs(x1 - x2) > 0.01 and abs(y1 - y2) > 0.01:
-                emit_junction(x2, y1)
+            emit_hop(cx, cy, horizontal=h)
 
     return "\n".join(L)
 
@@ -562,8 +778,12 @@ def schematic_wired() -> str:
 # ── PCB 生成（需 KiCad 自带 python 的 pcbnew）────────────────────
 # 元件布局（mm）与封装
 FP_LAYOUT: dict[str, tuple[str, str, float, float, float]] = {
-    # ref -> (pretty库, 封装名, x_mm, y_mm, 旋转deg)
-    "J1": ("Connector_PinHeader_2.54mm.pretty", "PinHeader_1x04_P2.54mm_Vertical", 4.0, 10.0, 0),
+    # ref -> (pretty 库，封装名，x_mm, y_mm, 旋转 deg)
+    # 4 个独立焊盘（B+/P+ 在上，B-/P- 在下）
+    "J_B+": ("Connector_PinHeader_2.54mm.pretty", "PinHeader_1x01_P2.54mm_Vertical", 4.0, 5.0, 0),
+    "J_P+": ("Connector_PinHeader_2.54mm.pretty", "PinHeader_1x01_P2.54mm_Vertical", 4.0, 7.5, 0),
+    "J_B-": ("Connector_PinHeader_2.54mm.pretty", "PinHeader_1x01_P2.54mm_Vertical", 4.0, 12.5, 0),
+    "J_P-": ("Connector_PinHeader_2.54mm.pretty", "PinHeader_1x01_P2.54mm_Vertical", 4.0, 15.0, 0),
     "U1": ("Package_TO_SOT_SMD.pretty", "SOT-23-6", 16.0, 6.5, 0),
     "Q1": ("Package_SO.pretty", "TSSOP-8_4.4x3mm_P0.65mm", 16.0, 14.0, 0),
     "R1": ("Resistor_SMD.pretty", "R_0603_1608Metric", 28.0, 5.0, 0),
@@ -775,21 +995,27 @@ if __name__ == "__main__":
     print("[ok] template.json")
 
     # adapt.py 几何适配器（通用，复制自 DW01-G 模板）
+    # ★ 始终覆盖以确保最新版本
     adapt_src = ROOT / "data" / "ic_templates" / "DW01-G" / "adapt.py"
-    if adapt_src.exists() and not (out / "adapt.py").exists():
+    if adapt_src.exists() and str(adapt_src) != str(out / "adapt.py"):
         import shutil
         shutil.copy2(adapt_src, out / "adapt.py")
-        print("[ok] adapt.py (copied from DW01-G)")
-    elif (out / "adapt.py").exists():
-        print("[ok] adapt.py (already exists)")
+        print("[ok] adapt.py (updated from DW01-G)")
+    elif not (out / "adapt.py").exists():
+        print("[warn] adapt.py source not found")
+    else:
+        print("[ok] adapt.py (already up-to-date)")
 
     # adapt_common.py 公共模块（端子 side 分配、zone 层选择等）
+    # ★ 始终覆盖以确保最新版本（含 compute_pad_rotation / create_custom_pad 等）
     common_src = ROOT / "data" / "ic_templates" / "adapt_common.py"
-    if common_src.exists() and not (out / "adapt_common.py").exists():
+    if common_src.exists() and str(common_src) != str(out / "adapt_common.py"):
         import shutil
         shutil.copy2(common_src, out / "adapt_common.py")
-        print("[ok] adapt_common.py (copied)")
-    elif (out / "adapt_common.py").exists():
-        print("[ok] adapt_common.py (already exists)")
+        print("[ok] adapt_common.py (updated)")
+    elif not (out / "adapt_common.py").exists():
+        print("[warn] adapt_common.py source not found")
+    else:
+        print("[ok] adapt_common.py (already up-to-date)")
 
     print(f"\n[done] template output: {out}")

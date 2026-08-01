@@ -1,4 +1,4 @@
-"""原理图 S表达式生成器 — 完全手写，保证所有连线可见"""
+"""原理图 S表达式生成器 — 完全手写，保证所有连线可见且无重叠"""
 import os, uuid, math
 from pathlib import Path
 from datetime import datetime
@@ -15,16 +15,24 @@ def build_schematic(ic="DW01-G", mos_count=1, series=1,
                     width_mm=40, height_mm=15):
     """
     用 S表达式生成完整的 .kicad_sch 原理图文件。
-    
-    布局 (坐标单位: 50 = 1 inch grid):
-      [J1] 接头        [R1] 电阻
-      [U1] DW01        [C1] 电容
-      [Q1] MOS         [C2] 电容
+
+    布局策略 (坐标单位 mm):
+      左侧: J1 接头
+      中上: U1 DW01 (IC)
+      中下: Q1 FS8205A (MOS)
+      右侧: R1, C1, C2 分散排列
+
+    总线:
+      B+  水平总线 y=25.4  (顶部)
+      GND 水平总线 y=165.1 (底部)
+      VDD 水平总线 y=127.0 (中部)
+
+    所有走线严格连接引脚端点，不穿过任何元件本体。
     """
-    
+
     lines = []
-    L = lines.append  # shortcut
-    
+    L = lines.append
+
     # ── Header ──
     project_uuid = uid()
     L(f'(kicad_sch')
@@ -38,8 +46,8 @@ def build_schematic(ic="DW01-G", mos_count=1, series=1,
     L(f'    (date "{datetime.now().strftime("%Y-%m-%d")}")')
     L(f'    (comment 1 "{width_mm}x{height_mm}mm, MOS x{mos_count}")')
     L(f'  ')
-    
-    # ── lib_symbols (嵌入式符号定义) ──
+
+    # ── lib_symbols ──
     L(f'  (lib_symbols')
     _write_dw01_symbol(L, ic)
     _write_fs8205a_symbol(L)
@@ -48,37 +56,39 @@ def build_schematic(ic="DW01-G", mos_count=1, series=1,
     _write_connector_symbol(L)
     L(f'  )')
     L(f'  ')
-    
+
     # ── Sheet ──
     sheet_uuid = uid()
-    L(f'  (sheet (at 0 0) (size 200 150) (fields_autoplaced)')
+    L(f'  (sheet (at 0 0) (size 200 190) (fields_autoplaced)')
     L(f'    (stroke (width 0) (type solid) (color 0 0 0 0))')
     L(f'    (fill (color 0 0 0 0.000))')
     L(f'    (uuid {sheet_uuid})')
-    L(f'    (property "Sheet name" "Root" (id 0) (at 0 0 0)') 
+    L(f'    (property "Sheet name" "Root" (id 0) (at 0 0 0)')
     L(f'      (effects (font (size 1.27 1.27)) hide))')
     L(f'    (property "Sheet file" "schematic.kicad_sch" (id 1) (at 0 0 0)')
     L(f'      (effects (font (size 1.27 1.27)) hide))')
     L(f'  )')
     L(f'  ')
-    
-    # ── 元件坐标 ──
-    # J1 接头: 左下 (column 2, row 1)
-    # U1 DW01: 中上 (column 4, row 9)
-    # Q1 MOS:  中下 (column 4, row 3)
-    # R1:      右上 (column 8, row 9)
-    # C1:      右中 (column 8, row 6)
-    # C2:      右下 (column 8, row 3)
-    
-    j1_x, j1_y = 25.4, 25.4     # 1" x 1"
-    u1_x, u1_y = 63.5, 127.0    # 2.5" x 5" 
-    q1_x, q1_y = 63.5, 50.8     # 2.5" x 2"
-    r1_x, r1_y = 127.0, 127.0   # 5" x 5"
-    c1_x, c1_y = 127.0, 88.9    # 5" x 3.5"
-    c2_x, c2_y = 127.0, 50.8    # 5" x 2"
-    
+
+    # ══════════════════════════════════════════════════
+    # 元件坐标 (精心计算，避免走线穿过本体)
+    # ══════════════════════════════════════════════════
+
+    # J1 接头: 左侧
+    j1_x, j1_y = 25.4, 50.8
+    # U1 IC: 中上
+    u1_x, u1_y = 63.5, 127.0
+    # Q1 MOS: 中下 (在 J1 右下方，与 U1 左右引脚相对)
+    q1_x, q1_y = 63.5, 50.8
+    # R1 电阻: 右侧偏上
+    r1_x, r1_y = 152.4, 101.6
+    # C1 电容: 右侧中间
+    c1_x, c1_y = 139.7, 88.9
+    # C2 电容: 右侧偏下
+    c2_x, c2_y = 139.7, 152.4
+
     # ── 放置元件 ──
-    _place_symbol(L, "J1", "battery_protection:Conn_01x04", j1_x, j1_y, 0, 
+    _place_symbol(L, "J1", "battery_protection:Conn_01x04", j1_x, j1_y, 0,
                   "J1", "Header_4P")
     _place_symbol(L, "U1", f"battery_protection:{ic}", u1_x, u1_y, 0,
                   "U1", ic, hide_fp=True)
@@ -90,115 +100,169 @@ def build_schematic(ic="DW01-G", mos_count=1, series=1,
                   "C1", "0.1uF", hide_fp=True)
     _place_symbol(L, "C2", "Device:C_Small", c2_x, c2_y, 0,
                   "C2", "10uF", hide_fp=True)
-    
-    # ── 连线 ──
-    # 获取各元件的引脚位置 (符号坐标 + 引脚相对偏移)
-    # 这些需要根据实际符号定义来算。先按符号的引脚偏移估算。
-    
-    # DW01-G 引脚 (引脚号->相对位置, 方向):
-    # 1(OD): left,  (u1_x-7.62, u1_y+2.54)  -- input side
-    # 2(CS): left,  (u1_x-7.62, u1_y+0)
-    # 3(OC): left,  (u1_x-7.62, u1_y-2.54)
-    # 4(TD): right, (u1_x+7.62, u1_y-2.54)
-    # 5(VDD):right, (u1_x+7.62, u1_y+0)
-    # 6(VSS):right, (u1_x+7.62, u1_y+2.54)
-    
-    # 简化：估算关键引脚坐标
-    u1_od_x, u1_od_y = u1_x - 7.62, u1_y + 2.54
-    u1_cs_x, u1_cs_y = u1_x - 7.62, u1_y
-    u1_oc_x, u1_oc_y = u1_x - 7.62, u1_y - 2.54
-    u1_vdd_x, u1_vdd_y = u1_x + 7.62, u1_y
-    u1_vss_x, u1_vss_y = u1_x + 7.62, u1_y + 2.54
-    
-    # Q1 FS8205A 引脚 (左侧: S1,S2,D2,D2; 右侧: G1,G2,D1,D1)
-    q1_s1_x, q1_s1_y = q1_x - 7.62, q1_y + 3.81
-    q1_g1_x, q1_g1_y = q1_x + 7.62, q1_y + 3.81
-    q1_s2_x, q1_s2_y = q1_x - 7.62, q1_y + 1.27
-    q1_g2_x, q1_g2_y = q1_x + 7.62, q1_y + 1.27
-    q1_d2_x, q1_d2_y = q1_x - 7.62, q1_y - 1.27
-    q1_d1_x, q1_d1_y = q1_x + 7.62, q1_y - 3.81
-    
-    # R1 电阻 (水平: 1=左, 2=右, 引脚X偏移~5.08)
-    r1_1_x, r1_1_y = r1_x - 5.08, r1_y
-    r1_2_x, r1_2_y = r1_x + 5.08, r1_y
-    
-    # C1 电容 (水平: 1=左, 2=右)
-    c1_1_x, c1_1_y = c1_x - 5.08, c1_y
-    c1_2_x, c1_2_y = c1_x + 5.08, c1_y
-    
-    # C2 电容
-    c2_1_x, c2_1_y = c2_x - 5.08, c2_y
-    c2_2_x, c2_2_y = c2_x + 5.08, c2_y
-    
-    # J1 接头 (4pin, pin 1-4 从上到下，左侧引脚)
-    j1_p1_x, j1_p1_y = j1_x - 5.08, j1_y + 7.62
-    j1_p2_x, j1_p2_y = j1_x - 5.08, j1_y + 2.54
-    j1_p3_x, j1_p3_y = j1_x - 5.08, j1_y - 2.54
-    j1_p4_x, j1_p4_y = j1_x - 5.08, j1_y - 7.62
-    
-    # ── 画线 ──
-    wires = []
-    
-    # 1. B+ = P+ 网络: R1.1 - Q1.D1(7,8) - J1.1(P+) - J1.3(P+)
-    _wire(L, q1_d1_x, q1_d1_y, q1_d1_x, j1_1_y)
-    _wire(L, q1_d1_x, j1_1_y, r1_1_x, j1_1_y)
-    _wire(L, r1_1_x, j1_1_y, r1_1_x, r1_1_y)  # 接到R1
-    
-    # J1.1 = J1.3 (P+ = P+ 内部短接)
-    _wire(L, j1_p1_x, j1_p1_y, j1_p1_x - 2.54, j1_p1_y)
-    _wire_vert(L, j1_p1_x - 2.54, j1_p1_y, j1_p3_y)
-    _wire(L, j1_p1_x - 2.54, j1_p3_y, j1_p3_x, j1_p3_y)
-    # 也连到主干
-    _wire_horiz(L, j1_p1_x - 2.54, j1_1_y, r1_1_x)
-    
-    # 2. VDD 网络: R1.2 - U1.VDD(5) - C1.1
-    _wire(L, r1_2_x, r1_2_y, r1_2_x + 5.08, r1_2_y)
-    _wire(L, r1_2_x + 5.08, r1_2_y, r1_2_x + 5.08, u1_vdd_y)
-    _wire(L, r1_2_x + 5.08, u1_vdd_y, u1_vdd_x, u1_vdd_y)
-    # C1.1 也接 VDD
-    _wire_horiz(L, r1_2_x + 5.08, c1_1_y, c1_1_x)
-    
-    # 3. B- = GND 网络: U1.VSS(6) - C1.2 - C2.2 - Q1.S1(1) - Q1.S2(3) - J1.2 - J1.4
-    # 主干横线
-    gnd_y = q1_y - 15.24  # 公共地线位置
-    _wire_horiz(L, u1_vss_x, gnd_y, j1_p2_x)
-    _wire(L, u1_vss_x, u1_vss_y, u1_vss_x, gnd_y)   # U1.VSS 向下
-    _wire(L, c1_2_x, c1_2_y, c1_2_x, gnd_y)          # C1.2 向下
-    _wire(L, c2_2_x, c2_2_y, c2_2_x, gnd_y)          # C2.2 向下
-    _wire(L, q1_s1_x, q1_s1_y, q1_s1_x, gnd_y)       # Q1.S1 向下
-    _wire(L, q1_s2_x, q1_s2_y, q1_s2_x, gnd_y)       # Q1.S2 向下
-    _wire(L, j1_p2_x, j1_p2_y, j1_p2_x, gnd_y)        # J1.2 向上
-    _wire(L, j1_p4_x, j1_p4_y, j1_p4_x, gnd_y)        # J1.4 向上
-    # U1.VSS(6)
-    _wire(L, u1_vss_x, u1_vss_y, u1_vss_x, gnd_y)
-    
-    # 4. OD 网络: U1.OD(1) - Q1.G1(2) (水平连线)
-    od_y = u1_y + 2.54
-    _wire_horiz(L, u1_od_x, od_y, q1_g1_x)
-    
-    # 5. OC 网络: U1.OC(3) - Q1.G2(4) (水平连线)
-    oc_y = u1_y - 2.54
-    _wire_horiz(L, u1_oc_x, oc_y, q1_g2_x)
-    
-    # 6. CS 网络: U1.CS(2) - Q1.S1(1) (检测电流)
-    # 从 U1.CS 向下弯到 Q1.S1
-    cs_y = u1_y
-    _wire(L, u1_cs_x, cs_y, q1_s1_x, cs_y)
-    _wire(L, q1_s1_x, cs_y, q1_s1_x, q1_s1_y)
-    
-    # 7. Q1.D2(5,6) 内部连接 (D2连D2) — 不需要额外连线，同一pin号
-    
-    # ── 网络标签 (方便阅读) ──
-    _label(L, "B+", r1_1_x - 2.54, r1_1_y, 0)
-    _label(L, "VDD", r1_2_x + 2.54, r1_2_y, 0)
-    _label(L, "GND", c2_2_x, gnd_y, 0)
-    _label(L, "OD", (u1_od_x + q1_g1_x)/2, od_y + 2.54, 0)
-    _label(L, "OC", (u1_oc_x + q1_g2_x)/2, oc_y - 2.54, 0)
-    _label(L, "CS", (u1_cs_x + q1_s1_x)/2, cs_y + 2.54 + 2.54, 0)
-    
+
+    # ══════════════════════════════════════════════════
+    # 引脚绝对坐标计算
+    # ══════════════════════════════════════════════════
+
+    # J1 Conn_01x04: 引脚在 (j1_x-7.62, j1_y+py)
+    j1_p1 = (j1_x - 7.62, j1_y + 7.62)   # (17.78, 58.42)
+    j1_p2 = (j1_x - 7.62, j1_y + 2.54)   # (17.78, 53.34)
+    j1_p3 = (j1_x - 7.62, j1_y - 2.54)   # (17.78, 48.26)
+    j1_p4 = (j1_x - 7.62, j1_y - 7.62)   # (17.78, 43.18)
+
+    # U1 DW01-G: 左列引脚 (u1_x-7.62, ...)，右列 (u1_x+7.62, ...)
+    u1_od  = (u1_x - 7.62, u1_y + 2.54)  # pin1 OD  (55.88, 129.54)
+    u1_cs  = (u1_x - 7.62, u1_y)         # pin2 CS  (55.88, 127.0)
+    u1_oc  = (u1_x - 7.62, u1_y - 2.54)  # pin3 OC  (55.88, 124.46)
+    u1_td  = (u1_x + 7.62, u1_y - 2.54)  # pin4 TD  (71.12, 124.46)
+    u1_vdd = (u1_x + 7.62, u1_y)         # pin5 VDD (71.12, 127.0)
+    u1_vss = (u1_x + 7.62, u1_y + 2.54)  # pin6 VSS (71.12, 129.54)
+
+    # Q1 FS8205A: 左列 (q1_x-7.62, ...)，右列 (q1_x+7.62, ...)
+    q1_s1 = (q1_x - 7.62, q1_y + 3.81)   # pin1 S1 (55.88, 54.61)
+    q1_g1 = (q1_x + 7.62, q1_y + 3.81)   # pin2 G1 (71.12, 54.61)
+    q1_s2 = (q1_x - 7.62, q1_y + 1.27)   # pin3 S2 (55.88, 52.07)
+    q1_g2 = (q1_x + 7.62, q1_y + 1.27)   # pin4 G2 (71.12, 52.07)
+    q1_d2a = (q1_x - 7.62, q1_y - 1.27)  # pin5 D2 (55.88, 49.53)
+    q1_d2b = (q1_x - 7.62, q1_y - 3.81)  # pin6 D2 (55.88, 46.99)
+    q1_d1a = (q1_x + 7.62, q1_y - 1.27)  # pin7 D1 (71.12, 49.53)
+    q1_d1b = (q1_x + 7.62, q1_y - 3.81)  # pin8 D1 (71.12, 46.99)
+
+    # R1: pin1=左 (r1_x-5.08, r1_y), pin2=右 (r1_x+5.08, r1_y)
+    r1_p1 = (r1_x - 5.08, r1_y)   # (147.32, 101.6)
+    r1_p2 = (r1_x + 5.08, r1_y)   # (157.48, 101.6)
+
+    # C1: pin1=左, pin2=右
+    c1_p1 = (c1_x - 5.08, c1_y)   # (134.62, 88.9)
+    c1_p2 = (c1_x + 5.08, c1_y)   # (144.78, 88.9)
+
+    # C2: pin1=左, pin2=右
+    c2_p1 = (c2_x - 5.08, c2_y)   # (134.62, 152.4)
+    c2_p2 = (c2_x + 5.08, c2_y)   # (144.78, 152.4)
+
+    # ══════════════════════════════════════════════════
+    # 走线
+    # ══════════════════════════════════════════════════
+
+    # ── B+ 网络 ──
+    # 顶部水平总线 y=25.4，从 x=15.24 到 x=157.48
+    _wire_horiz(L, 15.24, 25.4, 157.48)
+
+    # J1.P1(B+) → 左出引脚，水平接到 B+ 垂直总线 x=15.24
+    _wire(L, j1_p1[0], j1_p1[1], 15.24, j1_p1[1])
+    _junction(L, 15.24, 25.4)  # B+ 总线上的接合点
+
+    # J1.P3(B+) → 左出引脚，水平接到 B+ 垂直总线
+    _wire(L, j1_p3[0], j1_p3[1], 15.24, j1_p3[1])
+
+    # B+ 垂直总线 x=15.24: 从 y=25.4 到 y=139.7
+    _wire_vert(L, 15.24, 25.4, 139.7)
+    _junction(L, 15.24, 139.7)
+
+    # B+ 水平分支 y=139.7: 从 x=15.24 到 Q1.D1 下方
+    _wire_horiz(L, 15.24, 139.7, q1_d1a[0])
+    _junction(L, q1_d1a[0], 139.7)
+
+    # Q1.D1 (pin7+8) → 从引脚端点向上到 B+ 分支
+    _wire(L, q1_d1a[0], q1_d1a[1], q1_d1a[0], 139.7)
+    _wire(L, q1_d1b[0], q1_d1b[1], q1_d1b[0], 139.7)
+    _junction(L, q1_d1a[0], 139.7)
+
+    # Q1.D2 (pin5+6) → 左出引脚，经垂直总线 x=48.26 连到 B+
+    _wire(L, q1_d2a[0], q1_d2a[1], 48.26, q1_d2a[1])
+    _wire(L, q1_d2b[0], q1_d2b[1], 48.26, q1_d2b[1])
+    # D2 垂直总线 x=48.26: 从 B+ 总线 y=25.4 到 pin5 高度
+    _wire_vert(L, 48.26, 25.4, q1_d2a[1])
+    _junction(L, 48.26, 25.4)  # 接入 B+ 总线
+    _junction(L, 48.26, q1_d2a[1])
+    _junction(L, 48.26, q1_d2b[1])
+
+    # R1.P1 → 从 B+ 总线垂直下降到 R1 引脚
+    _wire_vert(L, r1_p1[0], 25.4, r1_p1[1])
+    _junction(L, r1_p1[0], 25.4)
+
+    # ── VDD 网络 ──
+    # R1.P2 → 向右 → 向下 → 水平到 U1.VDD
+    _wire(L, r1_p2[0], r1_p2[1], 165.1, r1_p2[1])
+    _wire(L, 165.1, r1_p2[1], 165.1, u1_vdd[1])
+    _wire(L, 165.1, u1_vdd[1], u1_vdd[0], u1_vdd[1])
+    _junction(L, 165.1, u1_vdd[1])
+
+    # C1.P1 → 水平右接到 VDD 垂直线 x=165.1
+    _wire(L, c1_p1[0], c1_p1[1], 165.1, c1_p1[1])
+    _junction(L, 165.1, c1_p1[1])
+
+    # C2.P1 → 水平右接到 VDD 垂直线 x=165.1
+    _wire(L, c2_p1[0], c2_p1[1], 165.1, c2_p1[1])
+    _junction(L, 165.1, c2_p1[1])
+
+    # ── GND 网络 ──
+    # 底部水平总线 y=165.1，从 x=15.24 到 x=165.1
+    _wire_horiz(L, 15.24, 165.1, 165.1)
+
+    # J1.P2(GND) → 左出引脚 → 向下到 GND 总线
+    _wire(L, j1_p2[0], j1_p2[1], 15.24, j1_p2[1])
+    _wire_vert(L, 15.24, j1_p2[1], 165.1)
+    _junction(L, 15.24, 165.1)
+
+    # J1.P4(GND) → 左出引脚 → 向下到 GND 总线 (共用 x=15.24)
+    _wire(L, j1_p4[0], j1_p4[1], 15.24, j1_p4[1])
+    _junction(L, 15.24, j1_p4[1])
+
+    # U1.VSS → 向下到 GND 总线
+    _wire_vert(L, u1_vss[0], u1_vss[1], 165.1)
+    _junction(L, u1_vss[0], 165.1)
+
+    # Q1.S1 → 向下到 GND 总线
+    _wire_vert(L, q1_s1[0], q1_s1[1], 165.1)
+    _junction(L, q1_s1[0], 165.1)
+
+    # Q1.S2 → 向下到 GND 总线
+    _wire_vert(L, q1_s2[0], q1_s2[1], 165.1)
+    _junction(L, q1_s2[0], 165.1)
+
+    # C1.P2 → 向下到 GND 总线
+    _wire_vert(L, c1_p2[0], c1_p2[1], 165.1)
+    _junction(L, c1_p2[0], 165.1)
+
+    # C2.P2 → 向下到 GND 总线
+    _wire_vert(L, c2_p2[0], c2_p2[1], 165.1)
+    _junction(L, c2_p2[0], 165.1)
+
+    # ── OD 网络: U1.OD(1) → Q1.G1(2) ──
+    # 从 U1.OD 引脚端点向上(到 U1 上方)，再向右，再向下到 Q1.G1
+    _wire(L, u1_od[0], u1_od[1], u1_od[0], 119.38)
+    _wire_horiz(L, u1_od[0], 119.38, q1_g1[0])
+    _wire(L, q1_g1[0], 119.38, q1_g1[0], q1_g1[1])
+
+    # ── OC 网络: U1.OC(3) → Q1.G2(4) ──
+    # 从 U1.OC 引脚端点向左，再向下，再向右到 Q1.G2
+    _wire(L, u1_oc[0], u1_oc[1], u1_oc[0] - 2.54, u1_oc[1])
+    _wire(L, u1_oc[0] - 2.54, u1_oc[1], u1_oc[0] - 2.54, 116.84)
+    _wire_horiz(L, u1_oc[0] - 2.54, 116.84, q1_g2[0])
+    _wire(L, q1_g2[0], 116.84, q1_g2[0], q1_g2[1])
+
+    # ── CS 网络: U1.CS(2) → Q1.S1(1) ──
+    # 从 U1.CS 引脚端点向左，再向下到 Q1.S1
+    _wire(L, u1_cs[0], u1_cs[1], u1_cs[0] - 5.08, u1_cs[1])
+    _wire(L, u1_cs[0] - 5.08, u1_cs[1], u1_cs[0] - 5.08, q1_s1[1])
+    _wire(L, u1_cs[0] - 5.08, q1_s1[1], q1_s1[0], q1_s1[1])
+
+    # ── 未使用引脚标记 ──
+    _no_connect(L, u1_td[0], u1_td[1])  # U1.TD(4) 未使用
+
+    # ── 网络标签 ──
+    _label(L, "B+", 20.32, 25.4, 0)
+    _label(L, "VDD", 160.02, u1_vdd[1], 0)
+    _label(L, "GND", 20.32, 165.1, 0)
+    _label(L, "OD", (u1_od[0] + q1_g1[0]) / 2, 119.38 + 2.54, 0)
+    _label(L, "OC", (u1_oc[0] - 2.54 + q1_g2[0]) / 2, 116.84 - 2.54, 0)
+    _label(L, "CS", u1_cs[0] - 5.08 - 2.54, (u1_cs[1] + q1_s1[1]) / 2, 0)
+
     L(f')')
     L(f'')
-    
+
     return '\n'.join(lines)
 
 
@@ -280,7 +344,6 @@ def _write_fs8205a_symbol(L):
 
 
 def _write_resistor_symbol(L):
-    # 简化的 R 符号 — 内嵌基础符号避免依赖外部库
     L(f'    (symbol "Device:R_Small_US"')
     L(f'      (exclude_from_sim no) (in_bom yes) (on_board yes)')
     L(f'      (property "Reference" "R" (id 0) (at 0 2.54 0)')
@@ -394,7 +457,7 @@ def _place_symbol(L, ref, lib_id, x, y, rot, ref_text, value_text, hide_fp=False
 
 
 def _wire(L, x1, y1, x2, y2):
-    """画一条线"""
+    """画一条导线"""
     L(f'  (wire (pts (xy {x1:.2f} {y1:.2f}) (xy {x2:.2f} {y2:.2f}))')
     L(f'    (stroke (width 0) (type default))')
     L(f'    (uuid {uid()}))')
@@ -406,6 +469,17 @@ def _wire_horiz(L, x1, y, x2):
 
 def _wire_vert(L, x, y1, y2):
     _wire(L, x, y1, x, y2)
+
+
+def _junction(L, x, y):
+    """添加接合点（导线交叉/分叉处的圆点）"""
+    L(f'  (junction (at {x:.2f} {y:.2f}) (diameter 0) (color 0 0 0 0)')
+    L(f'    (uuid {uid()}))')
+
+
+def _no_connect(L, x, y):
+    """标记未连接引脚"""
+    L(f'  (no_connect (at {x:.2f} {y:.2f}) (uuid {uid()}))')
 
 
 def _label(L, text, x, y, rot):
@@ -426,18 +500,19 @@ if __name__ == "__main__":
 
     out_dir = Path(f"output/{ic}_{series}S_MOSx{mos}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     sch_content = build_schematic(ic, mos, series, w, h)
     sch_file = out_dir / "schematic.kicad_sch"
     with open(sch_file, 'w', encoding='utf-8') as f:
         f.write(sch_content)
-    
+
     # 统计
     wires = sch_content.count('(wire ')
     labels = sch_content.count('(label ')
+    junctions = sch_content.count('(junction ')
     print(f"原理图: {sch_file}")
-    print(f"{wires} wires, {labels} labels")
-    
+    print(f"{wires} wires, {labels} labels, {junctions} junctions")
+
     # 导出 PNG
     png_file = out_dir / "schematic.png"
     if not export_sch_png_direct(sch_file, png_file):

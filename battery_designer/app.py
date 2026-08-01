@@ -129,16 +129,6 @@ def index():
     return FileResponse(STATIC_ROOT / "index.html")
 
 
-@app.get("/step3")
-def step3_page():
-    """Standalone Step-3 test page (design parameters & generate).
-
-    Lets you test cell lookup / IC resolve / generation without re-running
-    the full photo-recognition flow — recognition data is loaded from an
-    existing calibration record.
-    """
-    return FileResponse(STATIC_ROOT / "step3.html")
-
 
 @app.get("/api/calibrations/with-recognition")
 def list_calibrations_with_recognition():

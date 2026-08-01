@@ -26,7 +26,89 @@ if _common_dir not in sys.path:
 from adapt_common import (  # noqa: E402
     _mm, classify_terminal, place_terminal_footprints,
     determine_zone_layer, rebuild_b_zone, fill_zone_and_fix_stubs,
+    avoid_terminal_overlap, space_internal_references,
+    compute_pad_rotation, create_custom_pad,
+    _get_terminal_polygon_mm,
+    place_holes, place_internal_components, route_nets_manhattan, center_board,
+    run_freerouting_autorouter, connect_bminus_pads_to_zone,
+    optimize_component_placement,
 )
+
+
+def _point_in_polygon(px: float, py: float, polygon: list[tuple[float, float]]) -> bool:
+    """射线法判断点是否在多边形内。"""
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > py) != (yj > py)) and (px < (xj - xi) * (py - yi) / (yj - yi) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _clamp_footprints_to_outline(board, outline_pts: list[tuple[float, float]], margin: float = 1.0) -> int:
+    """确保所有内部元件（非端子）在 PCB 轮廓内。
+
+    如果元件中心在轮廓外，将其推到轮廓内最近的位置。
+    使用向内收缩 margin 后的轮廓作为安全边界。
+
+    Args:
+        board: pcbnew.BOARD 实例
+        outline_pts: PCB 轮廓顶点 [(x_mm, y_mm), ...]
+        margin: 安全边距 mm
+
+    Returns:
+        被移动的元件数量
+    """
+    if len(outline_pts) < 3:
+        return 0
+
+    # 计算轮廓中心
+    xs = [p[0] for p in outline_pts]
+    ys = [p[1] for p in outline_pts]
+    cx = sum(xs) / len(xs)
+    cy = sum(ys) / len(ys)
+
+    # 向内收缩轮廓（用于碰撞检测）
+    shrunk = []
+    for px, py in outline_pts:
+        dx = px - cx
+        dy = py - cy
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist > margin:
+            factor = (dist - margin) / dist
+            shrunk.append((cx + dx * factor, cy + dy * factor))
+        else:
+            shrunk.append((px, py))
+
+    moved = 0
+    for fp in board.GetFootprints():
+        if fp.GetReference().startswith("TP"):
+            continue  # 端子焊盘不处理
+        p = fp.GetPosition()
+        px, py = pcbnew.ToMM(p.x), pcbnew.ToMM(p.y)
+
+        if _point_in_polygon(px, py, shrunk):
+            continue  # 已在轮廓内
+
+        # 找到轮廓上最近的点，将元件移到该位置
+        best_dist = float('inf')
+        best_x, best_y = cx, cy  # fallback to center
+        for sx, sy in shrunk:
+            d = (px - sx) ** 2 + (py - sy) ** 2
+            if d < best_dist:
+                best_dist = d
+                best_x, best_y = sx, sy
+
+        fp.SetPosition(pcbnew.VECTOR2I(_mm(best_x), _mm(best_y)))
+        moved += 1
+
+    if moved:
+        print(f"[adapt] 将 {moved} 个超出轮廓的元件拉回板内")
+    return moved
 
 
 def main(spec_path: str, pcb_path: str) -> int:
@@ -93,96 +175,49 @@ def main(spec_path: str, pcb_path: str) -> int:
     # ★ 使用公共模块放置端子（自动处理 side → 铜层分配）
     term_info = place_terminal_footprints(board, terminals, load_tp_footprint)
 
-    # ── 3) 内部元件定位：缩放到板框内（排除 J1） ──
-    fps = [fp for fp in board.GetFootprints() if not fp.GetReference().startswith("TP")]
-    if fps:
-        fp_positions = [(pcbnew.ToMM(fp.GetPosition().x), pcbnew.ToMM(fp.GetPosition().y)) for fp in fps]
-        fp_xs = [p[0] for p in fp_positions]
-        fp_ys = [p[1] for p in fp_positions]
-        fp_minx, fp_maxx = min(fp_xs), max(fp_xs)
-        fp_miny, fp_maxy = min(fp_ys), max(fp_ys)
-        fp_w = fp_maxx - fp_minx
-        fp_h = fp_maxy - fp_miny
+    # ── 3) 放置孔槽（预留，当前测试板无孔槽）──
+    holes = spec.get("holes", [])
+    place_holes(board, holes)
 
-        inset = 2.0
-        target_w = max(spec_w - 2 * inset, fp_w * 0.3)
-        target_h = max(spec_h - 2 * inset, fp_h * 0.3)
-        sx = target_w / fp_w if fp_w > 0.01 else 1.0
-        sy = target_h / fp_h if fp_h > 0.01 else 1.0
-        scale = min(sx, sy, 2.0)
+    # ── 4) 内部元件布局：行排列+碰撞检测（替代原缩放逻辑）──
+    place_internal_components(board, pts, terminals, holes, min_gap=0.5)
 
-        fp_cx = (fp_minx + fp_maxx) / 2
-        fp_cy = (fp_miny + fp_maxy) / 2
+    # ★ 连接感知布局优化（模拟退火，最小化走线长度）
+    optimize_component_placement(board, pts)
 
-        for fp in fps:
-            p = fp.GetPosition()
-            ox, oy = pcbnew.ToMM(p.x), pcbnew.ToMM(p.y)
-            nx = spec_cx + (ox - fp_cx) * scale
-            ny = spec_cy + (oy - fp_cy) * scale
-            fp.SetPosition(pcbnew.VECTOR2I(_mm(nx), _mm(ny)))
+    # ★ 确保所有内部元件在 PCB 轮廓内
+    _clamp_footprints_to_outline(board, pts, margin=1.0)
+    # ★ 缩小丝印文本并放到元件周边空闲位置（约束板内，用最终元件位置）
+    space_internal_references(board)
 
-        print(f"[adapt] 内部元件变换: scale={scale:.3f}")
-
-    # ── 4) 删除旧走线/过孔 ──
+    # ── 4) 删除旧走线/过孔/zone ──
     old_tracks = list(board.GetTracks())
     for t in old_tracks:
         board.Remove(t)
+    # ★ 删除所有旧 zone（Freerouting 需要干净的双面布线环境）
+    for z in list(board.Zones()):
+        board.Remove(z)
 
-    # ── 5) 重建 B- zone（★ 使用公共模块根据 side 选择铜层）──
+    # ── 5) 自动布线：优先 Freerouting 双面布线，失败时回退 zone 方案 ──
     zone_layer = determine_zone_layer(board, terminals)
-    rebuild_b_zone(board, (spec_minx, spec_miny, spec_maxx, spec_maxy), zone_layer)
+    outline_dicts = [{"x_mm": p[0], "y_mm": p[1]} for p in pts]
 
-    # ── 6) 重新布线 ──
-    bcu = pcbnew.B_Cu
+    if run_freerouting_autorouter(board):
+        # ★ Freerouting 成功：所有网络（含 B-）已由云端双面布线
+        # 正反面通过过孔连接，无需 B- zone 后处理
+        print("[adapt] Freerouting 双面布线完成")
+        routed = -1
+    else:
+        # ★ Freerouting 不可用/失败：回退到 zone 方案
+        print("[adapt] Freerouting 不可用，回退 zone 方案（B.Cu 地平面 + F.Cu 信号）")
+        rebuild_b_zone(board, (spec_minx, spec_miny, spec_maxx, spec_maxy), zone_layer,
+                       outline_points=outline_dicts)
+        routed = route_nets_manhattan(board, zone_layer)
+        connect_bminus_pads_to_zone(board, zone_layer)
+        fill_zone_and_fix_stubs(board, zone_layer, spec_cx, spec_cy)
 
-    def pad_pos(pad):
-        p = pad.GetPosition()
-        return (pcbnew.ToMM(p.x), pcbnew.ToMM(p.y))
-
-    def add_track(net_code, ax, ay, bx, by, layer, w):
-        t = pcbnew.PCB_TRACK(board)
-        t.SetStart(pcbnew.VECTOR2I(_mm(ax), _mm(ay)))
-        t.SetEnd(pcbnew.VECTOR2I(_mm(bx), _mm(by)))
-        t.SetWidth(_mm(w))
-        t.SetLayer(layer)
-        t.SetNetCode(net_code)
-        board.Add(t)
-
-    def add_via(net_code, x, y):
-        via = pcbnew.PCB_VIA(board)
-        via.SetPosition(pcbnew.VECTOR2I(_mm(x), _mm(y)))
-        via.SetWidth(_mm(0.8))
-        via.SetDrill(_mm(0.4))
-        via.SetViaType(pcbnew.VIATYPE_THROUGH)
-        board.Add(via)
-        via.SetNetCode(net_code)
-
-    # 收集每个网络的所有焊盘
-    net_pads: dict[int, list] = {}
-    for fp in board.GetFootprints():
-        for pad in fp.Pads():
-            nc = pad.GetNetCode()
-            if nc == 0:
-                continue
-            x, y = pad_pos(pad)
-            is_smd = pad.GetAttribute() == pcbnew.PAD_ATTRIB_SMD
-            net_pads.setdefault(nc, []).append((x, y, is_smd))
-
-    routed = 0
-    for nc, pads in net_pads.items():
-        net_obj = board.FindNet(nc)
-        net_name = net_obj.GetNetname() if net_obj else ""
-        width = 0.4 if net_name in ("B+", "B-", "P-") else 0.25
-        for (x, y, is_smd) in pads:
-            if is_smd:
-                add_via(nc, x, y)
-        for i in range(len(pads) - 1):
-            add_track(nc, pads[i][0], pads[i][1], pads[i + 1][0], pads[i + 1][1], bcu, width)
-        routed += 1
-    print(f"[adapt] 重新布线 {routed} 个网络")
-
-    # ── 7) 填充 zone + 修复未覆盖焊盘（★ 使用公共模块）──
-    fill_zone_and_fix_stubs(board, zone_layer, spec_cx, spec_cy)
+    # ── 8) 板框居中（使 PCB 在 KiCad 画布中央显示）──
+    center_board(board)
 
     board.Save(pcb_path)
     print(f"[adapt] 完成: 板框{len(pts)}点, {len(terminals)}端子@检测位, {routed}网络布线")

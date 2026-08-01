@@ -78,10 +78,23 @@ def _svg(spec: DesignSpec, side: str) -> str:
         x = display_x(terminal.position.x_mm)
         y = terminal.position.y_mm - min_y + margin
         color = ROLE_COLORS[sorted(role.value for role in terminal.roles)[0]]
-        if terminal.shape == PadShape.CIRCLE:
+
+        # ★ 优先使用 source_region.polygon 绘制真实焊盘形状
+        polygon = (terminal.source_region.polygon
+                   if terminal.source_region
+                      and terminal.source_region.polygon
+                   else None)
+        if polygon and len(polygon) >= 3:
+            poly_pts = " ".join(
+                f"{display_x(p.x_mm):.3f},{p.y_mm - min_y + margin:.3f}"
+                for p in polygon
+            )
+            items.append(f'<polygon points="{poly_pts}" fill="{color}" stroke="#111827" stroke-width="0.15"/>')
+        elif terminal.shape == PadShape.CIRCLE:
             items.append(f'<circle cx="{x:.3f}" cy="{y:.3f}" r="{terminal.width_mm/2:.3f}" fill="{color}" stroke="#111827" stroke-width="0.15"/>')
         else:
             items.append(f'<rect x="{x-terminal.width_mm/2:.3f}" y="{y-terminal.height_mm/2:.3f}" width="{terminal.width_mm:.3f}" height="{terminal.height_mm:.3f}" rx="{terminal.height_mm/2 if terminal.shape == PadShape.OVAL else 0:.3f}" fill="{color}" stroke="#111827" stroke-width="0.15"/>')
+
         sign = "+" if terminal.polarity == Polarity.POSITIVE else ("−" if terminal.polarity == Polarity.NEGATIVE else "")
         roles = "/".join(sorted(role.value[0].upper() for role in terminal.roles))
         items.append(f'<text x="{x:.3f}" y="{y-terminal.height_mm/2-0.7:.3f}" text-anchor="middle" font-size="1.2" fill="#111827">{html.escape(terminal.id)} {roles}{sign}</text>')

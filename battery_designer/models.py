@@ -52,6 +52,8 @@ class PadShape(str, Enum):
     CIRCLE = "circle"
     RECT = "rect"
     OVAL = "oval"
+    ROUNDED_RECT = "rounded_rect"
+    CUSTOM = "custom"
 
 
 class TemplateStatus(str, Enum):

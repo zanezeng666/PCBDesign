@@ -161,10 +161,18 @@ class KicadPipeline:
             raise DesignError("TEMPLATE_ADAPTER_MISSING", "The reviewed template has no geometry/routing adapter.")
         spec_path = design_dir / "design-input.json"
         spec_path.write_text(spec.model_dump_json(indent=2), encoding="utf-8")
-        if adapter.suffix == ".py":
-            self._run([str(_KICAD_PYTHON), str(adapter), str(spec_path), str(pcb)], "TEMPLATE_ADAPT_FAILED")
-        else:
-            self._run([str(adapter), str(spec_path), str(pcb)], "TEMPLATE_ADAPT_FAILED")
+        adapt_cmd = [str(_KICAD_PYTHON), str(adapter), str(spec_path), str(pcb)] if adapter.suffix == ".py" else [str(adapter), str(spec_path), str(pcb)]
+        adapt_result = subprocess.run(adapt_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        # 始终保存适配器输出到日志（便于调试 Freerouting 等问题）
+        adapt_log = reports / "adapt.log"
+        adapt_log.write_text(
+            f"=== returncode: {adapt_result.returncode} ===\n"
+            f"=== stdout ===\n{adapt_result.stdout[-8000:]}\n\n=== stderr ===\n{adapt_result.stderr[-8000:]}",
+            encoding="utf-8", errors="replace",
+        )
+        if adapt_result.returncode != 0:
+            raise DesignError("TEMPLATE_ADAPT_FAILED", "External design command failed.",
+                              {"command": adapt_cmd, "stdout": adapt_result.stdout[-2000:], "stderr": adapt_result.stderr[-2000:]})
 
         erc = reports / "erc.rpt"
         drc = reports / "drc.rpt"
@@ -177,16 +185,21 @@ class KicadPipeline:
 
         preview = output_dir / "preview"
         preview.mkdir(exist_ok=True)
-        self._run([str(self.kicad_cli), "sch", "export", "svg", "-o", str(preview), str(schematic)], "SCHEMATIC_SVG_FAILED")
+        # 原理图 SVG：排除图纸边框，导出干净原理图
+        self._run([str(self.kicad_cli), "sch", "export", "svg", "--exclude-drawing-sheet", "-o", str(preview), str(schematic)], "SCHEMATIC_SVG_FAILED")
         # 画导线版原理图（若模板包含）
         wired_sch = design_dir / "schematic_wired.kicad_sch"
         if wired_sch.exists():
-            self._run([str(self.kicad_cli), "sch", "export", "svg", "-o", str(preview), str(wired_sch)], "SCHEMATIC_WIRED_SVG_FAILED")
+            self._run([str(self.kicad_cli), "sch", "export", "svg", "--exclude-drawing-sheet", "-o", str(preview), str(wired_sch)], "SCHEMATIC_WIRED_SVG_FAILED")
+        # PCB 各面 SVG：page-size-mode=2 仅导出板框区域（不含页面框架），mode-single 输出单个文件
         for side, layers in (("front", "F.Cu,F.Mask,F.Silkscreen,Edge.Cuts"), ("back", "B.Cu,B.Mask,B.Silkscreen,Edge.Cuts")):
-            self._run([str(self.kicad_cli), "pcb", "export", "svg", "--layers", layers, "-o", str(preview / f"pcb_{side}.svg"), str(pcb)], "PCB_SVG_FAILED")
+            self._run([str(self.kicad_cli), "pcb", "export", "svg", "--mode-single", "--page-size-mode", "2", "--layers", layers, "-o", str(preview / f"pcb_{side}.svg"), str(pcb)], "PCB_SVG_FAILED")
+        # PNG 光栅化：PCB 板小，用更高分辨率；原理图保持 1800px
         for svg in preview.rglob("*.svg"):
             if cairosvg is not None:
-                cairosvg.svg2png(url=str(svg), write_to=str(svg.with_suffix(".png")), output_width=1800)
+                fn = svg.name
+                w = 3600 if fn.startswith("pcb_") else 1800
+                cairosvg.svg2png(url=str(svg), write_to=str(svg.with_suffix(".png")), output_width=w)
         self._run([str(self.kicad_cli), "pcb", "export", "gerbers", "-o", str(gerber), str(pcb)], "GERBER_FAILED")
         self._run([str(self.kicad_cli), "pcb", "export", "drill", "-o", str(gerber), str(pcb)], "DRILL_FAILED")
         bom = manufacturing / "bom.csv"
@@ -198,9 +211,12 @@ class KicadPipeline:
 
     @staticmethod
     def _assert_no_unconnected(report: Path) -> None:
-        content = report.read_text(encoding="utf-8", errors="replace").lower()
-        if "unconnected_items" in content or "未连接" in content:
-            raise DesignError("UNCONNECTED_ITEMS", "KiCad DRC reports unconnected items.", {"report": str(report)})
+        content = report.read_text(encoding="utf-8", errors="replace")
+        import re
+        m = re.search(r"Found\s+(\d+)\s+unconnected\s+pads", content)
+        if m and int(m.group(1)) > 0:
+            raise DesignError("UNCONNECTED_ITEMS", "KiCad DRC reports unconnected items.",
+                              {"report": str(report), "unconnected_pads": int(m.group(1))})
 
     @staticmethod
     def _patch_mos_value(schematic: Path, mos_mpn: str) -> None:
@@ -236,11 +252,10 @@ class KicadPipeline:
         resistors: list[dict] = []
         capacitors: list[dict] = []
         for comp in detected_components:
-            ct = getattr(comp, "type", None) or comp.get("type", "")
-            ss = getattr(comp, "silkscreen", None) or comp.get("silkscreen", "")
-            conf = getattr(comp, "confidence", None)
-            if conf is None:
-                conf = comp.get("confidence", 0.5)
+            # DetectedComponent is a Pydantic BaseModel — use getattr, NOT .get()
+            ct = getattr(comp, "type", "other")
+            ss = getattr(comp, "silkscreen", "")
+            conf = getattr(comp, "confidence", 0.5)
             if not ss:
                 continue
             if ct == "resistor":
