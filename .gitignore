@@ -10,3 +10,12 @@ work/
 output/
 *.erc
 *.log
+# temp debug files
+_*.*
+debug_crops/
+diag_cv/
+diag_vlm/
+diag_full/
+diag_compare/
+.codebuddy/
+test_output.txt

@@ -31,6 +31,7 @@ from .storage import ProjectStore
 from .vlm_detection import detect_with_vlm as _vlm_detect
 from .vlm_detection import detect_all_vlm as _vlm_detect_all
 from .vlm_detection import detect_components as _detect_components
+from .vlm_detection import verify_pad_crop as _verify_pad_crop
 from .vision import extract_pcb as _extract_pcb, detect_holes as _detect_holes
 from .vision import _make_transparent, refine_outline_geometry
 from .vision import detect_black_frame as _detect_black_frame, calibrate_black_frame as _calibrate_black_frame
@@ -521,6 +522,73 @@ def _draw_rounded_rect(img, x1, y1, x2, y2, radius, color, thickness):
             cv2.ellipse(img, (x1 + r, y2 - r), (r, r), 0, 90, 180, color, thickness)
 
 
+# ── VLM debugging helpers ────────────────────────────────────────────
+
+VLM_DIAG_DIR = WORK_ROOT / "diag_vlm"
+
+def _save_vlm_input_for_debug(img_bgr, side: str, calibration_id: str) -> None:
+    """Save the image sent to VLM for later debugging.
+
+    The saved image helps diagnose WHY VLM missed certain pads — you can
+    visually inspect exactly what VLM received and whether small pads
+    are clearly visible.
+
+    Saving is best-effort — failures are silently swallowed.
+    """
+    try:
+        VLM_DIAG_DIR.mkdir(parents=True, exist_ok=True)
+        cal_id = calibration_id[:12] if calibration_id else "unknown"
+        out_path = VLM_DIAG_DIR / f"vlm_input_{side}_{cal_id}.png"
+        cv2.imwrite(str(out_path), np.ascontiguousarray(img_bgr))
+        logger.info("Saved VLM input image to %s (%dx%d)", out_path,
+                     img_bgr.shape[1], img_bgr.shape[0])
+    except Exception:
+        pass  # best-effort
+
+
+def _warn_incomplete_vlm_result(result: dict, side: str) -> None:
+    """Warn if VLM returned too few pads — small pads likely missed.
+
+    The detect-terminals pipeline can detect up to ~8 total pads per side:
+      - Large: B+, B- (2 pads)
+      - Medium: P+, P- (4-6 pads)
+      - Small: TH/T, ID, NTC (2-3 pads)
+
+    If VLM returns < 4 candidates, it almost certainly missed small pads
+    (T, ID) and possibly some P+/P- pads.  The remaining positions will
+    be filled by geometric estimation, which is much less accurate.
+    """
+    candidates = result.get("candidates", [])
+    n = len(candidates)
+    vlm_detected = sum(1 for c in candidates
+                       if c.get("matched_regions", [{}])[0].get("source") == "vlm"
+                       or c.get("visible_region", {}).get("source") == "vlm")
+    vlm_labels = sorted(set(
+        c.get("label", "") for c in candidates
+        if c.get("matched_regions", [{}])[0].get("source") == "vlm"
+        or c.get("visible_region", {}).get("source") == "vlm"
+    ))
+
+    small_labels = {"TH", "T", "ID", "NTC", "N"}
+    detected_small = small_labels & set(vlm_labels)
+    missing_small = small_labels - set(vlm_labels)
+
+    threshold = 4
+    if n < threshold:
+        logger.warning(
+            "VLM returned only %d candidate(s) on %s side (expected >= %d). "
+            "Detected labels: %s. Missing small pads will be estimated geometrically "
+            "— positions may be inaccurate.",
+            n, side, threshold, vlm_labels or ["(none)"]
+        )
+    elif missing_small:
+        logger.info(
+            "VLM on %s side: detected %d candidates (%s), but missed small pads: %s. "
+            "These will be geometrically estimated.",
+            side, n, vlm_labels, sorted(missing_small)
+        )
+
+
 def _refine_positions_cv(result: dict, img_rgba, pixels_per_mm: float) -> dict:
     """Refine VLM pad positions using CV edge detection on the original image.
 
@@ -534,7 +602,9 @@ def _refine_positions_cv(result: dict, img_rgba, pixels_per_mm: float) -> dict:
     h_img, w_img = img_rgba.shape[:2]
     has_alpha = len(img_rgba.shape) == 3 and img_rgba.shape[2] == 4
 
-    for cand in result.get("candidates", []):
+    invalid_indices: set[int] = set()  # candidates to reject after loop
+
+    for idx, cand in enumerate(result.get("candidates", [])):
         regions = cand.get("matched_regions", [])
         if not regions:
             continue
@@ -548,8 +618,21 @@ def _refine_positions_cv(result: dict, img_rgba, pixels_per_mm: float) -> dict:
         ys = [p["y_mm"] * pixels_per_mm for p in poly]
         pad_w = max(xs) - min(xs)
         pad_h = max(ys) - min(ys)
-        # Padding: 30% of pad size + 5px margin (tight search area)
-        pad_px = int(max(pad_w, pad_h) * 0.30) + 5
+        # ── Label-aware ROI padding ──
+        # P+/P-/B+/B-: VLM often traces silkscreen text 1.0–1.5 mm away from
+        # the actual metal pad → wide search (80% + 2.0mm).
+        # ID/TH/T/NTC/N: moderate search (50% + 1.0mm) — VLM sometimes
+        # misplaces them on nearby silkscreen text but the real metal pad
+        # is within ~2mm.
+        # Others: tight search (30% + 0.5mm).
+        label = cand.get("label", "")
+        label_up = label.upper()
+        if label_up in ("P+", "P-", "B+", "B-"):
+            pad_px = int(max(pad_w, pad_h) * 0.80) + int(2.0 * pixels_per_mm)
+        elif label_up in ("ID", "TH", "T", "NTC", "N"):
+            pad_px = int(max(pad_w, pad_h) * 0.50) + int(1.0 * pixels_per_mm)
+        else:
+            pad_px = int(max(pad_w, pad_h) * 0.30) + int(0.5 * pixels_per_mm)
 
         rx1 = max(0, int(min(xs)) - pad_px)
         ry1 = max(0, int(min(ys)) - pad_px)
@@ -576,8 +659,15 @@ def _refine_positions_cv(result: dict, img_rgba, pixels_per_mm: float) -> dict:
         # estimate) — i.e. no refinement at all.  Saturation separates metal
         # (S≈28) from solder mask (S≈224) cleanly; the loose V floor only
         # rejects truly-black parts (component bodies, V<40).
+        # Use tighter S threshold (80 vs 100) to reduce background bleed at
+        # board edges where white paper has similarly low saturation.
+        # Also cap V at 230 to exclude pure-white paper/polygon (V≈240-255,
+        # S≈0-10), which otherwise passes the low-saturation check.
         hsv = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2HSV)
-        metallic = cv2.inRange(hsv, np.array([0, 0, 40]), np.array([180, 100, 255]))
+        # V cap raised to 245 (was 230): some metallic pads exhibit V≈225-240
+        # under certain lighting, especially tin/solder surfaces.  White paper
+        # (V≈245-255) is still safely excluded.
+        metallic = cv2.inRange(hsv, np.array([0, 0, 40]), np.array([180, 80, 245]))
         binary = cv2.bitwise_and(metallic, pcb_region)
 
         # Clean up noise
@@ -594,16 +684,102 @@ def _refine_positions_cv(result: dict, img_rgba, pixels_per_mm: float) -> dict:
 
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            continue
+            # ── Wider fallback search ──
+            # VLM may have placed the polygon on silkscreen text adjacent to
+            # the actual metal pad.  Expand the ROI by 1.5× and retry once.
+            fallback_px = int(pad_px * 1.5)
+            frx1 = max(0, int(min(xs)) - fallback_px)
+            fry1 = max(0, int(min(ys)) - fallback_px)
+            frx2 = min(w_img, int(max(xs)) + fallback_px + 1)
+            fry2 = min(h_img, int(max(ys)) + fallback_px + 1)
+            if frx2 - frx1 > 20 and fry2 - fry1 > 20:
+                froi = img_rgba[fry1:fry2, frx1:frx2].copy()
+                if has_alpha:
+                    fa = froi[:, :, 3]
+                    fpcb = (fa >= 128).astype(np.uint8) * 255
+                else:
+                    fpcb = np.full(froi.shape[:2], 255, dtype=np.uint8)
+                fhsv = cv2.cvtColor(froi[:, :, :3], cv2.COLOR_BGR2HSV)
+                fmetallic = cv2.inRange(fhsv, np.array([0, 0, 40]), np.array([180, 80, 245]))
+                fbinary = cv2.bitwise_and(fmetallic, fpcb)
+                fkernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                fbinary = cv2.morphologyEx(fbinary, cv2.MORPH_OPEN, fkernel, iterations=1)
+                fbinary = cv2.morphologyEx(fbinary, cv2.MORPH_CLOSE, fkernel, iterations=2)
+                fcontours, _ = cv2.findContours(fbinary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if fcontours:
+                    # Found metal in wider search — reuse the expanded ROI context
+                    binary, contours = fbinary, fcontours
+                    rx1, ry1, rx2, ry2 = frx1, fry1, frx2, fry2
+                    roi_area = (rx2 - rx1) * (ry2 - ry1)
+                    logger.info("CV refine: %s metal found in wider fallback (+%.0f%%)",
+                                cand.get('label', '?'), (fallback_px / max(pad_px, 1) - 1) * 100)
+            if not contours:
+                logger.info("CV refine: %s NO metallic contour found in ROI — keeping VLM position as-is",
+                            cand.get('label', '?'))
+                continue
 
         # Find the largest contour (should be the metallic pad)
         best = max(contours, key=cv2.contourArea)
         area = cv2.contourArea(best)
         poly_area = pad_w * pad_h
+        roi_area = (rx2 - rx1) * (ry2 - ry1)
+
+        # ── VLM hallucination / silkscreen pseudo-pad rejection ──
+        # If the CV-detected metal contour is far smaller than the VLM-claimed
+        # polygon, the region is NOT a real terminal pad.  This catches:
+        #  • VLM detecting a silkscreen label outline (rectangular, pad-like)
+        #    as a "pad" when only a tiny via dot sits inside
+        #  • Pure hallucinations where no metal exists at all
+        #
+        # Geometric-inferred pads are exempt: they fill a known pattern gap and
+        # may land outside the board where no metal is visible.
+        is_geometric = any("geometric" in (r.get("source", "") or "")
+                           for r in (cand.get("matched_regions") or []))
+        area_ratio = area / max(poly_area, 0.01)
+        label = cand.get("label", "")
+
+        # ID/TH/T/NTC/N are real auxiliary pads — never reject them.
+        # VLM often places their polygon on silkscreen text instead of metal,
+        # so CV may find zero metal in the ROI.  Keep the VLM position as-is.
+        _AUX_LABELS = {"ID", "TH", "T", "NTC", "N"}
+
+        if not is_geometric and label.upper() not in _AUX_LABELS:
+            # Two-tier rejection (only for main power pads):
+            # Tier 1: <5%  → pure hallucination (no metal at all)
+            # Tier 2: <15% AND polygon > 4 mm² → silkscreen pseudo-pad
+            if area_ratio < 0.05:
+                logger.warning("CV refine: %s area %.0f < 5%% of poly %.0f — rejecting VLM hallucination",
+                               label, area, poly_area)
+                invalid_indices.add(idx)
+                continue
+            if area_ratio < 0.15 and poly_area > 4.0:
+                logger.warning(
+                    "CV refine: %s metal/poly=%.1f%% (poly=%.1f mm²) — "
+                    "silkscreen pseudo-pad (large poly but little metal), rejecting",
+                    label, area_ratio * 100, poly_area,
+                )
+                invalid_indices.add(idx)
+                continue
+
         # Safety: contour must be 25%–400% of VLM polygon area
         if area < poly_area * 0.25 or area > poly_area * 4.0:
             logger.info("CV refine: %s contour area %.0f outside range [%.0f, %.0f], skip",
                         cand.get('label','?'), area, poly_area*0.25, poly_area*4.0)
+            continue
+
+        # Safety: if metallic mask fills >80% of ROI, background is bleeding
+        # into the detection (happens at board edges or near large metal planes),
+        # so the contour center is unreliable — skip.
+        metal_pct = float(cv2.countNonZero(binary)) / float(roi_area) if roi_area > 0 else 1.0
+        if metal_pct > 0.80:
+            logger.info("CV refine: %s metal_mask=%.0f%% of ROI (background bleed), skip",
+                        cand.get('label','?'), metal_pct * 100)
+            continue
+        # If <10% of expected pad area is metallic, the pad is barely
+        # visible in this ROI — skip CV refinement but keep the candidate.
+        if area < poly_area * 0.10:
+            logger.info("CV refine: %s contour area %.0f < 10%% of poly_area %.0f, skip",
+                        cand.get('label','?'), area, poly_area)
             continue
 
         # Use minAreaRect for geometric center (more robust than centroid
@@ -641,11 +817,16 @@ def _refine_positions_cv(result: dict, img_rgba, pixels_per_mm: float) -> dict:
         dy = cy_px - cy_vlm
         shift_px = (dx ** 2 + dy ** 2) ** 0.5
 
-        # Safety: max shift = 35% of pad diagonal,
-        # capped at 2% of image max dimension (scales with PCB size)
+        # Safety: max shift is a fraction of pad diagonal.
+        # CV should refine, not relocate — but when the CV finds a large,
+        # high-confidence metal contour (area_ratio ≥ 0.30) we can trust it
+        # more and allow a larger shift.  This is critical for P+/P- pads
+        # where VLM often places the polygon on silkscreen text 1.0–1.5mm
+        # away from the actual metallic pad.
         img_max_dim = max(h_img, w_img)
-        max_shift = min((pad_w ** 2 + pad_h ** 2) ** 0.5 * 0.35,
-                        img_max_dim * 0.02)
+        base_factor = 0.60 if area_ratio >= 0.30 else 0.30
+        max_shift = min((pad_w ** 2 + pad_h ** 2) ** 0.5 * base_factor,
+                        img_max_dim * 0.05)
         logger.info("CV refine: %s VLM=(%.1f,%.1f) CV=(%.1f,%.1f) shift=%.1fpx max=%.1fpx",
                     cand.get('label','?'), cx_vlm, cy_vlm, cx_px, cy_px, shift_px, max_shift)
         if shift_px > max_shift:
@@ -654,6 +835,8 @@ def _refine_positions_cv(result: dict, img_rgba, pixels_per_mm: float) -> dict:
         # Apply shift (position only, preserve VLM shape)
         dx_mm = round(dx / pixels_per_mm, 3)
         dy_mm = round(dy / pixels_per_mm, 3)
+        shift_mm = round((dx_mm ** 2 + dy_mm ** 2) ** 0.5, 3)
+        cand["_cv_shift_mm"] = shift_mm  # store BEFORE polygon shift for alignment
         for pt in poly:
             pt["x_mm"] = round(pt["x_mm"] + dx_mm, 3)
             pt["y_mm"] = round(pt["y_mm"] + dy_mm, 3)
@@ -673,7 +856,122 @@ def _refine_positions_cv(result: dict, img_rgba, pixels_per_mm: float) -> dict:
         logger.info("CV refine: %s shifted (%.2f, %.2f)mm [%.1fpx]",
                     cand.get("label", "?"), dx_mm, dy_mm, shift_px)
 
+        # −− Store CV-detected tight metal bbox (world mm) for downstream crop−windows −−
+        # VLM polygon may be over−sized; the CV contour is the true metal boundary.
+        # minAreaRect gives an axis−aligned bounding rectangle of the actual metal.
+        cv_w_mm = rect[1][0] / pixels_per_mm
+        cv_h_mm = rect[1][1] / pixels_per_mm
+        cand["_cv_metal_bbox"] = {
+            "x_mm": round(cx_px / pixels_per_mm, 3),
+            "y_mm": round(cy_px / pixels_per_mm, 3),
+            "w_mm": round(cv_w_mm, 3),
+            "h_mm": round(cv_h_mm, 3),
+        }
+
+    # ── Remove hallucinated candidates ──
+    if invalid_indices:
+        original = result.get("candidates", [])
+        kept = [c for i, c in enumerate(original) if i not in invalid_indices]
+        rejected = [original[i]["label"] for i in sorted(invalid_indices) if i < len(original)]
+        logger.warning("CV refine: rejecting %d hallucinated pad(s): %s",
+                       len(invalid_indices), rejected)
+        result["candidates"] = kept
+
     return result
+
+
+def _clamp_pads_to_board(result, pcb_w_mm: float, pcb_h_mm: float):
+    """Clamp every candidate's polygon vertices to stay within PCB bounds.
+
+    Geometrically-inferred pads (or pads adjusted by `_align_pad_groups`)
+    may land outside the board.  This function truncates the polygon so no
+    vertex extends beyond [0, pcb_w]×[0, pcb_h], then recomputes the
+    effective centre.
+
+    Pads whose polygon collapses to a degenerate shape (zero area) after
+    clamping are removed entirely — they were entirely outside the PCB.
+    """
+    if pcb_w_mm <= 0 or pcb_h_mm <= 0:
+        return
+
+    candidates = result.get("candidates", [])
+    rejected: list[int] = []
+
+    for ci, cand in enumerate(candidates):
+        regions = cand.get("matched_regions", [])
+        region_indices_to_remove: list[int] = []
+        for ri, region in enumerate(regions):
+            poly = region.get("polygon") or []
+            if len(poly) < 3:
+                continue
+            clamped_any = False
+            for v in poly:
+                ox = v.get("x_mm")
+                oy = v.get("y_mm")
+                if ox is not None:
+                    cx = max(0.0, min(pcb_w_mm, float(ox)))
+                    if abs(cx - float(ox)) > 1e-4:
+                        clamped_any = True
+                    v["x_mm"] = round(cx, 3)
+                if oy is not None:
+                    cy = max(0.0, min(pcb_h_mm, float(oy)))
+                    if abs(cy - float(oy)) > 1e-4:
+                        clamped_any = True
+                    v["y_mm"] = round(cy, 3)
+            if not clamped_any:
+                continue
+
+            # Recompute effective centre from clamped polygon
+            xs = [v["x_mm"] for v in poly]
+            ys = [v["y_mm"] for v in poly]
+            cx = round(sum(xs) / len(xs), 3)
+            cy = round(sum(ys) / len(ys), 3)
+
+            # Check for degenerate polygon: zero area after clamping means
+            # the entire pad was outside the PCB and got squashed to a line/point.
+            w_clamped = round(max(xs) - min(xs), 3)
+            h_clamped = round(max(ys) - min(ys), 3)
+            if w_clamped < 0.05 or h_clamped < 0.05:
+                region_indices_to_remove.append(ri)
+                logger.warning(
+                    "PCB clamp: %s DEGENERATE polygon (%.3f×%.3fmm) at (%.2f,%.2f) — "
+                    "pad was entirely outside PCB, discarding",
+                    cand.get("label", "?"), w_clamped, h_clamped, cx, cy,
+                )
+                continue
+
+            region["center"] = {"x_mm": cx, "y_mm": cy}
+            bbox = region.get("bbox", {})
+            if bbox:
+                bbox["x_mm"] = round(min(xs), 3)
+                bbox["y_mm"] = round(min(ys), 3)
+                bbox["width_mm"] = w_clamped
+                bbox["height_mm"] = h_clamped
+            vp = cand.get("visible_position", {})
+            if vp:
+                vp["x_mm"] = cx
+                vp["y_mm"] = cy
+            logger.info("PCB clamp: %s polygon truncated to board edge (clamped %.3f×%.3fmm)",
+                        cand.get("label", "?"), w_clamped, h_clamped)
+
+        # Remove degenerate regions
+        if region_indices_to_remove:
+            for ri in reversed(region_indices_to_remove):
+                del regions[ri]
+            cand["matched_regions"] = regions
+
+        # If all regions were removed, mark candidate for rejection
+        if not cand.get("matched_regions"):
+            rejected.append(ci)
+
+    # Remove candidates that lost all their regions
+    if rejected:
+        for ci in reversed(rejected):
+            label = candidates[ci].get("label", "?")
+            logger.warning("PCB clamp: removing %s — all polygon regions collapsed outside PCB",
+                          label)
+            del candidates[ci]
+        result["candidates"] = candidates
 
 
 def _align_pad_groups(result, pixels_per_mm=1.0, pcb_w_mm=0.0, pcb_h_mm=0.0):
@@ -701,10 +999,24 @@ def _align_pad_groups(result, pixels_per_mm=1.0, pcb_w_mm=0.0, pcb_h_mm=0.0):
     for cand in candidates:
         regions = cand.get("matched_regions", [])
         region = regions[0] if regions else cand.get("visible_region", {})
-        poly = region.get("polygon", [])
+        poly = region.get("polygon") or []
         center = region.get("center", {})
         if len(poly) < 3 or not center:
-            continue
+            # Fallback: try to reconstruct from width_mm / height_mm
+            cx = center.get("x_mm")
+            cy = center.get("y_mm")
+            cand_w = cand.get("width_mm") or cand.get("visible_region", {}).get("bbox", {}).get("width_mm")
+            cand_h = cand.get("height_mm") or cand.get("visible_region", {}).get("bbox", {}).get("height_mm")
+            if cx is not None and cy is not None and cand_w and cand_h:
+                hw, hh = cand_w / 2, cand_h / 2
+                poly = [
+                    {"x_mm": cx - hw, "y_mm": cy - hh},
+                    {"x_mm": cx + hw, "y_mm": cy - hh},
+                    {"x_mm": cx + hw, "y_mm": cy + hh},
+                    {"x_mm": cx - hw, "y_mm": cy + hh},
+                ]
+            else:
+                continue
         xs = [p["x_mm"] for p in poly]
         ys = [p["y_mm"] for p in poly]
         w = max(xs) - min(xs)
@@ -755,23 +1067,15 @@ def _align_pad_groups(result, pixels_per_mm=1.0, pcb_w_mm=0.0, pcb_h_mm=0.0):
         med_h = statistics.median([p["h"] for p in grp])
 
         # 2) Unified alignment coordinate
-        #    Alignment axis: use PCB center as symmetry anchor (pads are
-        #    symmetric about board center by PCB layout convention).
-        #    For 3+ pads: use median (self-consistent, more robust).
-        if n == 2:
-            if axis == "v" and pcb_w_mm > 0:
-                med_align = pcb_w_mm / 2  # PCB center X
-            elif axis == "h" and pcb_h_mm > 0:
-                med_align = pcb_h_mm / 2  # PCB center Y
-            elif axis == "v":
-                med_align = statistics.median([p["cx"] for p in grp])
-            else:
-                med_align = statistics.median([p["cy"] for p in grp])
+        #    Use median of the group's actual detected positions on the
+        #    alignment axis.  (Previously, 2-pad groups were snapped to
+        #    PCB center, but that broke cases where aligned pads are
+        #    offset from center — e.g. side-by-side terminal columns or
+        #    ID+TH pairs near an edge.)
+        if axis == "v":
+            med_align = statistics.median([p["cx"] for p in grp])
         else:
-            if axis == "v":
-                med_align = statistics.median([p["cx"] for p in grp])
-            else:
-                med_align = statistics.median([p["cy"] for p in grp])
+            med_align = statistics.median([p["cy"] for p in grp])
 
         # 3) For 3+ pads: check uniform spacing along the other axis
         target_positions = None  # per-pad target along free axis
@@ -785,13 +1089,95 @@ def _align_pad_groups(result, pixels_per_mm=1.0, pcb_w_mm=0.0, pcb_h_mm=0.0):
                 coords = [p["cx"] for p in ordered]
 
             gaps = [coords[i+1] - coords[i] for i in range(n - 1)]
+            if len(gaps) == 0:
+                continue
             med_gap = statistics.median(gaps)
-            # If all gaps within 25% of median → enforce uniform spacing
-            if med_gap > 0 and all(abs(g - med_gap) / med_gap < 0.25 for g in gaps):
-                start = coords[0]
-                target_positions = {}
-                for idx_p, p in enumerate(ordered):
-                    target_positions[id(p)] = start + idx_p * med_gap
+
+            # ═══ Enforce minimum spacing: pads within a group MUST NOT overlap ═══
+            # The uniform pad size along the free axis is med_h (vertical group)
+            # or med_w (horizontal group).  Spacing between centres must be at
+            # least the pad size so that adjacent pads do not overlap.
+            pad_size_along_free = med_h if axis == "v" else med_w
+            if med_gap < pad_size_along_free:
+                # Unrealistically tight spacing — likely caused by an outlier
+                # dragging the median down.  Fall back to the maximum gap to
+                # preserve the larger, more plausible spacing, but never let
+                # it drop below the pad size.
+                max_gap = max(gaps)
+                if max_gap >= pad_size_along_free:
+                    med_gap = max_gap
+                else:
+                    med_gap = pad_size_along_free
+                logger.info(
+                    "Align(%s): median gap %.3f < pad size %.3f → bumped to %.3f",
+                    axis, statistics.median(gaps), pad_size_along_free, med_gap,
+                )
+
+            # For 4+ pads in a column/row, try splitting at the spatial
+            # midpoint into two natural halves (e.g. top vs bottom for a
+            # vertical group). This uses pure spatial proximity — no labels.
+            # Each half gets independent uniform spacing.
+            clusters = [ordered]
+            if n >= 4:
+                mid = (coords[0] + coords[-1]) / 2
+                top_half = [p for p in ordered
+                            if (p["cy"] if axis == "v" else p["cx"]) < mid]
+                bot_half = [p for p in ordered
+                            if (p["cy"] if axis == "v" else p["cx"]) >= mid]
+                if len(top_half) >= 2 and len(bot_half) >= 2:
+                    clusters = [top_half, bot_half]
+
+            # For each cluster, enforce uniform spacing independently
+            target_positions = {}
+            for cluster in clusters:
+                cn = len(cluster)
+                if cn >= 2:
+                    if axis == "v":
+                        cl_ordered = sorted(cluster, key=lambda p: p["cy"])
+                        cl_coords = [p["cy"] for p in cl_ordered]
+                    else:
+                        cl_ordered = sorted(cluster, key=lambda p: p["cx"])
+                        cl_coords = [p["cx"] for p in cl_ordered]
+                    if cn >= 3:
+                        cl_gaps = [cl_coords[i+1] - cl_coords[i] for i in range(cn - 1)]
+                        cl_med_gap = statistics.median(cl_gaps)
+
+                        # ═══ Cluster-level minimum spacing ═══
+                        # Pads within a cluster must not overlap.  The uniform
+                        # pad size along the free axis sets the absolute floor.
+                        cl_pad_size = med_h if axis == "v" else med_w
+                        cl_min_gap = cl_pad_size + 0.15  # at least 0.15 mm visual gap
+                        if cl_med_gap < cl_min_gap:
+                            # Try max gap first; if it fits the cluster span, use it.
+                            cl_max_gap = max(cl_gaps)
+                            span = cl_coords[-1] - cl_coords[0]
+                            max_fit = span / (cn - 1)
+                            if cl_max_gap >= cl_min_gap and cl_max_gap <= max_fit:
+                                cl_med_gap = cl_max_gap
+                            elif max_fit >= cl_pad_size:
+                                # Can't fit with ideal gap, but at least avoid overlap
+                                cl_med_gap = max_fit
+                            else:
+                                # Physically impossible to fit cn pads without overlap.
+                                # Keep original positions — uniform spacing would lie.
+                                logger.warning(
+                                    "Align cluster(%s): can't fit %d pads in span %.2f "
+                                    "(pad=%.2f) — keeping original positions",
+                                    axis, cn, span, cl_pad_size,
+                                )
+                                cl_med_gap = 0  # skip uniform spacing
+
+                        if cl_med_gap > 0:
+                            start = cl_coords[0]
+                            for idx_p, p in enumerate(cl_ordered):
+                                target_positions[id(p)] = start + idx_p * cl_med_gap
+                    elif cn == 2:
+                        actual_mid = (cl_coords[0] + cl_coords[1]) / 2
+                        half_gap = abs(cl_coords[0] - cl_coords[1]) / 2
+                        first = cl_ordered[0]
+                        second = cl_ordered[1]
+                        target_positions[id(first)] = actual_mid - half_gap
+                        target_positions[id(second)] = actual_mid + half_gap
 
         # 3b) For exactly 2 pads on the free axis:
         #     Symmetrize about the ACTUAL detected midpoint (optimal fit).
@@ -872,6 +1258,29 @@ def _align_pad_groups(result, pixels_per_mm=1.0, pcb_w_mm=0.0, pcb_h_mm=0.0):
         # Clamp to valid range
         grp_radius_mm = max(0.05, min(grp_radius_mm, min(med_w, med_h) / 2))
 
+        # ── CV-refined position preservation ──
+        # If CV refine shifted any pad in this group by ≥ 0.25 mm, its
+        # position is more trustworthy than VLM's raw coordinate.  Those
+        # pads become group anchors — the remaining pads snap to their
+        # median, NOT the overall median (which is still polluted by
+        # unrefined VLM positions).
+        cv_refined_cxs: list[float] = []
+        for p in grp:
+            shift_mm = p["cand"].get("_cv_shift_mm", 0)
+            if shift_mm >= 0.25:
+                # Use the CURRENT center (already shifted by CV refine)
+                cv_refined_cxs.append(p["cx"])
+
+        if cv_refined_cxs:
+            # Recompute alignment anchor from CV-refined positions only
+            cv_med = statistics.median(cv_refined_cxs)
+            logger.info(
+                "Align(%s): using CV-refined anchor X=%.3f (from %d pads) "
+                "instead of group median %.3f",
+                axis, cv_med, len(cv_refined_cxs), med_align,
+            )
+            med_align = cv_med
+
         # 5) Apply corrections to each pad in the group
         #    Position logic:
         #    - Alignment axis: snap to group median (pads are aligned)
@@ -935,12 +1344,15 @@ def _align_pad_groups(result, pixels_per_mm=1.0, pcb_w_mm=0.0, pcb_h_mm=0.0):
 
 
 @app.post("/api/vision/detect-terminals")
-def detect_terminals(calibration_id: str = Form(...), side: str = Form(...)):
+def detect_terminals(calibration_id: str = Form(...), side: str = Form(...),
+                     debug: str = Form("false")):
     """Detect terminal candidates using VLM identification on cropped PCB.
 
     For transparent PCB: crop to PCB bounding box so the board fills the entire
     image. This eliminates the Y-offset problem caused by PCB floating in white
     space. VLM coordinates are then offset back to full-frame mm.
+
+    Set debug=true to receive intermediate detection stage snapshots.
     """
     if len(calibration_id) != 32 or any(character not in "0123456789abcdef" for character in calibration_id):
         raise DesignError("INVALID_CALIBRATION_ID", "The calibration id is invalid.")
@@ -1048,9 +1460,12 @@ def detect_terminals(calibration_id: str = Form(...), side: str = Form(...)):
                     # RGBA crop with clean mask for CV refinement
                     pcb_img_rgba = cropped.copy()
                     pcb_img_rgba[:, :, 3] = binary_mask
-                    # Upscale 2x for better VLM recognition
+                    # Upscale 2x for better VLM recognition.
+                    # LINEAR preserves sharp copper-pad edges better than CUBIC
+                    # (important for small pads where cubic interpolation blurs
+                    # the pad→background transition).
                     upscaled = cv2.resize(composited, None, fx=2.0, fy=2.0,
-                                          interpolation=cv2.INTER_CUBIC)
+                                          interpolation=cv2.INTER_LINEAR)
                     _, buf = cv2.imencode(".png", upscaled)
                     img_for_vlm = buf.tobytes()
                     # PCB dimensions in mm (this IS the coordinate reference frame)
@@ -1068,6 +1483,35 @@ def detect_terminals(calibration_id: str = Form(...), side: str = Form(...)):
     result = _vlm_detect(img_for_vlm, crop_w_mm, crop_h_mm, side, is_transparent,
                          img_w_px=img_w_px, img_h_px=img_h_px)
 
+    # ── Diagnostically save the VLM input image for debugging ──
+    _save_vlm_input_for_debug(img_for_vlm, side, calibration_id)
+
+    # ── Warn if VLM missed small pads (rely on geometric estimation) ──
+    _warn_incomplete_vlm_result(result, side)
+
+    # ── Debug helper for app-level stages ──
+    is_debug = debug.lower() in ("true", "1", "yes")
+    app_debug_stages: list[dict] = []
+
+    def _app_debug_snapshot(label: str, res: dict):
+        if not is_debug:
+            return
+        cands = res.get("candidates", [])
+        app_debug_stages.append({
+            "stage": label,
+            "count": len(cands),
+            "candidates": [{
+                "label": c.get("label", ""),
+                "x_mm": c.get("visible_position", {}).get("x_mm"),
+                "y_mm": c.get("visible_position", {}).get("y_mm"),
+                "width_mm": c.get("width_mm"),
+                "height_mm": c.get("height_mm"),
+                "confidence": c.get("confidence"),
+                "source": c.get("visible_region", {}).get("source", c.get("matched_regions", [{}])[0].get("source", "vlm") if c.get("matched_regions") else "vlm"),
+                "diagnostic_verified": c.get("diagnostic_verified", ""),
+            } for c in cands],
+        })
+
     # ── CV position refinement on the PCB image (not the full transparent image) ──
     try:
         # Use RGBA crop if available (alpha channel masks non-PCB areas)
@@ -1082,6 +1526,7 @@ def detect_terminals(calibration_id: str = Form(...), side: str = Form(...)):
                 result = _refine_positions_cv(result, img_for_refine, pixels_per_mm)
     except Exception:
         logger.warning("CV position refinement failed, using VLM positions", exc_info=True)
+    _app_debug_snapshot("step5_after_cv_refine", result)
 
     # ── Group alignment correction (PCB layout symmetry) ──
     try:
@@ -1089,6 +1534,16 @@ def detect_terminals(calibration_id: str = Form(...), side: str = Form(...)):
                                      crop_w_mm, crop_h_mm)
     except Exception:
         logger.warning("Pad group alignment failed", exc_info=True)
+    # ── Clamp all pad polygons to PCB boundary ──
+    _clamp_pads_to_board(result, crop_w_mm, crop_h_mm)
+    _app_debug_snapshot("step6_after_align_groups", result)
+
+    # ── Debug stages: merge VLM + App snapshots, or strip them ──
+    if is_debug:
+        vlm_stages = result.pop("_debug_stages", [])
+        result["_debug_stages"] = vlm_stages + app_debug_stages
+    else:
+        result.pop("_debug_stages", None)
 
     # Add coordinate system metadata
     result["method_used"] = "vlm+cv_refine"
@@ -1214,6 +1669,241 @@ def detect_terminals(calibration_id: str = Form(...), side: str = Form(...)):
     return result
 
 
+@app.post("/api/vision/verify-pad-regions")
+def verify_pad_regions(calibration_id: str = Form(...), side: str = Form(...)):
+    """AI visual inspection: verify each detected pad's cropped region with VLM.
+
+    For each pad candidate in terminal-candidates.json, crop the calibrated
+    PCB image around the pad's polygon and send it to VLM for quality verification.
+    Detects issues like: pad spanning multiple real pads, non-pad area captured,
+    pad mostly outside PCB, etc.
+
+    Returns:
+        {
+            "verified": int,
+            "failed": int,
+            "results": [{"label", "ok", "issues", "confidence"}, ...],
+        }
+    """
+    import cv2
+    import numpy as np
+    from PIL import Image
+    import io
+
+    calib_dir = WORK_ROOT / "calibrations" / calibration_id
+    if not calib_dir.exists():
+        raise HTTPException(404, "Calibration directory not found")
+    candidates_file = calib_dir / "terminal-candidates.json"
+    if not candidates_file.exists():
+        raise HTTPException(404, "terminal-candidates.json not found")
+
+    result = json.loads(candidates_file.read_text(encoding="utf-8"))
+
+    # Load calibrated image (transparent PCB image)
+    transparent_path = calib_dir / "transparent.png"
+    if not transparent_path.exists():
+        transparent_path = calib_dir / "calibrated.png"
+    if not transparent_path.exists():
+        raise HTTPException(400, "No calibrated PCB image found")
+
+    pcb_img = cv2.imread(str(transparent_path), cv2.IMREAD_UNCHANGED)
+    if pcb_img is None:
+        raise HTTPException(400, "Failed to read calibrated PCB image")
+
+    h_img, w_img = pcb_img.shape[:2]
+    coord_sys = result.get("coordinate_system", {})
+    pcb_w_mm = coord_sys.get("pcb_width_mm", 0)
+    pcb_h_mm = coord_sys.get("pcb_height_mm", 0)
+    crop_offset = coord_sys.get("crop_offset_mm", {"x": 0.0, "y": 0.0})
+    offset_x_mm = float(crop_offset.get("x", 0.0))
+    offset_y_mm = float(crop_offset.get("y", 0.0))
+
+    # Use the stored pixels_per_mm from the calibration metadata (not w_img / pcb_w_mm)
+    # The image PPM is determined by the calibration rectification, and crop_offset_mm
+    # was computed using this same PPM.
+    cal_meta_path = calib_dir / "calibration.json"
+    ppm = w_img / pcb_w_mm  # fallback
+    if cal_meta_path.exists():
+        try:
+            cal_meta = json.loads(cal_meta_path.read_text(encoding="utf-8"))
+            _ppm = cal_meta.get("pixels_per_mm", 0)
+            if _ppm > 0:
+                ppm = float(_ppm)
+        except Exception:
+            pass
+    if pcb_w_mm <= 0 or pcb_h_mm <= 0:
+        raise HTTPException(400, "PCB dimensions not found in terminal-candidates.json")
+
+    candidates = result.get("candidates", [])
+    verification_results = []
+    verified_count = 0
+    failed_count = 0
+
+    for cand in candidates:
+        label = cand.get("label", "?")
+        regions = cand.get("matched_regions", [])
+        if not regions:
+            verification_results.append({
+                "label": label, "ok": False, "single_pad": False,
+                "issues": ["No matched_regions"],
+                "confidence": 0.0, "error": "no_regions",
+            })
+            failed_count += 1
+            continue
+
+        # Take the first region's polygon
+        region = regions[0]
+        poly = region.get("polygon", [])
+        if len(poly) < 3:
+            verification_results.append({
+                "label": label, "ok": False, "single_pad": False,
+                "issues": ["Invalid polygon"],
+                "confidence": 0.0, "error": "bad_polygon",
+            })
+            failed_count += 1
+            continue
+
+        xs = [v["x_mm"] for v in poly]
+        ys = [v["y_mm"] for v in poly]
+        x1_mm, y1_mm = min(xs), min(ys)
+        x2_mm, y2_mm = max(xs), max(ys)
+
+        # ═══ Ensure minimum crop size for VLM visibility ═══
+        # For very small pads (< 1 mm) at ~25 px/mm the crop image can be
+        # < 30 px across — too low-res for any VLM.  Enforce a floor so the
+        # VLM has at least ~25 px to work with in each direction.
+        # The expansion uses the polygon centre as the anchor.
+        MIN_CROP_MM = 1.0  # ≈ 25 px at typical calibration PPM
+        cx_mm = (x1_mm + x2_mm) / 2
+        cy_mm = (y1_mm + y2_mm) / 2
+        pad_w_mm = max(x2_mm - x1_mm, MIN_CROP_MM)
+        pad_h_mm = max(y2_mm - y1_mm, MIN_CROP_MM)
+
+        # Expand bounding box for context — must be TIGHT:
+        # In dense P+/P- arrays the polygon-to-polygon gap can be ≤0.35 mm.
+        # A margin of 0.12 mm leaves only 0.11 mm between adjacent crops
+        # (~3 px) — enough to avoid VLM seeing a sliver of the neighbour.
+        #   margin = smaller_side × 0.08, hard-capped at 0.12 mm
+        base_margin = min(0.12, min(pad_w_mm, pad_h_mm) * 0.08)
+        # ── Edge-aware clamping ──
+        # When a pad is within 1.0 mm of the board edge, reduce the margin
+        # on that side to 0.03 mm.  This avoids pulling in copper-pour or
+        # substrate features from beyond the pad that VLM might misidentify
+        # as additional pads.
+        edge_near = 1.0  # threshold for "near board edge"
+        ml = mr = mt = mb = base_margin  # left, right, top, bottom
+        pad_left   = cx_mm - pad_w_mm / 2
+        pad_right  = cx_mm + pad_w_mm / 2
+        pad_top    = cy_mm - pad_h_mm / 2
+        pad_bottom = cy_mm + pad_h_mm / 2
+        if pad_right >= pcb_w_mm - edge_near:
+            mr = 0.03
+        if pad_left <= edge_near:
+            ml = 0.03
+        if pad_bottom >= pcb_h_mm - edge_near:
+            mb = 0.03
+        if pad_top <= edge_near:
+            mt = 0.03
+        x1_mm = max(0, pad_left - ml)
+        y1_mm = max(0, pad_top - mt)
+        x2_mm = min(pcb_w_mm, pad_right + mr)
+        y2_mm = min(pcb_h_mm, pad_bottom + mb)
+
+        pad_w_mm = x2_mm - x1_mm
+        pad_h_mm = y2_mm - y1_mm
+        if pad_w_mm < 0.5 or pad_h_mm < 0.5:
+            verification_results.append({
+                "label": label, "ok": False, "single_pad": False,
+                "issues": ["Pad region too small / degenerate"],
+                "confidence": 0.0, "error": "too_small",
+            })
+            failed_count += 1
+            continue
+
+        # Crop the calibrated image (pad coords are relative to PCB crop, add offset)
+        x1_px = int((x1_mm + offset_x_mm) * ppm)
+        y1_px = int((y1_mm + offset_y_mm) * ppm)
+        x2_px = int((x2_mm + offset_x_mm) * ppm)
+        y2_px = int((y2_mm + offset_y_mm) * ppm)
+        x1_px = max(0, min(w_img - 1, x1_px))
+        y1_px = max(0, min(h_img - 1, y1_px))
+        x2_px = max(x1_px + 1, min(w_img, x2_px))
+        y2_px = max(y1_px + 1, min(h_img, y2_px))
+
+        crop = pcb_img[y1_px:y2_px, x1_px:x2_px]
+
+        # If image has alpha channel, composite over white
+        if len(crop.shape) == 3 and crop.shape[2] == 4:
+            alpha = crop[:, :, 3:4].astype(np.float32) / 255.0
+            bgr = crop[:, :, :3].astype(np.float32)
+            white = np.full_like(bgr, 255.0, dtype=np.float32)
+            crop_render = (bgr * alpha + white * (1.0 - alpha)).astype(np.uint8)
+        else:
+            if len(crop.shape) == 3:
+                crop_render = crop[:, :, :3]
+            else:
+                crop_render = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+
+        # Encode crop as PNG bytes
+        _, crop_buf = cv2.imencode(".png", crop_render)
+        crop_bytes = crop_buf.tobytes()
+
+        # Call VLM for verification
+        try:
+            v_result = _verify_pad_crop(crop_bytes, label, pad_w_mm, pad_h_mm)
+        except Exception as exc:
+            logger.error(f"Pad verification VLM error for {label}: {exc}")
+            v_result = {
+                "ok": False, "single_pad": False,
+                "issues": [f"VLM call error: {exc}"],
+                "confidence": 0.0,
+            }
+
+        # ── CV metal override ──
+        # When VLM says "no metallic pad visible" but CV finds substantial
+        # metal pixels in the same crop, override VLM's judgment.  This
+        # compensates for VLM's tendency to misread silkscreen-adjacent crops
+        # where the metal pad IS present but its visual appearance doesn't
+        # match VLM's expectation of "shiny silver/gold pad."
+        if not v_result.get("ok") and any(w in " ".join(v_result.get("issues", [])).lower()
+                                          for w in ("metal", "pad", "solder", "silkscreen")):
+            # Quick CV check: detect metal pixels in this crop
+            crop_hsv = cv2.cvtColor(crop_render, cv2.COLOR_BGR2HSV)
+            cv_metal = cv2.inRange(crop_hsv, np.array([0, 0, 40]), np.array([180, 80, 250]))
+            cv_metal_pct = np.count_nonzero(cv_metal) / max(cv_metal.size, 1)
+            # ID/TH/T/NTC/N are tiny pads (1-3mm); VLM almost always puts their
+            # polygon on silkscreen text.  Accept them at a lower threshold —
+            # if there is at least 2% metal and the structural alignment passed,
+            # the pad position is correct enough.
+            small_label_thresh = 0.02 if label.upper() in ("ID", "TH", "T", "NTC", "N") else 0.05
+            if cv_metal_pct > small_label_thresh:
+                logger.info(
+                    "Pad %s: VLM said no metal but CV found %.1f%% metal pixels → override to pass",
+                    label, cv_metal_pct * 100,
+                )
+                v_result["ok"] = True
+                v_result["single_pad"] = True
+                v_result["issues"] = []
+                v_result["confidence"] = 0.50
+                v_result["_cv_override"] = True
+
+        v_result["label"] = label
+        if v_result.get("ok"):
+            verified_count += 1
+        else:
+            failed_count += 1
+            logger.warning(f"Pad {label}: VLM verification FAILED — issues={v_result.get('issues')}")
+
+        verification_results.append(v_result)
+
+    return {
+        "verified": verified_count,
+        "failed": failed_count,
+        "total": len(candidates),
+        "results": verification_results,
+    }
+
+
 def _cv_find_metallic_pads(transparent_png: bytes, width_mm: float, height_mm: float,
                            pixels_per_mm: float) -> list[dict]:
     """Find metallic solder pads on transparent PCB using CV thresholding.
@@ -1314,6 +2004,18 @@ def _match_vlm_to_cv(candidates: list[dict], cv_pads: list[dict]):
     n_cand = len(candidates)
     n_pads = len(cv_pads)
 
+    # Compute adaptive match threshold from spatial extent of all points
+    all_xs = [c.get("visible_region", {}).get("center", {}).get("x_mm", 0) for c in candidates]
+    all_ys = [c.get("visible_region", {}).get("center", {}).get("y_mm", 0) for c in candidates]
+    for pad in cv_pads:
+        all_xs.append(pad["center_mm"][0])
+        all_ys.append(pad["center_mm"][1])
+    if all_xs and all_ys:
+        spatial_spread = max(max(all_xs) - min(all_xs), max(all_ys) - min(all_ys), 1.0)
+        max_match_dist = spatial_spread * 0.25  # 25% of spatial extent
+    else:
+        max_match_dist = 15.0
+
     # Compute all (distance, cand_idx, pad_idx) pairs
     pairs = []
     for ci, cand in enumerate(candidates):
@@ -1337,7 +2039,7 @@ def _match_vlm_to_cv(candidates: list[dict], cv_pads: list[dict]):
     for dist, ci, pi in pairs:
         if ci in used_cands or pi in used_pads:
             continue
-        if dist > 15.0:  # too far, not a valid match
+        if dist > max_match_dist:  # too far, not a valid match
             break
         assignments[ci] = pi
         used_cands.add(ci)
@@ -1594,8 +2296,8 @@ def api_contour_match(front_calibration_id: str = Form(...),
     if not isinstance(back_ol, list) or len(back_ol) < 3:
         raise HTTPException(status_code=400, detail="Back outline data missing or incomplete")
 
-    w_mm = max(front_meta.get("frame_w_mm", 60.0), back_meta.get("frame_w_mm", 60.0))
-    h_mm = max(front_meta.get("frame_h_mm", 40.0), back_meta.get("frame_h_mm", 40.0))
+    w_mm = max(front_meta.get("frame_w_mm", 40.0), back_meta.get("frame_w_mm", 40.0))
+    h_mm = max(front_meta.get("frame_h_mm", 25.0), back_meta.get("frame_h_mm", 25.0))
 
     steps = [
         {"side": "front", "calibration_success": True,
@@ -1859,24 +2561,25 @@ def _contour_to_points(ol_mm):
     return np.array(pts, dtype=np.float32) if pts else None
 
 
-def _simplify_polygon_dp(pts_mm, epsilon_mm=2.0):
+def _simplify_polygon_dp(pts_mm, epsilon_mm=None):
     """Douglas-Peucker polygon simplification — keep only main shape vertices.
 
     The raw HSV-mask contour has dozens/hundreds of vertices, many of which are
     shadow-noise artifacts.  A real PCB has a clean geometric outline with ~6–20
     significant corners.  This function strips the noise before Chamfer matching.
 
-    epsilon_mm:  minimum allowed deviation in mm.  Default 2.0 mm ensures even
-                 moderate shadow burrs (2-5mm deviation) are merged into the
-                 main polygon edge, not preserved as separate vertices.
-                 Adaptive floor = max(2.0, 1.2% of perimeter) scales for any size.
+    epsilon_mm:  minimum allowed deviation in mm.  When not provided, defaults
+                 to 3% of the polygon's bounding-box diagonal, which scales with
+                 PCB size.  Adaptive floor = 1.2% of perimeter.
     """
     if len(pts_mm) < 4:
         return pts_mm
+    if epsilon_mm is None:
+        bbox_w = float(pts_mm[:, 0].max() - pts_mm[:, 0].min())
+        bbox_h = float(pts_mm[:, 1].max() - pts_mm[:, 1].min())
+        epsilon_mm = max(bbox_w, bbox_h) * 0.03  # proportional to PCB extent
     peri_mm = cv2.arcLength(pts_mm.reshape(-1, 1, 2), True)
-    # Adaptive epsilon: max(2.0mm floor, 1.2% of perimeter).
-    # e.g. 200mm PCB → 2.4mm eps (aggressive against shadow burrs)
-    # e.g.  80mm PCB → 2.0mm eps (still removes typical 2-5mm noise)
+    # Adaptive epsilon: max(proportional floor, 1.2% of perimeter).
     eps = max(epsilon_mm, peri_mm * 0.012)
     simplified = cv2.approxPolyDP(
         pts_mm.reshape(-1, 1, 2), eps, True).reshape(-1, 2)
@@ -1887,7 +2590,7 @@ def _simplify_polygon_dp(pts_mm, epsilon_mm=2.0):
     return simplified if len(simplified) >= 3 else pts_mm
 
 
-def _prune_hull_burrs(pts_mm, min_depth_mm=1.5, max_width_mm=8.0):
+def _prune_hull_burrs(pts_mm, min_depth_mm=None, max_width_mm=None):
     """Remove narrow deep dents (shadow burrs) from polygon vertices.
 
     After DP simplification, small-scale shadow burrs may still survive as
@@ -1902,6 +2605,13 @@ def _prune_hull_burrs(pts_mm, min_depth_mm=1.5, max_width_mm=8.0):
     """
     if len(pts_mm) < 5:
         return pts_mm
+    bbox_w = float(pts_mm[:, 0].max() - pts_mm[:, 0].min())
+    bbox_h = float(pts_mm[:, 1].max() - pts_mm[:, 1].min())
+    bbox_dim = max(bbox_w, bbox_h)
+    if min_depth_mm is None:
+        min_depth_mm = max(bbox_dim * 0.02, 0.5)   # 2% of bbox, min 0.5mm
+    if max_width_mm is None:
+        max_width_mm = max(bbox_dim * 0.12, 2.0)    # 12% of bbox, min 2.0mm
     n = len(pts_mm)
     keep = [True] * n
     removed = 0
@@ -1951,7 +2661,7 @@ def _prune_hull_burrs(pts_mm, min_depth_mm=1.5, max_width_mm=8.0):
     return pts_mm
 
 
-def _extract_straight_edges(pts_mm, min_length_mm=5.0):
+def _extract_straight_edges(pts_mm, min_length_mm=None):
     """Extract long straight edge segments from a DP-simplified polygon.
 
     Each segment is a pair of consecutive vertices. Segments shorter than
@@ -1959,12 +2669,16 @@ def _extract_straight_edges(pts_mm, min_length_mm=5.0):
     not real PCB physical edges. Returns metadata needed for alignment scoring:
     direction, normal, midpoint, and projection range.
 
-    Returns:
-        list of dict: [{p1, p2, length, direction, normal, midpoint}, ...]
+    When min_length_mm is not provided, it defaults to 10% of the polygon's
+    smaller bbox dimension (min 1.5mm), which scales with PCB size.
     """
     n = len(pts_mm)
     if n < 3:
         return []
+    if min_length_mm is None:
+        bbox_w = float(pts_mm[:, 0].max() - pts_mm[:, 0].min())
+        bbox_h = float(pts_mm[:, 1].max() - pts_mm[:, 1].min())
+        min_length_mm = max(min(bbox_w, bbox_h) * 0.10, 1.5)
     edges = []
     for i in range(n):
         p1 = pts_mm[i]
@@ -1990,7 +2704,7 @@ def _extract_straight_edges(pts_mm, min_length_mm=5.0):
 
 def _score_straight_edge_align(front_edges, back_pts, dx_mm, dy_mm,
                                 angle_cos_th=0.966, max_dist_mm=2.0,
-                                min_overlap=0.3, min_length_mm=5.0):
+                                min_overlap=0.3, min_length_mm=None):
     """Score a candidate (dx, dy) translation by straight-edge alignment quality.
 
     PCB physical edges are straight — unlike shadow-generated jagged edges.
@@ -2197,7 +2911,8 @@ def _merge_front_back_outlines(front_ol, back_ol, w_mm, h_mm,
     # Two-pass coarse→fine: (±5mm @ 0.5mm step) → (±1mm @ 0.1mm step)
 
     # Pre-extract front straight edges (fixed reference, computed once)
-    front_edges = _extract_straight_edges(front_pts, min_length_mm=5.0)
+    # min_length_mm defaults to 10% of polygon's smaller bbox dimension
+    front_edges = _extract_straight_edges(front_pts)
     logger.info("Front straight edges: %d segments", len(front_edges))
 
     best_dx_px, best_dy_px = 0, 0
@@ -2415,8 +3130,8 @@ def _compare_front_back_contours(steps):
     # reference).  Returns areas computed from the mask — i.e. the SAME
     # processing pipeline for all three numbers, unlike raw contour areas
     # which come from a different computation path.
-    w_mm = steps[0].get("frame_w_mm", 60.0) if steps else 60.0
-    h_mm = steps[0].get("frame_h_mm", 40.0) if steps else 40.0
+    w_mm = steps[0].get("frame_w_mm", 40.0) if steps else 40.0
+    h_mm = steps[0].get("frame_h_mm", 25.0) if steps else 25.0
     merged_outline, f_area, b_area, merged_area = _merge_front_back_outlines(
         front_ol, back_ol, w_mm, h_mm, front_ppm, back_ppm)
 
@@ -2461,8 +3176,8 @@ def _compare_front_back_contours(steps):
 
 @app.post("/api/simulate")
 def simulate(
-    frame_w_mm: float = Form(60.0),
-    frame_h_mm: float = Form(30.0),
+    frame_w_mm: float = Form(40.0),
+    frame_h_mm: float = Form(25.0),
 ):
     """Auto-test: run black frame detection + calibration on input/front.jpg and input/back.jpg.
 
@@ -2592,8 +3307,8 @@ def simulate(
 @app.post("/api/vision/preview-black-frame")
 def preview_black_frame(
     file: UploadFile = File(...),
-    frame_w_mm: float = Form(60.0),
-    frame_h_mm: float = Form(30.0),
+    frame_w_mm: float = Form(40.0),
+    frame_h_mm: float = Form(25.0),
 ):
     """Detect the black frame in an uploaded photo and return an annotated preview."""
     img_buf = file.file.read()
@@ -2605,8 +3320,8 @@ def preview_black_frame(
 @app.post("/api/vision/calibrate-black-frame")
 def calibrate_black_frame_endpoint(
     file: UploadFile = File(...),
-    frame_w_mm: float = Form(60.0),
-    frame_h_mm: float = Form(30.0),
+    frame_w_mm: float = Form(40.0),
+    frame_h_mm: float = Form(25.0),
 ):
     """Detect black frame, compute perspective rectification, save calibration.
 

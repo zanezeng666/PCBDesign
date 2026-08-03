@@ -26,6 +26,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import os
 import re
 
@@ -45,6 +46,10 @@ MODEL_NAME = "qwen3.7-plus"
 TEMPERATURE = 0.05
 MAX_TOKENS = 2048
 ENABLE_THINKING = False  # Disable thinking mode for deterministic pad detection
+
+# Tolerance (in mm) for P+/P- pads sharing the same x-column during symmetry retry.
+# Pads within this horizontal distance are considered in the same column.
+_SYMMETRY_COLUMN_TOLERANCE_MM = 2.0
 
 # Labels we care about
 TARGET_LABELS = {
@@ -104,6 +109,55 @@ def detect_with_vlm(
     candidates = _parse_vlm_response(raw, width_mm, height_mm, side)
     _log.info("VLM returned %d candidates for side %r", len(candidates), side)
 
+    # ── Debug snapshot helper ──
+    _debug_stages: list[dict] = []
+
+    def _snapshot(label: str, cands: list[dict]):
+        _debug_stages.append({
+            "stage": label,
+            "count": len(cands),
+            "candidates": [_pad_for_debug(c) for c in cands],
+        })
+
+    def _pad_for_debug(pad: dict) -> dict:
+        """Extract key fields from a pad for debug output."""
+        vp = pad.get("visible_position", {})
+        vr = pad.get("visible_region", {})
+        mr = (pad.get("matched_regions") or [{}])[0]
+        return {
+            "label": pad.get("label", ""),
+            "x_mm": vp.get("x_mm"),
+            "y_mm": vp.get("y_mm"),
+            "width_mm": pad.get("width_mm"),
+            "height_mm": pad.get("height_mm"),
+            "confidence": pad.get("confidence"),
+            "source": vr.get("source", mr.get("source", "vlm")),
+            "diagnostic_verified": pad.get("diagnostic_verified", ""),
+        }
+
+    _snapshot("step1_vlm_raw", candidates)
+
+    # ── Symmetry check: if P+/P- counts are asymmetric in the same column, retry ──
+    pre_sym_n = len(candidates)
+    candidates = _symmetry_fill_missing(
+        rectified_png, width_mm, height_mm, candidates,
+        img_w_px=img_w_px, img_h_px=img_h_px,
+    )
+    _log.info("After symmetry_fill: %d → %d candidates", pre_sym_n, len(candidates))
+    _snapshot("step2_after_symmetry", candidates)
+
+    # ── Safety net: remove P+/P- outliers not in the main x-column ──
+    pre_filter_n = len(candidates)
+    candidates = _filter_pp_pn_column_outliers(candidates, width_mm, height_mm)
+    _log.info("After column_outlier_filter: %d → %d candidates", pre_filter_n, len(candidates))
+    _snapshot("step3_after_outlier_filter", candidates)
+
+    # ── Final geometric inference: fill any remaining P+/P- asymmetry ──
+    _log.info("Calling geometric_fill_missing with %d candidates", len(candidates))
+    candidates = _geometric_fill_missing(candidates, width_mm, height_mm)
+    _log.info("After geometric_fill_missing: %d candidates", len(candidates))
+    _snapshot("step4_after_geometric", candidates)
+
     return {
         "side": side,
         "width_mm": width_mm,
@@ -113,7 +167,634 @@ def detect_with_vlm(
         "annotated_png_base64": "",  # frontend draws its own overlay
         "method": "vlm+qwen3.7-plus",
         "notice": "VLM 视觉识别结果；请逐项人工确认。",
+        "_debug_stages": _debug_stages,
     }
+
+
+# ── Post-detection symmetry check ───────────────────────────────────
+
+_SYMMETRY_MIN_RATIO = 0.5  # min ratio for retry (at least 50% of major count found)
+
+
+def _compute_column_tolerance(width_mm: float, height_mm: float) -> float:
+    """Column tolerance proportional to PCB dimensions.
+    
+    Pads in the same column (same P+/P- side) typically share a similar
+    x-coordinate. The tolerance is proportional to the smaller PCB dimension
+    (usually ~6%), with a 1.0mm minimum for very small PCBs.
+    """
+    return max(min(width_mm, height_mm) * 0.06, 1.0)
+
+def _symmetry_fill_missing(
+    png_bytes: bytes,
+    width_mm: float,
+    height_mm: float,
+    candidates: list[dict],
+    img_w_px: int = 0,
+    img_h_px: int = 0,
+) -> list[dict]:
+    """Post-detection symmetry check for P+/P- pad counts.
+
+    If the VLM detected more P+ than P- (or vice versa) and they appear
+    to share the same vertical column, run a *targeted* retry focused
+    on the region where the missing pads most likely reside.
+    """
+    p_plus_all = [c for c in candidates if c["label"] == "P+"]
+    p_minus_all = [c for c in candidates if c["label"] == "P-"]
+
+    # ── Column clustering: filter out isolated false positives ──
+    # P+/P- pads should cluster at specific x-coordinates on the board edges.
+    # Isolated pads at completely different x positions (VLM noise) are removed
+    # before symmetry analysis.
+    col_tol = _compute_column_tolerance(width_mm, height_mm)
+    def _cluster_by_x(pads: list[dict], eps: float = None) -> list[list[dict]]:
+        if eps is None:
+            eps = col_tol
+        """DBSCAN-like 1D clustering by x-coordinate."""
+        if not pads:
+            return []
+        sorted_pads = sorted(pads, key=lambda c: c["visible_position"]["x_mm"])
+        clusters = []
+        current = [sorted_pads[0]]
+        for p in sorted_pads[1:]:
+            if p["visible_position"]["x_mm"] - current[-1]["visible_position"]["x_mm"] <= eps:
+                current.append(p)
+            else:
+                clusters.append(current)
+                current = [p]
+        clusters.append(current)
+        return clusters
+
+    p_plus_clusters = _cluster_by_x(p_plus_all)
+    p_minus_clusters = _cluster_by_x(p_minus_all)
+
+    # Keep only the largest cluster for each label
+    p_plus = max(p_plus_clusters, key=len) if p_plus_clusters else []
+    p_minus = max(p_minus_clusters, key=len) if p_minus_clusters else []
+
+    # Log if we filtered any outliers
+    n_plus_removed = len(p_plus_all) - len(p_plus)
+    n_minus_removed = len(p_minus_all) - len(p_minus)
+    if n_plus_removed or n_minus_removed:
+        _log.info(
+            "Column filter: removed %d P+ and %d P- outliers (not in main cluster)",
+            n_plus_removed, n_minus_removed,
+        )
+        # Remove outliers from candidates list by position+label match
+        out_keys = set()
+        for c in (p_plus_all + p_minus_all):
+            if c not in p_plus and c not in p_minus:
+                out_keys.add((c["label"], round(c["visible_position"]["x_mm"], 2), round(c["visible_position"]["y_mm"], 2)))
+        candidates = [
+            c for c in candidates
+            if (c["label"], round(c["visible_position"]["x_mm"], 2), round(c["visible_position"]["y_mm"], 2)) not in out_keys
+        ]
+
+    n_plus, n_minus = len(p_plus), len(p_minus)
+
+    # Quick exit: both present and symmetric, or both absent
+    if n_plus == n_minus:
+        return candidates
+    if n_plus == 0 or n_minus == 0:
+        return candidates
+
+    missing_label = "P-" if n_plus > n_minus else "P+"
+    n_expected = max(n_plus, n_minus)
+    n_found = min(n_plus, n_minus)
+
+    _log.info(
+        "Symmetry check: P+=%d, P-=%d (expected symmetric, missing %d %s)",
+        n_plus, n_minus, n_expected - n_found, missing_label,
+    )
+
+    # ── Verify they share the same x column ──
+    all_pads = p_plus + p_minus
+    xs = [c["visible_position"]["x_mm"] for c in all_pads]
+    x_spread = max(xs) - min(xs)
+    if x_spread > col_tol:
+        _log.info("Symmetry skip: x-spread=%.1fmm > tolerance, not same column", x_spread)
+        return candidates
+
+    # ── Build region description for retry ──
+    avg_x = sum(xs) / len(xs)
+    found_ys = sorted(c["visible_position"]["y_mm"] for c in (p_plus + p_minus))
+    y_min, y_max = found_ys[0], found_ys[-1]
+
+    # Infer expected y-range: extend beyond last found pad
+    # If we have N found + M missing, the total span = (N+M-1) * avg_gap
+    if len(found_ys) >= 2:
+        avg_gap = (found_ys[-1] - found_ys[0]) / (len(found_ys) - 1)
+    else:
+        avg_gap = 2.5  # typical pad pitch
+
+    # Extend search region: look beyond the last found pad
+    total_count = n_expected + n_found  # total pads in column
+    expected_span = (total_count - 1) * avg_gap
+
+    if n_plus > n_minus:
+        # P- pads are below P+ → extend downward
+        search_y_min = y_max + avg_gap * 0.5
+        search_y_max = max(height_mm, y_min + expected_span * 1.2)
+    else:
+        # P+ pads are above P- → extend upward
+        search_y_min = max(0, y_max - expected_span * 1.2)
+        search_y_max = y_min - avg_gap * 0.5
+
+    search_y_min = max(0, min(search_y_min, height_mm))
+    search_y_max = max(0, min(search_y_max, height_mm))
+
+    _log.info(
+        "Symmetry retry: searching for %s pads near x=%.1fmm, y ∈ [%.1f, %.1f]mm",
+        missing_label, avg_x, search_y_min, search_y_max,
+    )
+
+    # ── Build targeted retry prompt ──
+    # CRITICAL: All coordinates must be in the SAME system — fractional 0.0–1.0.
+    # Mixing mm and fractional causes VLM coordinate confusion and hallucination.
+    px_w = img_w_px if img_w_px > 0 else int(width_mm * 50)
+    px_h = img_h_px if img_h_px > 0 else int(height_mm * 50)
+    avg_x_frac = avg_x / width_mm if width_mm > 0 else 0.5
+    search_y_min_frac = search_y_min / height_mm if height_mm > 0 else 0.0
+    search_y_max_frac = search_y_max / height_mm if height_mm > 0 else 1.0
+    col_tol_frac = _SYMMETRY_COLUMN_TOLERANCE_MM / width_mm if width_mm > 0 else 0.05
+
+    retry_prompt = f"""You previously identified {n_plus} P+ and {n_minus} P- pads on this PCB.
+The P+ and P- pads are arranged in a single vertical column along the same edge.
+
+There should be {n_expected} P- and {n_expected} P+ pads (equal count).
+You may have missed {n_expected - n_found} {missing_label} pad(s).
+
+Look ONLY along the vertical strip near x_frac ≈ {avg_x_frac:.4f} (±{col_tol_frac:.4f}).
+Scan the y_frac range [{search_y_min_frac:.4f}, {search_y_max_frac:.4f}].
+
+The pads are uniformly spaced. Look for a metallic rectangular pad
+with "{missing_label}" silkscreen label nearby. The pad appearance
+is identical to the {missing_label} pads you already found — same size,
+same shape, same text.
+
+Return ONLY a JSON array of pad(s) found in this region.
+Each pad: label, polygon (x_frac/y_frac), confidence.
+If you genuinely cannot find any {missing_label} pad in this region, return [].
+DO NOT re-list pads you have already identified."""
+
+    image_b64 = base64.b64encode(png_bytes).decode("ascii")
+    image_url = f"data:image/png;base64,{image_b64}"
+
+    retry_messages = [{
+        "role": "user",
+        "content": [
+            {"image": image_url},
+            {"text": retry_prompt},
+        ],
+    }]
+
+    # ── Call VLM for retry ──
+    try:
+        dashscope.api_key = _get_api_key()
+        _log.info("Symmetry retry: calling VLM with focused prompt")
+        response = MultiModalConversation.call(
+            model=MODEL_NAME,
+            messages=retry_messages,
+            temperature=0.05,  # lower temp for more focused search
+            max_tokens=2048,
+            enable_thinking=ENABLE_THINKING,
+        )
+
+        if response.status_code != 200:
+            _log.warning("Symmetry retry API error: code=%s, skipping", response.code)
+            return candidates
+
+        contents = response.output.choices[0].message.content
+        raw_text = "".join(p.get("text", "") for p in contents if isinstance(p, dict))
+        if not raw_text.strip():
+            _log.info("Symmetry retry: VLM returned empty, no additional pads found")
+            return candidates
+
+        _log.debug("Symmetry retry raw (first 300 chars): %s", raw_text[:300])
+
+        parsed = _extract_json(raw_text)
+        if not parsed or not parsed.get("items"):
+            _log.info("Symmetry retry: no valid JSON items")
+            return candidates
+
+        # Parse retry results using the same pipeline
+        retry_candidates = _parse_vlm_response(parsed, width_mm, height_mm, "front")
+        retry_candidates = [c for c in retry_candidates if c["label"] == missing_label]
+
+        _log.info("Symmetry retry: found %d additional %s pad(s)", len(retry_candidates), missing_label)
+
+        if not retry_candidates:
+            return candidates
+
+        # ── Merge: append retry candidates, then re-dedup ──
+        merged = list(candidates) + retry_candidates
+        merged = _spatial_dedup_candidates(merged)
+        merged = _assign_unique_ids(merged)
+
+        merged = sorted(merged, key=lambda c: (
+            c["visible_position"]["x_mm"], c["visible_position"]["y_mm"], c["label"],
+        ))
+
+        # ── Level-2 check: still asymmetric → re-verify all labels ──
+        p_plus2 = [c for c in merged if c["label"] == "P+"]
+        p_minus2 = [c for c in merged if c["label"] == "P-"]
+        n2_plus, n2_minus = len(p_plus2), len(p_minus2)
+
+        if n2_plus == n2_minus or n2_plus == 0 or n2_minus == 0:
+            return merged
+
+        # Still asymmetric — one of the P+ or P- might be mislabeled.
+        # Ask VLM to re-verify ALL pads in the column.
+        _log.info(
+            "Symmetry L2: still asymmetric (P+=%d, P-=%d), running label re-verification",
+            n2_plus, n2_minus,
+        )
+
+        all_col_ys = sorted(c["visible_position"]["y_mm"] for c in p_plus2 + p_minus2)
+        pad_list = "\n".join(
+            f"  Pad at y={y:.2f} mm — originally labeled \"{c['label']}\""
+            for c, y in sorted(
+                [(c, c["visible_position"]["y_mm"]) for c in p_plus2 + p_minus2],
+                key=lambda t: t[1],
+            )
+        )
+
+        recheck_prompt = f"""CRITICAL LABEL VERIFICATION: I need you to re-examine the P+/P- pads
+in the vertical column at x ≈ {avg_x:.1f} mm. Currently detected:
+
+{pad_list}
+
+IMPORTANT: There should be EQUAL numbers of P+ and P- pads in this column.
+But we have {n2_plus} P+ and {n2_minus} P-. This means at least one pad
+was assigned the wrong label.
+
+Look VERY carefully at the silkscreen labels next to each pad:
+  - "P+" means a positive charge terminal
+  - "P-" means a negative charge terminal
+  - The label text may be small or partially visible
+
+Return a JSON array with the CORRECTED labels for ALL {n2_plus + n2_minus} pads
+in this column. For each pad, provide label, x_frac, y_frac, and confidence.
+If a label is already correct, keep it as-is.
+If a label is wrong, output the CORRECTED label.
+Only include pads in the column at x ≈ {avg_x:.1f} mm."""
+
+        recheck_messages = [{
+            "role": "user",
+            "content": [
+                {"image": image_url},
+                {"text": recheck_prompt},
+            ],
+        }]
+
+        try:
+            recheck_raw = MultiModalConversation.call(
+                model=MODEL_NAME,
+                messages=recheck_messages,
+                temperature=0.03,
+                max_tokens=2048,
+                enable_thinking=ENABLE_THINKING,
+            )
+            if recheck_raw.status_code == 200:
+                recheck_text = "".join(
+                    p.get("text", "") for p in recheck_raw.output.choices[0].message.content
+                    if isinstance(p, dict)
+                )
+                recheck_parsed = _extract_json(recheck_text)
+                if recheck_parsed and recheck_parsed.get("items"):
+                    recheck_cands = _parse_vlm_response(recheck_parsed, width_mm, height_mm, "front")
+                    # Only keep P+/P- from the recheck, replace originals
+                    kept = [c for c in merged if c["label"] not in ("P+", "P-")]
+                    replaced = [c for c in recheck_cands if c["label"] in ("P+", "P-")]
+                    merged = kept + replaced
+                    merged = _spatial_dedup_candidates(merged)
+                    merged = _assign_unique_ids(merged)
+                    merged = sorted(merged, key=lambda c: (
+                        c["visible_position"]["x_mm"], c["visible_position"]["y_mm"], c["label"],
+                    ))
+                    p_final = [c for c in merged if c["label"] in ("P+", "P-")]
+                    _log.info(
+                        "Symmetry L2 result: %d total P+/P- pads (%d P+, %d P-)",
+                        len(p_final),
+                        len([c for c in merged if c["label"] == "P+"]),
+                        len([c for c in merged if c["label"] == "P-"]),
+                    )
+                else:
+                    _log.info("Symmetry L2: VLM returned no usable recheck data")
+            else:
+                _log.warning("Symmetry L2: API error code=%s", recheck_raw.code)
+        except Exception as exc:
+            _log.warning("Symmetry L2 failed: %s", exc)
+
+        # ── L3: Geometric inference — extrapolate missing pads from pattern ──
+        p_plus3 = [c for c in merged if c["label"] == "P+"]
+        p_minus3 = [c for c in merged if c["label"] == "P-"]
+        n3_plus, n3_minus = len(p_plus3), len(p_minus3)
+
+        if n3_plus != n3_minus and n3_plus > 0 and n3_minus > 0:
+            _log.info("Symmetry L3: geometric inference (P+=%d, P-=%d)", n3_plus, n3_minus)
+            merged = _geometric_fill_missing(merged, width_mm, height_mm)
+
+        # ── Final cleanup: column filter again + remove overlaps ──
+        merged = _filter_pp_pn_column_outliers(merged, width_mm, height_mm)
+        merged = _resolve_pp_pn_overlaps(merged)
+
+        final_p = [c for c in merged if c["label"] in ("P+", "P-")]
+        _log.info(
+            "Symmetry final: %d P+/P- pads (%d P+, %d P-)",
+            len(final_p), len([c for c in final_p if c["label"] == "P+"]), len([c for c in final_p if c["label"] == "P-"]),
+        )
+
+        return merged
+
+    except Exception as exc:
+        _log.warning("Symmetry retry failed with exception: %s, falling back", exc)
+        return candidates
+
+
+def _geometric_fill_missing(
+    candidates: list[dict],
+    width_mm: float,
+    height_mm: float,
+) -> list[dict]:
+    """Geometric inference: extrapolate missing P+ or P- pads from column pattern.
+
+    When the VLM cannot find all pads (e.g., silkscreen too faint at edges),
+    we use the uniform-spacing pattern of the known pads to predict the
+    missing ones. The inferred pad gets a lower confidence and a flag
+    marking it as geometrically inferred.
+    """
+    p_plus = sorted(
+        [c for c in candidates if c["label"] == "P+"],
+        key=lambda c: c["visible_position"]["y_mm"],
+    )
+    p_minus = sorted(
+        [c for c in candidates if c["label"] == "P-"],
+        key=lambda c: c["visible_position"]["y_mm"],
+    )
+
+    col_tol = _compute_column_tolerance(width_mm, height_mm)
+    n_plus, n_minus = len(p_plus), len(p_minus)
+    _log.info(
+        "Geometric fill: entry n_plus=%d n_minus=%d total_candidates=%d width=%.2f height=%.2f col_tol=%.2f",
+        n_plus, n_minus, len(candidates), width_mm, height_mm, col_tol,
+    )
+    if n_plus == n_minus:
+        _log.info("Geometric fill: n_plus==n_minus, nothing to do")
+        return candidates
+
+    major_label, major_pads = ("P+", p_plus) if n_plus > n_minus else ("P-", p_minus)
+    minor_label = "P-" if major_label == "P+" else "P+"
+    minor_pads = p_minus if major_label == "P+" else p_plus
+
+    # Check same column: all pads share approximately same x
+    all_col = major_pads + minor_pads
+    xs = [c["visible_position"]["x_mm"] for c in all_col]
+    x_min, x_max = min(xs), max(xs)
+    x_spread = x_max - x_min
+    _log.info(
+        "Geometric fill: x-coords=%s, spread=%.2f, tolerance=%.2f",
+        [round(x, 2) for x in xs], x_spread, col_tol,
+    )
+    if x_spread > col_tol:
+        _log.warning(
+            "Geometric fill: x-spread %.2f > tolerance %.2f, skipping (P+ and P- not in same column)",
+            x_spread, col_tol,
+        )
+        return candidates
+
+    avg_x = sum(xs) / len(xs)
+    all_ys = sorted(c["visible_position"]["y_mm"] for c in all_col)
+    _log.info("Geometric fill: all_ys=%s", [round(y, 2) for y in all_ys])
+
+    # Compute avg gap from all known pads
+    if len(all_ys) < 2:
+        _log.info("Geometric fill: only 1 pad total, cannot compute gap")
+        return candidates
+    gaps = [all_ys[i + 1] - all_ys[i] for i in range(len(all_ys) - 1)]
+    avg_gap = sum(gaps) / len(gaps)
+    _log.info("Geometric fill: gaps=%s avg_gap=%.2f", [round(g, 2) for g in gaps], avg_gap)
+
+    n_missing = len(major_pads) - len(minor_pads)
+    _log.info("Geometric fill: n_missing=%d for label=%s", n_missing, minor_label)
+
+    # Determine where missing pads should be
+    major_ys = sorted(c["visible_position"]["y_mm"] for c in major_pads)
+    minor_ys = sorted(c["visible_position"]["y_mm"] for c in minor_pads)
+    _log.info("Geometric fill: major_ys=%s minor_ys=%s",
+              [round(y, 2) for y in major_ys], [round(y, 2) for y in minor_ys])
+
+    # Compute spacing from the minor-label pads (or major if minor only has 1)
+    if len(minor_ys) >= 2:
+        minor_gaps = [minor_ys[i + 1] - minor_ys[i] for i in range(len(minor_ys) - 1)]
+        step = sum(minor_gaps) / len(minor_gaps)
+        ref_ys = minor_ys
+        _log.info("Geometric fill: using minor gaps=%s step=%.2f", [round(g, 2) for g in minor_gaps], step)
+    else:
+        if len(major_ys) >= 2:
+            major_gaps = [major_ys[i + 1] - major_ys[i] for i in range(len(major_ys) - 1)]
+            step = sum(major_gaps) / len(major_gaps)
+            _log.info("Geometric fill: minor has <2 pads, using major gaps=%s step=%.2f",
+                      [round(g, 2) for g in major_gaps], step)
+        else:
+            step = avg_gap
+            _log.info("Geometric fill: both major and minor have <2 pads, using avg_gap=%.2f", step)
+        ref_ys = minor_ys
+
+    # Direction: if minor pads are above major, extend upward; else downward
+    if minor_ys and major_ys:
+        minor_center = sum(minor_ys) / len(minor_ys)
+        major_center = sum(major_ys) / len(major_ys)
+        extend_up = minor_center < major_center  # minor is above → extend further up
+        _log.info("Geometric fill: minor_center=%.2f major_center=%.2f extend_up=%s",
+                  minor_center, major_center, extend_up)
+    else:
+        extend_up = False
+
+    last_minor_y = max(minor_ys) if minor_ys else max(major_ys)
+    first_minor_y = min(minor_ys) if minor_ys else min(major_ys)
+    _log.info("Geometric fill: last_minor_y=%.2f first_minor_y=%.2f", last_minor_y, first_minor_y)
+
+    # Compute average pad dimensions from existing pads for inferred ones
+    # Prefer same-label pads, fall back to major-label pads
+    minor_all = minor_pads
+    avg_w, avg_h = width_mm * 0.04, height_mm * 0.03  # proportional to PCB size
+    for source_pads in [minor_pads, major_pads]:
+        widths = [p.get("width_mm") for p in source_pads if p.get("width_mm")]
+        heights = [p.get("height_mm") for p in source_pads if p.get("height_mm")]
+        if widths and heights:
+            avg_w = sum(widths) / len(widths)
+            avg_h = sum(heights) / len(heights)
+            break
+
+    _log.info(
+        "Geometric inference: filling %d missing %s pad(s), step=%.2fmm, x=%.2f, extend_up=%s, size=%.2fx%.2f",
+        n_missing, minor_label, step, avg_x, extend_up, avg_w, avg_h,
+    )
+
+    inferred = []
+    for i in range(n_missing):
+        if extend_up:
+            predicted_y = first_minor_y - step * (i + 1)
+        else:
+            predicted_y = last_minor_y + step * (i + 1)
+        _log.info("Geometric fill: candidate %d predicted_y=%.2f board=[0, %.2f]",
+                  i, predicted_y, height_mm)
+
+        # Tight margin: geometric inference should not place pads far outside.
+        # A margin of 3mm or 5% of PCB height, whichever is smaller, prevents
+        # pads from being generated that will later become degenerate after
+        # _clamp_pads_to_board clips them to the board edge.
+        MARGIN_MM = min(height_mm * 0.05, 3.0)
+        if predicted_y < -MARGIN_MM or predicted_y > height_mm + MARGIN_MM:
+            _log.info("Geometric inference: predicted y=%.2f far outside PCB [0, %.2f] margin=%.1f, skipping",
+                      predicted_y, height_mm, MARGIN_MM)
+            continue
+
+        # Create synthetic candidate with geometric inference flag.
+        # Build a synthetic rectangle polygon so downstream alignment
+        # (_align_pad_groups) can read polygon dimensions correctly.
+        hw = avg_w / 2
+        hh = avg_h / 2
+        synthetic_poly = [
+            {"x_mm": round(avg_x - hw, 3), "y_mm": round(predicted_y - hh, 3)},
+            {"x_mm": round(avg_x + hw, 3), "y_mm": round(predicted_y - hh, 3)},
+            {"x_mm": round(avg_x + hw, 3), "y_mm": round(predicted_y + hh, 3)},
+            {"x_mm": round(avg_x - hw, 3), "y_mm": round(predicted_y + hh, 3)},
+        ]
+        synthetic_bbox = {
+            "x_mm": round(avg_x - hw, 3),
+            "y_mm": round(predicted_y - hh, 3),
+            "width_mm": round(avg_w, 3),
+            "height_mm": round(avg_h, 3),
+        }
+        inferred_pad = {
+            "label": minor_label,
+            "visible_position": {
+                "x_mm": round(avg_x, 3),
+                "y_mm": round(predicted_y, 3),
+            },
+            "matched_regions": [{
+                "center": {"x_mm": round(avg_x, 3), "y_mm": round(predicted_y, 3)},
+                "polygon": synthetic_poly,
+                "bbox": synthetic_bbox,
+                "source": "geometric",
+            }],
+            "visible_region": {
+                "center": {"x_mm": round(avg_x, 3), "y_mm": round(predicted_y, 3)},
+                "polygon": synthetic_poly,
+                "bbox": synthetic_bbox,
+                "source": "geometric",
+                "confidence": 0.4,
+            },
+            "diagnostic_verified": "geometric_inference",
+            "confidence": 0.4,
+            "width_mm": round(avg_w, 3),
+            "height_mm": round(avg_h, 3),
+        }
+        inferred.append(inferred_pad)
+        _log.info("  Inferred %s at (%.2f, %.2f)", minor_label, avg_x, predicted_y)
+
+    result = list(candidates) + inferred
+    _log.info("Geometric fill: before dedup=%d after inferred=%d, result=%d",
+              len(candidates), len(inferred), len(result))
+    result = _spatial_dedup_candidates(result)
+    result = _assign_unique_ids(result)
+    _log.info("Geometric fill: after dedup+assign=%d candidates", len(result))
+    return sorted(result, key=lambda c: (
+        c["visible_position"]["x_mm"], c["visible_position"]["y_mm"], c["label"],
+    ))
+
+
+def _filter_pp_pn_column_outliers(candidates: list[dict],
+                                    width_mm: float = 50.0,
+                                    height_mm: float = 30.0) -> list[dict]:
+    """Remove P+/P- pads not belonging to the main column cluster by x-coordinate."""
+    pp_all = [c for c in candidates if c["label"] == "P+"]
+    pm_all = [c for c in candidates if c["label"] == "P-"]
+    all_polarity = pp_all + pm_all
+    if len(all_polarity) <= 1:
+        return candidates
+
+    col_tol = _compute_column_tolerance(width_mm, height_mm)
+
+    # Simple 1D clustering by x
+    sorted_pads = sorted(all_polarity, key=lambda c: c["visible_position"]["x_mm"])
+    clusters = [[sorted_pads[0]]]
+    for p in sorted_pads[1:]:
+        if p["visible_position"]["x_mm"] - clusters[-1][-1]["visible_position"]["x_mm"] <= col_tol:
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+
+    # Keep only pads in the largest cluster (match by position+label, not id)
+    main_cluster = max(clusters, key=len)
+    out_keys = set()
+    for c in all_polarity:
+        if c not in main_cluster:
+            key = (c["label"], round(c["visible_position"]["x_mm"], 2), round(c["visible_position"]["y_mm"], 2))
+            out_keys.add(key)
+
+    if out_keys:
+        candidates = [
+            c for c in candidates
+            if (c["label"], round(c["visible_position"]["x_mm"], 2), round(c["visible_position"]["y_mm"], 2)) not in out_keys
+        ]
+        _log.info("Column cleanup: removed %d outlier(s) not in main cluster", len(out_keys))
+
+    return candidates
+
+
+def _resolve_pp_pn_overlaps(candidates: list[dict]) -> list[dict]:
+    """Remove P+/P- pairs that overlap at the same physical position.
+
+    When the VLM assigns P+ and P- labels to the same pad location,
+    we resolve the conflict by keeping the label that is more consistent
+    with the majority count in its column.
+    """
+    p_plus = [c for c in candidates if c["label"] == "P+"]
+    p_minus = [c for c in candidates if c["label"] == "P-"]
+    if len(p_plus) <= 1 or len(p_minus) <= 1:
+        return candidates
+
+    overlaps = []  # pairs of (p_plus_idx, p_minus_idx)
+    for i, pp in enumerate(p_plus):
+        px, py = pp["visible_position"]["x_mm"], pp["visible_position"]["y_mm"]
+        for j, pm in enumerate(p_minus):
+            mx, my = pm["visible_position"]["x_mm"], pm["visible_position"]["y_mm"]
+            dist = ((px - mx) ** 2 + (py - my) ** 2) ** 0.5
+            if dist < 1.0:  # same position within 1mm
+                overlaps.append((i, j, dist))
+
+    if not overlaps:
+        return candidates
+
+    _log.info("Resolving %d P+/P- overlap(s)", len(overlaps))
+
+    # Remove the overlapping pad with fewer total pads in its group
+    # If a P- overlaps with a P+ and there are more P+ than P-, keep P+
+    non_pp = [c for c in candidates if c["label"] not in ("P+", "P-")]
+    kept_pp = list(p_plus)
+    kept_pm = list(p_minus)
+
+    for i, j, dist in overlaps:
+        if len(kept_pp) >= len(kept_pm):
+            # Keep P+, remove P- at index j
+            _log.info("  Removing overlapping P- at (%.2f, %.2f) — keeping P+", kept_pm[j]["visible_position"]["x_mm"], kept_pm[j]["visible_position"]["y_mm"])
+            kept_pm[j] = None
+        else:
+            _log.info("  Removing overlapping P+ at (%.2f, %.2f) — keeping P-", kept_pp[i]["visible_position"]["x_mm"], kept_pp[i]["visible_position"]["y_mm"])
+            kept_pp[i] = None
+
+    kept_pp = [c for c in kept_pp if c is not None]
+    kept_pm = [c for c in kept_pm if c is not None]
+
+    result = non_pp + kept_pp + kept_pm
+    result = _spatial_dedup_candidates(result)
+    result = _assign_unique_ids(result)
+    return sorted(result, key=lambda c: (
+        c["visible_position"]["x_mm"], c["visible_position"]["y_mm"], c["label"],
+    ))
 
 
 # ── VLM core ────────────────────────────────────────────────────────
@@ -322,8 +1003,6 @@ FINAL REMINDERS:
 - 4-vertex output is preferred and sufficient for rounded rectangle pads.
 - If uncertain about a pad, set confidence < 0.8 and still provide your best polygon estimate.
 - Order results alphabetically by label."""
-
-
 def _extract_json(text: str) -> dict | None:
     """Robustly extract JSON array from model output (handles markdown fences)."""
     text = text.strip()
@@ -380,15 +1059,14 @@ def _parse_vlm_response(
         vertices tracing the actual metallic pad outline.
       - BBox format (legacy fallback): x_frac / y_frac / w_frac / h_frac rectangle.
 
-    Fractional coordinates (0.0–1.0) relative to image dimensions → mm.
+    Fractional coordinates (0.0 to 1.0) relative to image dimensions -> mm.
     """
 
     items = raw.get("items", [])
     if not isinstance(items, list):
         items = []
 
-    candidates: list[dict] = []
-    seen_labels: set[str] = set()
+    raw_candidates: list[dict] = []
 
     for item in items:
         if not isinstance(item, dict):
@@ -400,16 +1078,7 @@ def _parse_vlm_response(
         if label not in TARGET_LABELS:
             continue
 
-        # Deduplicate: keep highest confidence per label
         confidence = float(item.get("confidence", 0.7))
-        if label in seen_labels:
-            existing = next(c for c in candidates if c["label"] == label)
-            if confidence <= existing["confidence"]:
-                continue
-            candidates.remove(existing)
-            seen_labels.discard(label)
-
-        seen_labels.add(label)
 
         # ── Parse polygon vertices (preferred) or fall back to bbox ──
         polygon_raw = item.get("polygon")
@@ -463,6 +1132,13 @@ def _parse_vlm_response(
             if h_frac <= 0:
                 h_frac = float(item.get("h_px", 0)) / max(height_mm * 20, 1)
 
+            # Reject items with zero-area bbox (VLM hallucination / empty item)
+            # A valid pad MUST have non-zero width AND height in fraction space
+            if w_frac <= 0.0 and h_frac <= 0.0:
+                _log.info("Parse: rejecting %s at (%.2f,%.2f) — zero-area bbox (w=%.3f h=%.3f)",
+                          label, x_frac, y_frac, w_frac, h_frac)
+                continue
+
             # Bounds check
             if x_frac < 0 or x_frac > 1 or y_frac < 0 or y_frac > 1:
                 if x_frac < -0.5 or x_frac > 1.5 or y_frac < -0.5 or y_frac > 1.5:
@@ -472,8 +1148,8 @@ def _parse_vlm_response(
 
             cx = x_frac * width_mm
             cy = y_frac * height_mm
-            pad_w_mm = w_frac * width_mm if w_frac > 0 else 4.0
-            pad_h_mm = h_frac * height_mm if h_frac > 0 else 2.5
+            pad_w_mm = w_frac * width_mm if w_frac > 0 else width_mm * 0.08
+            pad_h_mm = h_frac * height_mm if h_frac > 0 else height_mm * 0.05
 
             aspect = pad_w_mm / max(pad_h_mm, 0.01)
             shape = "rounded_rect" if 1.4 < aspect < 3.0 else ("rect" if aspect >= 3.0 else "circle")
@@ -508,10 +1184,40 @@ def _parse_vlm_response(
             "source": "vlm",
         }
 
+        # ── PCB boundary validation ──
+        # Pads must lie within (or very near) the PCB image area.
+        # A pad whose bounding box is entirely outside the board is a
+        # hallucination; reject it now rather than forward garbage downstream.
+        # Uses min_x/min_y/pad_w_mm/pad_h_mm which are defined in both
+        # the polygon path and the bbox fallback path.
+        BOUNDARY_MARGIN_MM = max(min(width_mm, height_mm) * 0.03, 0.5)
+        bbox_right = min_x + pad_w_mm
+        bbox_bottom = min_y + pad_h_mm
+        if (bbox_right < -BOUNDARY_MARGIN_MM
+                or min_x > width_mm + BOUNDARY_MARGIN_MM
+                or bbox_bottom < -BOUNDARY_MARGIN_MM
+                or min_y > height_mm + BOUNDARY_MARGIN_MM):
+            _log.warning(
+                "Parse: rejecting %s — bbox (%.1f,%.1f %.1f×%.1f) outside PCB %.1f×%.1f",
+                label, min_x, min_y, pad_w_mm, pad_h_mm, width_mm, height_mm,
+            )
+            continue
+        elif (min_x < -BOUNDARY_MARGIN_MM or min_y < -BOUNDARY_MARGIN_MM
+              or bbox_right > width_mm + BOUNDARY_MARGIN_MM
+              or bbox_bottom > height_mm + BOUNDARY_MARGIN_MM):
+            _log.info(
+                "Parse: clipping %s bbox (%.1f,%.1f %.1f×%.1f) to PCB %.1f×%.1f",
+                label, min_x, min_y, pad_w_mm, pad_h_mm, width_mm, height_mm,
+            )
+            # Clip polygon vertices to PCB area
+            for pt in polygon_mm:
+                pt["x_mm"] = max(0.0, min(width_mm, pt["x_mm"]))
+                pt["y_mm"] = max(0.0, min(height_mm, pt["y_mm"]))
+
         roles, polarity = LABEL_CONTRACT.get(label, (set(), None))
 
         candidate = {
-            "id": label.replace("+", "_POS").replace("-", "_NEG"),
+            "id": label.replace("+", "_POS").replace("-", "_NEG"),  # temporary; will be uniquified below
             "label": label,
             "recognized_text": label,
             "visible_position": {"x_mm": round(cx, 3), "y_mm": round(cy, 3)},
@@ -531,9 +1237,158 @@ def _parse_vlm_response(
             "match_distance_mm": None,
             "requires_confirmation": True,
         }
-        candidates.append(candidate)
+        raw_candidates.append(candidate)
+
+    # ── Flag via-like false positives (small circular spots) ──
+    raw_candidates = _filter_via_like_candidates(raw_candidates, width_mm, height_mm)
+
+    # ── Spatial deduplication: merge near-identical pads sharing the same label ──
+    candidates = _spatial_dedup_candidates(raw_candidates)
+
+    # ── Assign unique sequential IDs per label group (internal use only) ──
+    candidates = _assign_unique_ids(candidates)
 
     return sorted(candidates, key=lambda c: (c["visible_position"]["x_mm"], c["visible_position"]["y_mm"], c["label"]))
+
+
+def _compute_dedup_threshold(candidates: list[dict]) -> float:
+    """Spatial dedup threshold proportional to the candidates' spatial extent."""
+    if len(candidates) >= 2:
+        xs = [c["visible_position"]["x_mm"] for c in candidates]
+        ys = [c["visible_position"]["y_mm"] for c in candidates]
+        spread = max(max(xs) - min(xs), max(ys) - min(ys), 0.1)
+        return max(spread * 0.03, 0.5)
+    return 1.5  # fallback for single candidate
+
+
+def _spatial_dedup_candidates(raw_candidates: list[dict]) -> list[dict]:
+    """Remove near-duplicate candidates that share the same label and have
+    overlapping / very-close center positions.
+
+    Within each label group, a pair of candidates whose center-to-center
+    distance is below a threshold (proportional to the spatial extent of
+    all candidates) is considered the same physical pad; the one with
+    higher confidence is kept.
+    """
+    if len(raw_candidates) <= 1:
+        return list(raw_candidates)
+
+    threshold = _compute_dedup_threshold(raw_candidates)
+
+    # ── Group by label ──
+    groups: dict[str, list[dict]] = {}
+    for c in raw_candidates:
+        groups.setdefault(c["label"], []).append(c)
+
+    deduped: list[dict] = []
+    for _label, group in groups.items():
+        n = len(group)
+        if n == 1:
+            deduped.append(group[0])
+            continue
+
+        # Sort by (area descending, confidence descending).
+        # Large-area candidates represent real pads; small-area ones are
+        # likely false-positives (e.g. via solder dots).  Preferring area
+        # first prevents a tiny high-confidence blob from replacing a
+        # genuinely large pad.
+        def _area_key(c: dict) -> float:
+            bb = (c.get("visible_region") or {}).get("bbox") or {}
+            return float((bb.get("width_mm") or 0) * (bb.get("height_mm") or 0))
+
+        group.sort(key=lambda c: (_area_key(c), c["confidence"]), reverse=True)
+        kept: list[dict] = []
+        # Keep track of already-kept centers for this label
+        kept_centers: list[tuple[float, float]] = []
+
+        for c in group:
+            cx = c["visible_position"]["x_mm"]
+            cy = c["visible_position"]["y_mm"]
+            is_dup = False
+            for kcx, kcy in kept_centers:
+                dist = math.hypot(cx - kcx, cy - kcy)
+                if dist <= threshold:
+                    is_dup = True
+                    _log.info(
+                        "Spatial dedup: merging %s at (%.1f,%.1f) into "
+                        "existing (%.1f,%.1f), dist=%.2f mm",
+                        c["label"], cx, cy, kcx, kcy, dist,
+                    )
+                    break
+            if not is_dup:
+                kept.append(c)
+                kept_centers.append((cx, cy))
+
+        deduped.extend(kept)
+
+    return deduped
+
+
+def _assign_unique_ids(candidates: list[dict]) -> list[dict]:
+    """Assign unique internal IDs per label group.
+
+    If a label appears only once, the ID stays as-is (e.g. ``P_POS``).
+    If a label appears multiple times, each candidate gets a numbered suffix
+    (e.g. ``P_POS_1``, ``P_POS_2``). The ``label`` field is **never** modified
+    — these suffixes are purely for internal disambiguation.
+    """
+    # ── Group by label ──
+    groups: dict[str, list[dict]] = {}
+    for c in candidates:
+        groups.setdefault(c["label"], []).append(c)
+
+    result: list[dict] = []
+    for _label, group in groups.items():
+        if len(group) == 1:
+            # Single instance — keep original ID
+            result.extend(group)
+        else:
+            # Multiple instances — append numeric suffix
+            for idx, c in enumerate(group, start=1):
+                base_id = _label.replace("+", "_POS").replace("-", "_NEG")
+                c["id"] = f"{base_id}_{idx}"
+                result.append(c)
+
+    return result
+
+
+def _compute_via_max_area(width_mm: float, height_mm: float) -> float:
+    """Via detection area threshold proportional to PCB area.
+
+    A typical via/solder dot is < 0.2% of the total PCB area.
+    """
+    return max(width_mm * height_mm * 0.002, 0.5)
+
+_VIA_MIN_ASPECT_RATIO = 0.85    # width/height >= this → nearly square/circular
+
+
+def _filter_via_like_candidates(raw_candidates: list[dict],
+                                 width_mm: float = 50.0,
+                                 height_mm: float = 30.0) -> list[dict]:
+    """Flag (do not remove) candidates whose shape resembles a via/solder dot.
+
+    Through-hole solder joints appear as tiny, nearly circular metallic spots.
+    Real terminal pads are larger rounded rectangles.  This filter LOWERS the
+    confidence of via-like candidates so they appear with a warning flag in
+    the review UI rather than being silently dropped.
+    """
+    via_max_area = _compute_via_max_area(width_mm, height_mm)
+    for c in raw_candidates:
+        w = c.get("width_mm", 0)
+        h = c.get("height_mm", 0)
+        if w <= 0 or h <= 0:
+            continue
+        area = w * h
+        aspect = min(w, h) / max(w, h) if max(w, h) > 0 else 0
+        if area <= via_max_area and aspect >= _VIA_MIN_ASPECT_RATIO:
+            _log.info(
+                "Via filter: %s area=%.2f mm² aspect=%.2f → marking as via-like",
+                c["label"], area, aspect,
+            )
+            c["confidence"] = round(min(c["confidence"], 0.50), 3)
+            c["requires_confirmation"] = True
+            c["_via_like"] = True
+    return raw_candidates
 
 
 def _parse_polygon_vertices(
@@ -593,7 +1448,7 @@ def _clean_label(raw: str) -> str:
         "P+": "P+", "P4": "P+",
         "C-": "C-",
         "C+": "C+",
-        "NTC": "NTC", "N": "N", "TH": "TH",
+        "NTC": "NTC", "N": "N", "TH": "TH", "T": "TH",
         "1D": "ID", "LD": "ID", "ID": "ID",
     }
     return mapping.get(raw, raw)
@@ -1289,4 +2144,111 @@ def _parse_components_response(
         })
 
     return components
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Pad visual quality verification (single-pad VLM check)
+# ══════════════════════════════════════════════════════════════════════
+
+def verify_pad_crop(
+    crop_png: bytes,
+    label: str,
+    pad_w_mm: float,
+    pad_h_mm: float,
+) -> dict:
+    """Send a single pad's cropped image to VLM for quality verification.
+
+    Returns:
+        {
+            "ok": bool,
+            "single_pad": bool,
+            "issues": [str],
+            "confidence": float,
+        }
+    """
+    _check_vlm_available()
+
+    dashscope.api_key = _get_api_key()
+    image_b64 = base64.b64encode(crop_png).decode("ascii")
+    image_url = f"data:image/png;base64,{image_b64}"
+
+    prompt = f"""You are inspecting a single cropped region from a PCB board, supposedly containing ONE solder pad labeled "{label}".
+
+The crop region is approximately {pad_w_mm:.1f}mm x {pad_h_mm:.1f}mm on the actual PCB.
+Pixel resolution: roughly {pad_w_mm * 25:.0f} x {pad_h_mm * 25:.0f} pixels (assume 25 px/mm).
+
+Your task: verify whether this crop genuinely contains exactly ONE well-formed solder pad.
+
+Answer these questions:
+1. Is there clearly ONE metallic pad in this crop? (YES / NO)
+2. Is the crop showing parts of TWO or more distinct pads? (YES if the crop spans across multiple pads, cutting through them)
+3. Is the metal pad actually inside the visible area (not cut off at the edge, not mostly outside)?
+4. Are there any obvious quality issues?
+
+IMPORTANT about low-resolution / small crops:
+- If the crop is very small (pad_w_mm < 1.5 mm), do NOT fail just because the image is low-res or slightly blurry.
+- Look for the characteristic COLOR and TEXTURE of a solder pad: shiny silver/gold metallic surface against a green solder-mask background.
+- A small low-res metallic rectangle with expected pad color IS a valid pad. Only mark FAIL if you are CERTAIN no metal pad exists (e.g., pure green background, silkscreen text without any metal, or a dark component body).
+- "Blurry" or "low resolution" alone is NOT a failure reason — the crop is necessarily small.
+
+Return a JSON object:
+{{"single_pad": true/false, "issues": ["list of problems found, empty if clean"], "confidence": 0.0-1.0}}
+
+Only return the JSON object. No markdown, no explanation."""
+
+    messages = [{
+        "role": "user",
+        "content": [
+            {"image": image_url},
+            {"text": prompt},
+        ],
+    }]
+
+    _log.info("Pad verification VLM call: label=%s, image_size=%d bytes", label, len(crop_png))
+
+    try:
+        response = MultiModalConversation.call(
+            model=MODEL_NAME,
+            messages=messages,
+            temperature=0.1,
+            max_tokens=1024,
+            enable_thinking=False,
+        )
+    except Exception as exc:
+        _log.error("Pad verification VLM call failed: %s", exc)
+        return {"ok": False, "single_pad": False, "issues": [f"VLM error: {exc}"], "confidence": 0.0}
+
+    if response.status_code != 200:
+        _log.error("Pad verification VLM error: code=%s msg=%s", response.code, response.message)
+        return {"ok": False, "single_pad": False, "issues": [f"API error {response.code}"], "confidence": 0.0}
+
+    try:
+        contents = response.output.choices[0].message.content
+    except (AttributeError, IndexError, KeyError) as exc:
+        _log.error("Pad verification response parse error: %s", exc)
+        return {"ok": False, "single_pad": False, "issues": ["Response parse error"], "confidence": 0.0}
+
+    raw_text = ""
+    for part in contents:
+        if isinstance(part, dict) and "text" in part:
+            raw_text += part["text"]
+
+    if not raw_text:
+        return {"ok": False, "single_pad": False, "issues": ["Empty VLM response"], "confidence": 0.0}
+
+    parsed = _extract_json(raw_text)
+    if not isinstance(parsed, dict):
+        return {"ok": False, "single_pad": False, "issues": ["Unparseable VLM response"], "confidence": 0.0}
+
+    single = bool(parsed.get("single_pad", False))
+    issues = parsed.get("issues", []) if isinstance(parsed.get("issues"), list) else []
+    conf = max(0.0, min(1.0, float(parsed.get("confidence", 0.0))))
+    ok = single and not issues
+
+    return {
+        "ok": ok,
+        "single_pad": single,
+        "issues": issues,
+        "confidence": round(conf, 3),
+    }
 

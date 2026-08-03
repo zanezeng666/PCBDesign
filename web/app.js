@@ -55,10 +55,10 @@ function toggle(el, visible) { el.hidden = !visible; }
 async function init() {
   // Read frame dimensions from inputs
   const fw = $('#frame-w'), fh = $('#frame-h');
-  STATE.frameW = parseFloat(fw.value) || 60;
-  STATE.frameH = parseFloat(fh.value) || 30;
-  fw.addEventListener('input', () => { STATE.frameW = parseFloat(fw.value) || 60; });
-  fh.addEventListener('input', () => { STATE.frameH = parseFloat(fh.value) || 60; });
+  STATE.frameW = parseFloat(fw.value) || 40;
+  STATE.frameH = parseFloat(fh.value) || 25;
+  fw.addEventListener('input', () => { STATE.frameW = parseFloat(fw.value) || 40; });
+  fh.addEventListener('input', () => { STATE.frameH = parseFloat(fh.value) || 25; });
 
   setupUploadZones();
 

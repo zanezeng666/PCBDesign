@@ -31,8 +31,8 @@ CELL_MANUFACTURER = "亿纬锂能"
 CELL_MODEL = "INR18650-26V"
 IC_MODEL = "3M1B/N607"
 MOS_MODEL = "8205A"
-FRAME_W_MM = 60.0
-FRAME_H_MM = 30.0
+FRAME_W_MM = 40.0
+FRAME_H_MM = 25.0
 
 
 def step(n: int, title: str):
