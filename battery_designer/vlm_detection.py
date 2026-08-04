@@ -29,8 +29,12 @@ import logging
 import math
 import os
 import re
+import time
+import threading
 
-_log = logging.getLogger(__name__)
+from .logger import get_logger
+
+_log = get_logger(__name__)
 
 try:
     import dashscope
@@ -42,10 +46,17 @@ except ImportError:
 
 # ── constants ────────────────────────────────────────────────────────
 
-MODEL_NAME = "qwen3.7-plus"
+MODEL_NAME = os.getenv("VLM_MODEL_NAME", "qwen3.7-plus")
 TEMPERATURE = 0.05
 MAX_TOKENS = 2048
 ENABLE_THINKING = False  # Disable thinking mode for deterministic pad detection
+
+# Rate limiting: enforce minimum interval between VLM API calls to avoid 429
+_VLM_CALL_LOCK = threading.Lock()
+_VLM_LAST_CALL_TS = 0.0
+_VLM_MIN_INTERVAL = float(os.getenv("VLM_MIN_INTERVAL", "0.8"))  # seconds
+_VLM_MAX_RETRIES = int(os.getenv("VLM_MAX_RETRIES", "4"))
+_VLM_RETRY_BASE_DELAY = float(os.getenv("VLM_RETRY_BASE_DELAY", "2.0"))  # seconds
 
 # Tolerance (in mm) for P+/P- pads sharing the same x-column during symmetry retry.
 # Pads within this horizontal distance are considered in the same column.
@@ -56,6 +67,87 @@ TARGET_LABELS = {
     "B+", "B-", "P+", "P-", "C+", "C-",
     "NTC", "TH", "ID", "N",
 }
+
+
+def _vlm_call_with_retry(
+    model: str,
+    messages: list,
+    temperature: float,
+    max_tokens: int,
+    enable_thinking: bool = False,
+    max_retries: int = _VLM_MAX_RETRIES,
+    base_delay: float = _VLM_RETRY_BASE_DELAY,
+) -> object:
+    """Call MultiModalConversation.call with rate limiting and 429 retry.
+
+    - Enforces a minimum interval between calls (_VLM_MIN_INTERVAL) to avoid 429.
+    - On 429 (rate limit), retries with exponential backoff up to max_retries times.
+    - On other errors, retries once with a short delay.
+    """
+    last_exc = None
+
+    for attempt in range(max_retries + 1):
+        # ── Rate limit: wait if needed ──
+        with _VLM_CALL_LOCK:
+            global _VLM_LAST_CALL_TS
+            now = time.monotonic()
+            wait = _VLM_LAST_CALL_TS + _VLM_MIN_INTERVAL - now
+            if wait > 0:
+                pass  # will sleep outside the lock
+            _VLM_LAST_CALL_TS = now + max(wait, 0)
+
+        if wait > 0:
+            _log.debug("VLM rate limit: waiting %.1fs before next call", wait)
+            time.sleep(wait)
+
+        try:
+            response = MultiModalConversation.call(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                enable_thinking=enable_thinking,
+            )
+
+            if response.status_code == 429:
+                delay = base_delay * (2 ** attempt)
+                _log.warning(
+                    "VLM 429 rate limit (attempt %d/%d), retrying in %.1fs...",
+                    attempt + 1, max_retries + 1, delay,
+                )
+                time.sleep(delay)
+                last_exc = RuntimeError(f"HTTP 429 rate limit (attempt {attempt + 1})")
+                continue
+
+            if response.status_code != 200:
+                _log.error(
+                    "VLM API error: status=%s, code=%s, message=%s",
+                    response.status_code, getattr(response, "code", "?"),
+                    getattr(response, "message", "?"),
+                )
+                if attempt < max_retries:
+                    time.sleep(base_delay)
+                    last_exc = RuntimeError(f"HTTP {response.status_code}")
+                    continue
+                return None
+
+            return response
+
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                delay = base_delay * (2 ** attempt)
+                _log.warning(
+                    "VLM call exception (attempt %d/%d): %s, retrying in %.1fs...",
+                    attempt + 1, max_retries + 1, exc, delay,
+                )
+                time.sleep(delay)
+            else:
+                _log.error("VLM call failed after %d retries: %s", max_retries + 1, exc)
+                return None
+
+    _log.error("VLM call failed after all retries: %s", last_exc)
+    return None
 
 # Label contract: roles + polarity for each terminal type
 LABEL_CONTRACT: dict[str, tuple[set[str], str | None]] = {
@@ -352,7 +444,7 @@ DO NOT re-list pads you have already identified."""
     try:
         dashscope.api_key = _get_api_key()
         _log.info("Symmetry retry: calling VLM with focused prompt")
-        response = MultiModalConversation.call(
+        response = _vlm_call_with_retry(
             model=MODEL_NAME,
             messages=retry_messages,
             temperature=0.05,  # lower temp for more focused search
@@ -360,8 +452,9 @@ DO NOT re-list pads you have already identified."""
             enable_thinking=ENABLE_THINKING,
         )
 
-        if response.status_code != 200:
-            _log.warning("Symmetry retry API error: code=%s, skipping", response.code)
+        if response is None or response.status_code != 200:
+            _log.warning("Symmetry retry API error: code=%s, skipping",
+                         getattr(response, 'code', 'none') if response else 'none')
             return candidates
 
         contents = response.output.choices[0].message.content
@@ -447,44 +540,42 @@ Only include pads in the column at x ≈ {avg_x:.1f} mm."""
             ],
         }]
 
-        try:
-            recheck_raw = MultiModalConversation.call(
-                model=MODEL_NAME,
-                messages=recheck_messages,
-                temperature=0.03,
-                max_tokens=2048,
-                enable_thinking=ENABLE_THINKING,
+        recheck_raw = _vlm_call_with_retry(
+            model=MODEL_NAME,
+            messages=recheck_messages,
+            temperature=0.03,
+            max_tokens=2048,
+            enable_thinking=ENABLE_THINKING,
+        )
+        if recheck_raw and recheck_raw.status_code == 200:
+            recheck_text = "".join(
+                p.get("text", "") for p in recheck_raw.output.choices[0].message.content
+                if isinstance(p, dict)
             )
-            if recheck_raw.status_code == 200:
-                recheck_text = "".join(
-                    p.get("text", "") for p in recheck_raw.output.choices[0].message.content
-                    if isinstance(p, dict)
+            recheck_parsed = _extract_json(recheck_text)
+            if recheck_parsed and recheck_parsed.get("items"):
+                recheck_cands = _parse_vlm_response(recheck_parsed, width_mm, height_mm, "front")
+                # Only keep P+/P- from the recheck, replace originals
+                kept = [c for c in merged if c["label"] not in ("P+", "P-")]
+                replaced = [c for c in recheck_cands if c["label"] in ("P+", "P-")]
+                merged = kept + replaced
+                merged = _spatial_dedup_candidates(merged)
+                merged = _assign_unique_ids(merged)
+                merged = sorted(merged, key=lambda c: (
+                    c["visible_position"]["x_mm"], c["visible_position"]["y_mm"], c["label"],
+                ))
+                p_final = [c for c in merged if c["label"] in ("P+", "P-")]
+                _log.info(
+                    "Symmetry L2 result: %d total P+/P- pads (%d P+, %d P-)",
+                    len(p_final),
+                    len([c for c in merged if c["label"] == "P+"]),
+                    len([c for c in merged if c["label"] == "P-"]),
                 )
-                recheck_parsed = _extract_json(recheck_text)
-                if recheck_parsed and recheck_parsed.get("items"):
-                    recheck_cands = _parse_vlm_response(recheck_parsed, width_mm, height_mm, "front")
-                    # Only keep P+/P- from the recheck, replace originals
-                    kept = [c for c in merged if c["label"] not in ("P+", "P-")]
-                    replaced = [c for c in recheck_cands if c["label"] in ("P+", "P-")]
-                    merged = kept + replaced
-                    merged = _spatial_dedup_candidates(merged)
-                    merged = _assign_unique_ids(merged)
-                    merged = sorted(merged, key=lambda c: (
-                        c["visible_position"]["x_mm"], c["visible_position"]["y_mm"], c["label"],
-                    ))
-                    p_final = [c for c in merged if c["label"] in ("P+", "P-")]
-                    _log.info(
-                        "Symmetry L2 result: %d total P+/P- pads (%d P+, %d P-)",
-                        len(p_final),
-                        len([c for c in merged if c["label"] == "P+"]),
-                        len([c for c in merged if c["label"] == "P-"]),
-                    )
-                else:
-                    _log.info("Symmetry L2: VLM returned no usable recheck data")
             else:
-                _log.warning("Symmetry L2: API error code=%s", recheck_raw.code)
-        except Exception as exc:
-            _log.warning("Symmetry L2 failed: %s", exc)
+                _log.info("Symmetry L2: VLM returned no usable recheck data")
+        else:
+            _log.warning("Symmetry L2: API error code=%s",
+                         getattr(recheck_raw, 'code', 'none') if recheck_raw else 'none')
 
         # ── L3: Geometric inference — extrapolate missing pads from pattern ──
         p_plus3 = [c for c in merged if c["label"] == "P+"]
@@ -852,23 +943,23 @@ def _vlm_detect_raw(rectified_png: bytes, width_mm: float, height_mm: float, is_
         ],
     }]
 
-    _log.info("Calling DashScope VLM (model=%s, image_size=%d bytes)", MODEL_NAME, len(rectified_png))
+    _log.info("Calling VLM (model=%s, image_size=%d bytes)", MODEL_NAME, len(rectified_png))
 
-    try:
-        response = MultiModalConversation.call(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            enable_thinking=ENABLE_THINKING,
-        )
-    except Exception as exc:
-        _log.error("DashScope API call failed: %s", exc)
+    response = _vlm_call_with_retry(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+        enable_thinking=ENABLE_THINKING,
+    )
+
+    if response is None:
         return None
 
     if response.status_code != 200:
-        _log.error("DashScope API error: code=%s message=%s", response.code, response.message)
-        return None
+        _log.error("VLM API error: code=%s message=%s",
+                   getattr(response, 'code', '?'),
+                   getattr(response, 'message', '?'))
 
     # response.output.choices[0].message.content is a list of dicts
     # Each dict has either "text" or "image" key
@@ -1671,23 +1762,23 @@ def _vlm_detect_unified(
         ],
     }]
 
-    _log.info("Calling DashScope VLM (unified, model=%s)", MODEL_NAME)
+    _log.info("Calling VLM (unified, model=%s)", MODEL_NAME)
 
-    try:
-        response = MultiModalConversation.call(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            enable_thinking=ENABLE_THINKING,
-        )
-    except Exception as exc:
-        _log.error("DashScope API call failed (unified): %s", exc)
+    response = _vlm_call_with_retry(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+        enable_thinking=ENABLE_THINKING,
+    )
+
+    if response is None:
         return None
 
     if response.status_code != 200:
-        _log.error("DashScope API error: code=%s message=%s",
-                   response.code, response.message)
+        _log.error("VLM API error: code=%s message=%s",
+                   getattr(response, 'code', '?'),
+                   getattr(response, 'message', '?'))
         return None
 
     try:
@@ -2038,24 +2129,24 @@ def _vlm_detect_components_raw(
         ],
     }]
 
-    _log.info("Calling DashScope VLM (components, model=%s, side=%s, image_size=%d bytes)",
+    _log.info("Calling VLM (components, model=%s, side=%s, image_size=%d bytes)",
               MODEL_NAME, side, len(rectified_png))
 
-    try:
-        response = MultiModalConversation.call(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            enable_thinking=ENABLE_THINKING,
-        )
-    except Exception as exc:
-        _log.error("DashScope API call failed (components): %s", exc)
+    response = _vlm_call_with_retry(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+        enable_thinking=ENABLE_THINKING,
+    )
+
+    if response is None:
         return None
 
     if response.status_code != 200:
-        _log.error("DashScope API error (components): code=%s message=%s",
-                   response.code, response.message)
+        _log.error("VLM API error (components): code=%s message=%s",
+                   getattr(response, 'code', '?'),
+                   getattr(response, 'message', '?'))
         return None
 
     try:
@@ -2206,21 +2297,22 @@ Only return the JSON object. No markdown, no explanation."""
 
     _log.info("Pad verification VLM call: label=%s, image_size=%d bytes", label, len(crop_png))
 
-    try:
-        response = MultiModalConversation.call(
-            model=MODEL_NAME,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=1024,
-            enable_thinking=False,
-        )
-    except Exception as exc:
-        _log.error("Pad verification VLM call failed: %s", exc)
-        return {"ok": False, "single_pad": False, "issues": [f"VLM error: {exc}"], "confidence": 0.0}
+    response = _vlm_call_with_retry(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.1,
+        max_tokens=1024,
+        enable_thinking=False,
+    )
+
+    if response is None:
+        return {"ok": False, "single_pad": False, "issues": ["VLM call failed after retries"], "confidence": 0.0}
 
     if response.status_code != 200:
-        _log.error("Pad verification VLM error: code=%s msg=%s", response.code, response.message)
-        return {"ok": False, "single_pad": False, "issues": [f"API error {response.code}"], "confidence": 0.0}
+        _log.error("Pad verification VLM error: code=%s msg=%s",
+                   getattr(response, 'code', '?'),
+                   getattr(response, 'message', '?'))
+        return {"ok": False, "single_pad": False, "issues": [f"API error {getattr(response, 'code', '?')}"], "confidence": 0.0}
 
     try:
         contents = response.output.choices[0].message.content

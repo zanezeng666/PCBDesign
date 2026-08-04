@@ -6,17 +6,18 @@ Pipeline (verified via pcb_image_pipeline.md):
   3. Perspective correction — warp to 60×30mm reference frame
   4. Adaptive HSV PCB extraction — auto-detect green/blue/black/yellow + Otsu fallback
   5. Edge decontamination — 1px erosion + distanceTransform for clean transparent PNG
-  6. VLM groove detection — validates CV convexity defects for edge grooves
 """
 
 from __future__ import annotations
 
-import base64, json, logging, math, os, re, uuid
+import base64, json, logging, math, os, re, time, threading, uuid
 from pathlib import Path
 
 import cv2, numpy as np
 
-_log = logging.getLogger(__name__)
+from .logger import get_logger
+
+_log = get_logger(__name__)
 
 try:
     import dashscope
@@ -25,11 +26,63 @@ except ImportError:
     MultiModalConversation = None
     dashscope = None
 
-MODEL_NAME = "qwen3.7-plus"
+MODEL_NAME = os.getenv("VLM_MODEL_NAME", "qwen3.7-plus")
 TEMPERATURE = 0.05
 MAX_TOKENS = 4096
 ENABLE_THINKING = False
-MAX_GROOVES = 6
+
+# Rate limiting + retry (keep in sync with vlm_detection.py)
+_VLM_LOCK = threading.Lock()
+_VLM_LAST = 0.0
+_VLM_GAP = float(os.getenv("VLM_MIN_INTERVAL", "0.8"))
+_VLM_RETRIES = int(os.getenv("VLM_MAX_RETRIES", "4"))
+_VLM_BASE_DELAY = float(os.getenv("VLM_RETRY_BASE_DELAY", "2.0"))
+
+
+def _vlm_call(model, messages, temperature, max_tokens, enable_thinking=False):
+    """Call MultiModalConversation with rate limiting + 429 retry."""
+    last_err = None
+    for attempt in range(_VLM_RETRIES + 1):
+        with _VLM_LOCK:
+            global _VLM_LAST
+            now = time.monotonic()
+            wait = _VLM_LAST + _VLM_GAP - now
+            if wait > 0:
+                pass
+            _VLM_LAST = now + max(wait, 0)
+        if wait > 0:
+            time.sleep(wait)
+
+        try:
+            resp = MultiModalConversation.call(
+                model=model, messages=messages,
+                temperature=temperature, max_tokens=max_tokens,
+                enable_thinking=enable_thinking,
+            )
+            if resp.status_code == 429:
+                delay = _VLM_BASE_DELAY * (2 ** attempt)
+                _log.warning("VLM 429 (attempt %d/%d), retry in %.1fs...",
+                             attempt + 1, _VLM_RETRIES + 1, delay)
+                time.sleep(delay)
+                last_err = RuntimeError("429")
+                continue
+            if resp.status_code != 200:
+                _log.error("VLM error %s: %s", resp.status_code,
+                           getattr(resp, 'message', '?'))
+                if attempt < _VLM_RETRIES:
+                    time.sleep(_VLM_BASE_DELAY)
+                return None
+            return resp
+        except Exception as exc:
+            last_err = exc
+            if attempt < _VLM_RETRIES:
+                delay = _VLM_BASE_DELAY * (2 ** attempt)
+                _log.warning("VLM exception (attempt %d/%d): %s", attempt + 1, _VLM_RETRIES + 1, exc)
+                time.sleep(delay)
+            else:
+                _log.error("VLM failed after %d retries: %s", _VLM_RETRIES + 1, exc)
+                return None
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -79,13 +132,11 @@ def extract_pcb(rectified_png: bytes, width_mm: float, height_mm: float,
       1. HSV PCB extraction (green/blue/yellow + Otsu fallback)
       2. Paper background model (colour + texture fingerprint)
       3. Outline refinement (~12 vertices via epsilon scan)
-      4. Paper-validated edge notch detection
-      5. Paper-matched internal hole/slot detection
-      6. Edge-decontaminated transparent PNG
+      4. Paper-matched internal hole/slot detection
+      5. Edge-decontaminated transparent PNG
 
-    Returns: outline, grooves, groove_count, groove_warning, holes, hole_count,
-             pcb_mask_b64, transparent_pcb_b64, paper_model, method,
-             debug_steps, vertex_count.
+    Returns: outline, holes, hole_count, pcb_mask_b64, transparent_pcb_b64,
+             paper_model, method, debug_steps, vertex_count.
     """
     nparr = np.frombuffer(rectified_png, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -148,23 +199,16 @@ def extract_pcb(rectified_png: bytes, width_mm: float, height_mm: float,
         if cv2.countNonZero(clean_mask) > 100:
             pcb_mask = clean_mask
 
-    # ── Step 4: Paper-validated edge notches ──
-    notches, notch_warning = _validate_notches_by_paper(
-        img, pcb_mask, outline, paper_model, width_mm, height_mm, pixels_per_mm)
-    debug_steps.append({"step": "04_notches", "label": f"纸色验证凹槽({len(notches)}个)",
-                        "notches": notches, "warning": notch_warning})
-
-    # ── Step 5: Paper-matched internal holes ──
+    # ── Step 4: Paper-matched internal holes ──
     holes = _detect_paper_holes(img, pcb_mask, paper_model,
                                  width_mm, height_mm, pixels_per_mm)
-    debug_steps.append({"step": "05_holes", "label": f"纸色匹配孔槽({len(holes)}个)",
+    debug_steps.append({"step": "04_holes", "label": f"纸色匹配孔槽({len(holes)}个)",
                         "holes": holes})
 
-    # ── Step 6: Edge-decontaminated transparent PNG ──
+    # ── Step 5: Edge-decontaminated transparent PNG ──
     transparent_png = _make_transparent(img, pcb_mask)
     return {
-        "outline": outline, "grooves": notches,
-        "groove_count": len(notches), "groove_warning": notch_warning,
+        "outline": outline,
         "holes": holes, "hole_count": len(holes),
         "pcb_mask_b64": _to_b64(pcb_mask),
         "transparent_pcb_b64": base64.b64encode(transparent_png).decode("ascii"),
@@ -239,17 +283,11 @@ TASKS:
    - Shadows on paper are NOT part of the board.
    - Bright PCB surface elements ARE part of the board.
 2. SHADOWS — Darker paper regions OUTSIDE the PCB. One polygon per region.
-3. EDGE GROOVES (凹槽) — MAX {max_grooves} most prominent concave indentations
-   into the board edge where white paper is visible inside the notch.
 
 Return ONLY a JSON object (no markdown, no explanation):
 {{
   "outline": [{{"x_frac":0.1234,"y_frac":0.0567}}, ...],
-  "shadows": [{{"polygon":[{{"x_frac":...,"y_frac":...}},...]}}],
-  "grooves": [
-    {{"type":"groove","polygon":[{{"x_frac":...,"y_frac":...}},...],
-      "depth_mm":2.5,"confidence":0.85}}
-  ]
+  "shadows": [{{"polygon":[{{"x_frac":...,"y_frac":...}},...]}}]
 }}
 
 Coordinates: x_frac/y_frac are 0.0-1.0 fractions, 4-5 decimal places.
@@ -278,7 +316,7 @@ def _get_api_key() -> str:
 
 
 def _vlm_detect_contour(img: np.ndarray, width_mm: float, height_mm: float) -> dict:
-    """Call Qwen VLM → {outline, grooves, shadows, holes}."""
+    """Call Qwen VLM → {outline, shadows, holes}."""
     if not _get_api_key() or MultiModalConversation is None:
         _log.warning("VLM unavailable")
         return _empty()
@@ -288,15 +326,13 @@ def _vlm_detect_contour(img: np.ndarray, width_mm: float, height_mm: float) -> d
     _, png = cv2.imencode(".png", img)
     url = f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}"
     prompt = _CONTOUR_PROMPT.format(width=width_mm, height=height_mm,
-                                     px_w=w, px_h=h, max_grooves=MAX_GROOVES)
+                                     px_w=w, px_h=h)
 
     _log.info("VLM contour: %d×%d image", w, h)
-    try:
-        resp = MultiModalConversation.call(model=MODEL_NAME,
-            messages=[{"role":"user","content":[{"image":url},{"text":prompt}]}],
-            temperature=TEMPERATURE, max_tokens=MAX_TOKENS, enable_thinking=ENABLE_THINKING)
-    except Exception as exc:
-        _log.error("VLM API error: %s", exc)
+    resp = _vlm_call(model=MODEL_NAME,
+        messages=[{"role":"user","content":[{"image":url},{"text":prompt}]}],
+        temperature=TEMPERATURE, max_tokens=MAX_TOKENS, enable_thinking=ENABLE_THINKING)
+    if resp is None:
         return _empty()
 
     if resp.status_code != 200:
@@ -317,7 +353,6 @@ def _vlm_detect_contour(img: np.ndarray, width_mm: float, height_mm: float) -> d
 
     return {
         "outline": _frac_list(parsed.get("outline",[]), width_mm, height_mm),
-        "grooves": _parse_grooves(parsed.get("grooves",[]), width_mm, height_mm),
         "shadows": [{"polygon": _frac_list(s.get("polygon",[]), width_mm, height_mm)}
                     for s in parsed.get("shadows",[])],
         "holes": _parse_holes(parsed.get("holes",[]), width_mm, height_mm),
@@ -330,7 +365,7 @@ def _vlm_detect_holes(img: np.ndarray, width_mm: float, height_mm: float) -> lis
 
 
 def _empty() -> dict:
-    return {"outline":[],"grooves":[],"shadows":[],"holes":[]}
+    return {"outline":[],"shadows":[],"holes":[]}
 
 
 
@@ -362,18 +397,6 @@ def _frac_list(pts, w_mm, h_mm):
     return [{"x_mm":round(float(p.get("x_frac",0))*w_mm,3),
              "y_mm":round(float(p.get("y_frac",0))*h_mm,3)}
             for p in pts if isinstance(p,dict) and 0<=float(p.get("x_frac",-1))<=1]
-
-def _parse_grooves(vg, w, h):
-    out = []
-    for i,g in enumerate(vg[:MAX_GROOVES]):
-        if not isinstance(g,dict): continue
-        poly = _frac_list(g.get("polygon",[]),w,h)
-        if len(poly)<3: continue
-        t = g.get("type","groove"); t = t if t in ("groove","protrusion") else "groove"
-        out.append({"id":f"groove_{i+1:02d}","groove_type":t,"polygon":poly,
-                     "depth_mm":float(g.get("depth_mm",0)),
-                     "confidence":float(g.get("confidence",0.7)),"source":"vlm"})
-    return out
 
 def _parse_holes(vh, w, h):
     out = []
@@ -675,125 +698,6 @@ def _detect_paper_holes(img, pcb_mask, paper_model, w_mm, h_mm, ppm):
               len(holes), paper_model["h_lo"], paper_model["h_hi"],
               paper_model["s_lo"], paper_model["s_hi"])
     return holes
-
-
-def _validate_notches_by_paper(img, pcb_mask, outline_mm, paper_model,
-                                w_mm, h_mm, ppm):
-    """Validate edge notches using paper colour matching.
-
-    An edge notch is a concave indentation where paper is visible INSIDE
-    the notch.  We check each convexity defect: if the defect interior
-    matches paper colour → real notch.  Otherwise → shadow / noise.
-    """
-    h, w_img = img.shape[:2]
-    if paper_model is None:
-        return [], None
-
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    paper_color = cv2.inRange(
-        hsv,
-        np.array([paper_model["h_lo"], paper_model["s_lo"], paper_model["v_lo"]]),
-        np.array([paper_model["h_hi"], paper_model["s_hi"], paper_model["v_hi"]]),
-    )
-
-    contours, _ = cv2.findContours(pcb_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
-        return [], "No PCB contour found"
-    cnt = max(contours, key=cv2.contourArea)
-    n_contour = len(cnt)
-    perim = cv2.arcLength(cnt, True)
-
-    hull = cv2.convexHull(cnt, returnPoints=False)
-    if len(hull) < 4:
-        return [], None
-
-    defects = cv2.convexityDefects(cnt, hull)
-    if defects is None:
-        return [], None
-
-    min_depth_px = max(ppm * 0.12, 6.0)
-    max_seg_ratio = 0.35
-    max_seg_px = perim * max_seg_ratio
-    min_paper_ratio = 0.25  # At least 25% of notch interior must match paper
-
-    notches = []
-    for i in range(defects.shape[0]):
-        row = defects[i].flatten()
-        s, e, f, d = int(row[0]), int(row[1]), int(row[2]), int(row[3])
-        depth = d / 256.0
-        if depth < min_depth_px:
-            continue
-
-        fwd = (e - s) % n_contour
-        bwd = (s - e) % n_contour
-        seg_arc = min(fwd, bwd)
-        if seg_arc > max_seg_px:
-            continue
-
-        depth_mm = depth / ppm
-        arc_mm = seg_arc / ppm
-        depth_ratio = depth_mm / max(arc_mm, 0.1)
-        min_ratio = 0.04 if depth_mm > 0.5 else 0.06
-        if depth_ratio < min_ratio:
-            continue
-
-        # ── Paper-match validation: is paper visible inside the notch? ──
-        # Build a triangle: s, f, e → check paper fill ratio
-        sf = cnt[s][0], cnt[f][0]
-        with_subscript = False  # check surrounding area for paper
-        tri_mask = np.zeros((h, w_img), dtype=np.uint8)
-        tri = np.array([[cnt[s][0], cnt[f][0], cnt[e][0]]], dtype=np.int32)
-        cv2.fillPoly(tri_mask, tri, 255)
-
-        paper_in_notch = cv2.bitwise_and(tri_mask, paper_color)
-        paper_fill = np.sum(paper_in_notch) / max(np.sum(tri_mask), 1)
-
-        if paper_fill < min_paper_ratio:
-            _log.debug("Notch rejected: paper_fill=%.2f < %.2f", paper_fill, min_paper_ratio)
-            continue
-
-        # Collect contour points
-        if s < e:
-            groove_pts = cnt[s:e+1, 0, :].tolist()
-        else:
-            groove_pts = cnt[s:, 0, :].tolist() + cnt[:e+1, 0, :].tolist()
-        if len(groove_pts) < 4:
-            continue
-
-        segments = np.array(groove_pts, dtype=np.float32).reshape(-1, 1, 2)
-        poly_eps = max(ppm * 0.15, 5.0)
-        simplified = cv2.approxPolyDP(segments, poly_eps, True).reshape(-1, 2)
-        if len(simplified) < 3:
-            simplified = np.array(groove_pts[:min(6, len(groove_pts))])
-
-        cx = int(np.mean([p[0] for p in groove_pts]))
-        cy = int(np.mean([p[1] for p in groove_pts]))
-
-        idx = len(notches) + 1
-        notches.append({
-            "id": f"notch_{idx:02d}",
-            "groove_type": "groove",
-            "polygon": [{"x_mm": round(float(px) / w_img * w_mm, 3),
-                         "y_mm": round(float(py) / h * h_mm, 3)}
-                        for px, py in simplified.tolist()],
-            "center_mm": {"x_mm": round(float(cx) / w_img * w_mm, 3),
-                          "y_mm": round(float(cy) / h * h_mm, 3)},
-            "depth_mm": round(depth_mm, 2),
-            "seg_arc_mm": round(arc_mm, 2),
-            "depth_ratio": round(depth_ratio, 3),
-            "paper_fill": round(float(paper_fill), 2),
-            "confidence": min(0.95, 0.5 + 0.5 * paper_fill),
-            "source": "paper_validated",
-        })
-
-    warning = None
-    if len(notches) > MAX_GROOVES:
-        notches.sort(key=lambda g: g.get("confidence", 0), reverse=True)
-        notches = notches[:MAX_GROOVES]
-        warning = f"检测到{len(notches)}个凹槽，已保留最显著的{MAX_GROOVES}个"
-
-    _log.info("Paper-validated notches: %d found", len(notches))
-    return notches, warning
 
 
 # ═══════════════════════════════════════════════════════════════════════

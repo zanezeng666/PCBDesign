@@ -35,6 +35,7 @@ from .vlm_detection import verify_pad_crop as _verify_pad_crop
 from .vision import extract_pcb as _extract_pcb, detect_holes as _detect_holes
 from .vision import _make_transparent, refine_outline_geometry
 from .vision import detect_black_frame as _detect_black_frame, calibrate_black_frame as _calibrate_black_frame
+from .pcb_recognition import PCBRecognitionPipeline
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -2165,38 +2166,30 @@ def api_extract_pcb(calibration_id: str = Form(...),
         try:
             merge_w = max(w_mm, other_w_mm)
             merge_h = max(h_mm, other_h_mm)
-            consensus_outline, _, _, _ = _merge_front_back_outlines(
-                result["outline"], other_outline, merge_w, merge_h,
-                front_ppm=ppm, back_ppm=other_ppm)
-            result["outline"] = consensus_outline
-            consensus_msg = f" (正反面对照纠正, {len(consensus_outline)}顶点)"
 
-            # ── Rebuild display mask & transparent PNG from consensus outline ──
-            try:
-                nparr2 = np.frombuffer(png, np.uint8)
-                img2 = cv2.imdecode(nparr2, cv2.IMREAD_COLOR)
-                h2, w2 = img2.shape[:2]
-                if len(consensus_outline) >= 3:
-                    outline_px = np.array([
-                        [round(p["x_mm"] / w_mm * w2),
-                         round(p["y_mm"] / h_mm * h2)]
-                        for p in consensus_outline
-                    ], dtype=np.int32)
-                    new_mask = np.zeros((h2, w2), dtype=np.uint8)
-                    cv2.fillPoly(new_mask, [outline_px], 255)
-                    # Punch grooves back through (consensus merge simplifies the
-                    # polygon and loses groove detail → white background).
-                    if orig_mask is not None and orig_mask.shape == new_mask.shape:
-                        new_mask = cv2.bitwise_and(new_mask, orig_mask)
-                    result["pcb_mask_b64"] = base64.b64encode(
-                        cv2.imencode(".png", new_mask)[1]).decode("ascii")
-                    result["transparent_pcb_b64"] = base64.b64encode(
-                        _make_transparent(img2, new_mask)).decode("ascii")
-                    logger.info("extract-pcb consensus: rebuilt display from %d-vertex outline",
-                                len(consensus_outline))
-            except Exception:
-                logger.warning("extract-pcb consensus: image rebuild failed",
-                               exc_info=True)
+            # 构建正面结果供交叉校验
+            front_result = {
+                "outline": result["outline"],
+                "pixels_per_mm": ppm,
+                "width_mm": w_mm,
+                "height_mm": h_mm,
+                "rectified_png_b64": result.get("rectified_png_b64", ""),
+            }
+            back_result = {
+                "outline": other_outline,
+                "pixels_per_mm": other_ppm,
+                "width_mm": other_w_mm,
+                "height_mm": other_h_mm,
+                "rectified_png_b64": "",
+            }
+
+            cross_result = PCBRecognitionPipeline.cross_validate_front_back(
+                front_result, back_result
+            )
+            consensus_outline = cross_result["outline"]
+            result["outline"] = consensus_outline
+            result["transparent_pcb_b64"] = cross_result["transparent_pcb_b64"]
+            consensus_msg = f" (正反面对照纠正, {len(consensus_outline)}顶点)"
 
             logger.info("extract-pcb consensus: %s corrected via other side",
                         calibration_id)
@@ -2530,567 +2523,6 @@ def _resample_polygon_perimeter(pts, n):
     return np.array(result, dtype=np.float32)
 
 
-def _remove_collinear_pts(pts, angle_tol_deg=3.5):
-    """Remove vertices where angle ≈ 180° (collinear)."""
-    if len(pts) < 4:
-        return pts
-    n = len(pts)
-    keep = [True] * n
-    for i in range(n):
-        a, b, c = pts[(i - 1) % n], pts[i], pts[(i + 1) % n]
-        v1, v2 = a - b, c - b
-        l1, l2 = np.linalg.norm(v1), np.linalg.norm(v2)
-        if l1 < 1e-6 or l2 < 1e-6:
-            keep[i] = False
-            continue
-        cos_a = np.clip(np.dot(v1, v2) / (l1 * l2), -1.0, 1.0)
-        if np.degrees(np.arccos(cos_a)) >= (180.0 - angle_tol_deg):
-            keep[i] = False
-    result = pts[np.array(keep)]
-    return result if len(result) >= 3 else pts
-
-
-def _contour_to_points(ol_mm):
-    """Convert outline dict list to flat (x,y) numpy array."""
-    pts = []
-    for pt in ol_mm:
-        if isinstance(pt, dict):
-            pts.append([pt.get("x_mm", 0), pt.get("y_mm", 0)])
-        elif hasattr(pt, '__iter__') and len(pt) >= 2:
-            pts.append([float(pt[0]), float(pt[1])])
-    return np.array(pts, dtype=np.float32) if pts else None
-
-
-def _simplify_polygon_dp(pts_mm, epsilon_mm=None):
-    """Douglas-Peucker polygon simplification — keep only main shape vertices.
-
-    The raw HSV-mask contour has dozens/hundreds of vertices, many of which are
-    shadow-noise artifacts.  A real PCB has a clean geometric outline with ~6–20
-    significant corners.  This function strips the noise before Chamfer matching.
-
-    epsilon_mm:  minimum allowed deviation in mm.  When not provided, defaults
-                 to 3% of the polygon's bounding-box diagonal, which scales with
-                 PCB size.  Adaptive floor = 1.2% of perimeter.
-    """
-    if len(pts_mm) < 4:
-        return pts_mm
-    if epsilon_mm is None:
-        bbox_w = float(pts_mm[:, 0].max() - pts_mm[:, 0].min())
-        bbox_h = float(pts_mm[:, 1].max() - pts_mm[:, 1].min())
-        epsilon_mm = max(bbox_w, bbox_h) * 0.03  # proportional to PCB extent
-    peri_mm = cv2.arcLength(pts_mm.reshape(-1, 1, 2), True)
-    # Adaptive epsilon: max(proportional floor, 1.2% of perimeter).
-    eps = max(epsilon_mm, peri_mm * 0.012)
-    simplified = cv2.approxPolyDP(
-        pts_mm.reshape(-1, 1, 2), eps, True).reshape(-1, 2)
-    # Remove collinear leftovers after DP (tight 3° tolerance)
-    simplified = _remove_collinear_pts(simplified, angle_tol_deg=3.0)
-    logger.info("DP simplify: %d → %d vertices (eps=%.2f mm, peri=%.0f mm)",
-                len(pts_mm), len(simplified), eps, peri_mm)
-    return simplified if len(simplified) >= 3 else pts_mm
-
-
-def _prune_hull_burrs(pts_mm, min_depth_mm=None, max_width_mm=None):
-    """Remove narrow deep dents (shadow burrs) from polygon vertices.
-
-    After DP simplification, small-scale shadow burrs may still survive as
-    a single deep-concave vertex on an otherwise straight polygon edge.
-    These are characterised by: (1) vertex angle near 180° (shallow V),
-    (2) large point-to-chord distance (deep dent), (3) narrow chord (small mouth).
-
-    Strategy: for each vertex, compute the distance to the chord connecting
-    its two neighbours.  If the chord is narrow and the vertex is far from it,
-    the vertex is a burr and is removed.  Legitimate corners have either
-    large chord widths or sharp angles that survive the filter.
-    """
-    if len(pts_mm) < 5:
-        return pts_mm
-    bbox_w = float(pts_mm[:, 0].max() - pts_mm[:, 0].min())
-    bbox_h = float(pts_mm[:, 1].max() - pts_mm[:, 1].min())
-    bbox_dim = max(bbox_w, bbox_h)
-    if min_depth_mm is None:
-        min_depth_mm = max(bbox_dim * 0.02, 0.5)   # 2% of bbox, min 0.5mm
-    if max_width_mm is None:
-        max_width_mm = max(bbox_dim * 0.12, 2.0)    # 12% of bbox, min 2.0mm
-    n = len(pts_mm)
-    keep = [True] * n
-    removed = 0
-
-    for i in range(n):
-        p_prev = pts_mm[(i - 1) % n]
-        p_i = pts_mm[i]
-        p_next = pts_mm[(i + 1) % n]
-
-        # Chord vector and length
-        chord = p_next - p_prev
-        chord_len = float(np.linalg.norm(chord))
-        if chord_len < 0.1:
-            continue
-
-        # Distance from vertex to chord line (point-line distance)
-        # 2D cross product: |chord x (p_i - p_prev)| = |cx*dy - cy*dx|
-        d = p_i - p_prev
-        cross_abs = abs(float(chord[0] * d[1] - chord[1] * d[0]))
-        dist = cross_abs / chord_len
-
-        if dist < min_depth_mm or chord_len > max_width_mm:
-            continue
-
-        # Check angle at vertex: near-180° = shallow dent (burr-like)
-        v1 = p_prev - p_i
-        v2 = p_next - p_i
-        len1 = float(np.linalg.norm(v1))
-        len2 = float(np.linalg.norm(v2))
-        if len1 < 1e-6 or len2 < 1e-6:
-            keep[i] = False
-            removed += 1
-            continue
-        cos_angle = max(-1.0, min(1.0, float(np.dot(v1, v2)) / (len1 * len2)))
-        angle_deg = float(np.degrees(np.arccos(cos_angle)))
-
-        # Vertex with angle > 155°: almost-straight edge with a dent → burr
-        if angle_deg >= 155.0:
-            keep[i] = False
-            removed += 1
-
-    if removed > 0:
-        result = pts_mm[np.array(keep)]
-        logger.info("Hull burr prune: removed %d burr vertices, %d → %d",
-                    removed, n, len(result))
-        return result if len(result) >= 3 else pts_mm
-    return pts_mm
-
-
-def _extract_straight_edges(pts_mm, min_length_mm=None):
-    """Extract long straight edge segments from a DP-simplified polygon.
-
-    Each segment is a pair of consecutive vertices. Segments shorter than
-    min_length_mm are filtered out — short edges are typically shadow burrs,
-    not real PCB physical edges. Returns metadata needed for alignment scoring:
-    direction, normal, midpoint, and projection range.
-
-    When min_length_mm is not provided, it defaults to 10% of the polygon's
-    smaller bbox dimension (min 1.5mm), which scales with PCB size.
-    """
-    n = len(pts_mm)
-    if n < 3:
-        return []
-    if min_length_mm is None:
-        bbox_w = float(pts_mm[:, 0].max() - pts_mm[:, 0].min())
-        bbox_h = float(pts_mm[:, 1].max() - pts_mm[:, 1].min())
-        min_length_mm = max(min(bbox_w, bbox_h) * 0.10, 1.5)
-    edges = []
-    for i in range(n):
-        p1 = pts_mm[i]
-        p2 = pts_mm[(i + 1) % n]
-        vec = p2 - p1
-        length = float(np.linalg.norm(vec))
-        if length < min_length_mm:
-            continue
-        direction = vec / length
-        # Perpendicular normal (CCW rotation of direction)
-        normal = np.array([-direction[1], direction[0]], dtype=np.float64)
-        midpoint = (p1 + p2) / 2.0
-        edges.append({
-            'p1': p1.copy(),
-            'p2': p2.copy(),
-            'length': length,
-            'direction': direction,
-            'normal': normal,
-            'midpoint': midpoint,
-        })
-    return edges
-
-
-def _score_straight_edge_align(front_edges, back_pts, dx_mm, dy_mm,
-                                angle_cos_th=0.966, max_dist_mm=2.0,
-                                min_overlap=0.3, min_length_mm=None):
-    """Score a candidate (dx, dy) translation by straight-edge alignment quality.
-
-    PCB physical edges are straight — unlike shadow-generated jagged edges.
-    This function only trusts the long straight segments from DP simplification
-    as ground truth for alignment.
-
-    For each front straight edge, it looks for a parallel, overlapping, and
-    nearby counterpart in the shifted back polygon.  The total score is the sum
-    of (edge_length × overlap_ratio × distance_decay) over all matched edges.
-
-    Returns:
-        float: alignment score (higher = better).  0.0 if no edges match.
-    """
-    if not front_edges:
-        return 0.0
-
-    # Shift back and extract its straight edges
-    shifted_back = back_pts.copy()
-    shifted_back[:, 0] += dx_mm
-    shifted_back[:, 1] += dy_mm
-    back_edges = _extract_straight_edges(shifted_back, min_length_mm=min_length_mm)
-
-    if not back_edges:
-        return 0.0
-
-    score = 0.0
-    for fe in front_edges:
-        best_quality = 0.0
-        for be in back_edges:
-            # 1. Direction similarity: cos_sim > angle_cos_th (±15°)
-            cos_sim = abs(float(np.dot(fe['direction'], be['direction'])))
-            if cos_sim < angle_cos_th:
-                continue
-
-            # 2. Perpendicular distance between parallel lines
-            dist = abs(float(np.dot(fe['normal'], be['midpoint'] - fe['midpoint'])))
-            if dist > max_dist_mm:
-                continue
-
-            # 3. Projection overlap along front edge direction
-            # Project back endpoints onto front edge's infinite line
-            proj_a1 = 0.0
-            proj_a2 = fe['length']
-            proj_b1 = float(np.dot(fe['direction'], be['p1'] - fe['p1']))
-            proj_b2 = float(np.dot(fe['direction'], be['p2'] - fe['p1']))
-
-            b_min, b_max = min(proj_b1, proj_b2), max(proj_b1, proj_b2)
-            overlap_start = max(proj_a1, b_min)
-            overlap_end = min(proj_a2, b_max)
-            overlap_len = max(0.0, overlap_end - overlap_start)
-
-            if overlap_len <= 0:
-                continue
-
-            overlap_ratio = overlap_len / fe['length']
-            if overlap_ratio < min_overlap:
-                continue
-
-            # Quality: overlap × linear distance decay
-            dist_decay = max(0.0, 1.0 - dist / max_dist_mm)
-            quality = overlap_ratio * dist_decay
-
-            if quality > best_quality:
-                best_quality = quality
-
-        if best_quality > 0:
-            score += fe['length'] * best_quality
-
-    return score
-
-
-def _merge_front_back_outlines(front_ol, back_ol, w_mm, h_mm,
-                              front_ppm=0.0, back_ppm=0.0):
-    """Merge front + back PCB outlines via full 2D mask comparison.
-
-    Key constraint:  back is the front PCB **left-right mirrored**
-    (same board, flipped over — left⇄right, top=top, bottom=bottom).
-
-    Strategy (full 2D consensus):
-      1. Mirror back around its bbox x-center (correct physical flip).
-      2. Align by STRAIGHT-EDGE MATCHING (translation only):
-         PCB physical edges are straight — shadow/jagged edges are NOT trusted.
-         Extract long straight segments (≥5mm) from DP-simplified polygons,
-         then search (dx, dy) that maximises the total length-weighted quality
-         of parallel + overlapping + nearby front⇆back edge pairs.
-         Two-pass coarse→fine grid search for optimal translation.
-         NOTE: consensus masks are drawn from the RAW (un-simplified) points so
-         shallow notch/groove features survive; the 2mm DP simplification is used
-         ONLY to obtain clean edges for alignment.  No PPM/scale rescaling is
-         applied — both outlines are already in mm, and an IoU-based scale search
-         would merely shrink the good outline to match the smaller one.
-      3. INTERSECTION mask → removes one-sided PROTRUSION burrs.
-      4. diff = fm XOR bm → the full 2D difference between the two masks.
-      5. Hull = convex hull of intersection.
-      6. diff ∩ hull → indentation-style burrs (one side's shadow artifact
-         creating a "bite" that the other side fills).
-      7. Connected-component analysis on diff in hull:
-         - Small isolated components → shadow burrs → FILL them.
-         - Large components → serious misalignment → log warning, keep.
-      8. Extract clean polygon from filled result.
-    """
-    # RAW points are kept for consensus-mask drawing so that shallow notch /
-    # groove features (0.3-0.5mm) are preserved.  The 2mm DP simplification
-    # below would erase them, so it is applied ONLY to copies used to obtain
-    # clean straight edges for alignment.
-    front_raw = _contour_to_points(front_ol)
-    back_raw = _contour_to_points(back_ol)
-
-    # ---- simplify copies for robust straight-edge alignment ----
-    # Raw HSV-mask contours have 50-200+ noisy vertices from shadow edges.
-    # DP simplification keeps the ~6-20 geometric corners for edge matching,
-    # but is NEVER used for the consensus mask (would destroy notches).
-    front_pts = _simplify_polygon_dp(front_raw.copy()) if front_raw is not None else None
-    back_pts = _simplify_polygon_dp(back_raw.copy()) if back_raw is not None else None
-
-    if front_pts is None or back_pts is None:
-        # One outline missing — return the available one with dummy areas
-        ol = front_ol if front_pts is not None else (back_ol or [])
-        pts = front_pts if front_pts is not None else back_pts
-        if pts is not None and len(pts) >= 3:
-            a = float(abs(cv2.contourArea(pts.reshape(-1, 1, 2).astype(np.float32))))
-        else:
-            a = 0.0
-        return ol, a, a, a
-
-    # ── High-resolution canvas (0.05mm/pixel) ──
-    SCALE = 20.0  # px/mm → 0.05mm precision
-    cw = int(w_mm * SCALE) + 1
-    ch = int(h_mm * SCALE) + 1
-    if cw < 10 or ch < 10:
-        # Canvas too small — return front outline with contour-based area
-        if len(front_pts) >= 3:
-            a_f = float(abs(cv2.contourArea(front_pts.reshape(-1, 1, 2).astype(np.float32))))
-        else:
-            a_f = 0.0
-        if len(back_pts) >= 3:
-            a_b = float(abs(cv2.contourArea(back_pts.reshape(-1, 1, 2).astype(np.float32))))
-        else:
-            a_b = 0.0
-        return front_ol, a_f, a_b, a_f
-
-    # ── 1. Mirror back around its bbox x-center ──
-    # Use the RAW bbox (simplification can shift extreme points slightly).
-    # The same mirror is applied to BOTH the raw points (consensus mask) and
-    # the simplified points (alignment).
-    b_min_x, b_max_x = np.min(back_raw[:, 0]), np.max(back_raw[:, 0])
-    back_cx = (b_min_x + b_max_x) / 2.0
-    back_mirrored = back_pts.copy()            # simplified → alignment
-    back_mirrored[:, 0] = 2.0 * back_cx - back_mirrored[:, 0]
-    back_raw_mir = back_raw.copy()             # raw → consensus mask
-    back_raw_mir[:, 0] = 2.0 * back_cx - back_raw_mir[:, 0]
-
-    # ── 2. Align: centroid initial guess → coarse+fine grid search for best straight-edge match ──
-    f_centroid = np.mean(front_pts, axis=0)
-    b_centroid = np.mean(back_mirrored, axis=0)
-    init_tx = f_centroid - b_centroid
-    back_mirrored += init_tx
-    back_raw_mir += init_tx
-
-    # ── 2a. Extent matching: compensate systematic scale mismatch ──
-    # The two photos may be at slightly different zoom, so the other side can
-    # be uniformly larger/smaller than the current side.  Left uncorrected the
-    # intersection would (a) shrink the result to the smaller side, and (b)
-    # "cut" the corners (offset arcs intersect into a spurious large corner
-    # radius that the downstream geometry refinement then over-rounds,
-    # shrinking the board).  Scale the OTHER side about its centroid to match
-    # the CURRENT side's bbox extent BEFORE the straight-edge search, so the
-    # subsequent alignment re-optimises the translation on the scaled outline.
-    # This preserves the current side's own dimensions (its calibration scale)
-    # while still using the other side to recover notches and strip burrs.
-    f_min = front_raw.min(axis=0); f_max = front_raw.max(axis=0)
-    b_min = back_raw_mir.min(axis=0); b_max = back_raw_mir.max(axis=0)
-    f_ext = f_max - f_min; b_ext = b_max - b_min
-    if float(np.min(b_ext)) > 1e-6:
-        sx = max(0.95, min(1.05, float(f_ext[0] / b_ext[0])))
-        sy = max(0.95, min(1.05, float(f_ext[1] / b_ext[1])))
-        if abs(sx - 1.0) > 0.001 or abs(sy - 1.0) > 0.001:
-            bc = (b_min + b_max) / 2.0
-            scale_vec = np.array([sx, sy])
-            back_raw_mir = (back_raw_mir - bc) * scale_vec + bc
-            back_mirrored = (back_mirrored - bc) * scale_vec + bc
-            logger.info("Extent match: other side scaled by (%.4f, %.4f) "
-                        "to match current extent", sx, sy)
-
-    def _draw_mask(pts, dx_px=0, dy_px=0):
-        mask = np.zeros((ch, cw), dtype=np.uint8)
-        scaled = pts * SCALE
-        pix = np.round(scaled).astype(np.int32)
-        pix[:, 0] += dx_px
-        pix[:, 1] += dy_px
-        pix[:, 0] = np.clip(pix[:, 0], 0, cw - 1)
-        pix[:, 1] = np.clip(pix[:, 1], 0, ch - 1)
-        cv2.fillPoly(mask, [pix], 255)
-        return mask
-
-    # Draw front mask once (fixed reference) — from RAW points to keep notches.
-    fm = _draw_mask(front_raw)
-
-    # ── Straight-Edge Alignment ──
-    # PCB physical edges are straight — shadow/jagged edges are NOT trusted.
-    # We rely on DP-simplified long straight edges (≥5mm) as ground truth.
-    # Score each (dx, dy) by total length of front straight edges that have
-    # a parallel, overlapping, and nearby counterpart in the shifted back polygon.
-    # Two-pass coarse→fine: (±5mm @ 0.5mm step) → (±1mm @ 0.1mm step)
-
-    # Pre-extract front straight edges (fixed reference, computed once)
-    # min_length_mm defaults to 10% of polygon's smaller bbox dimension
-    front_edges = _extract_straight_edges(front_pts)
-    logger.info("Front straight edges: %d segments", len(front_edges))
-
-    best_dx_px, best_dy_px = 0, 0
-    best_score = -1.0
-    centroid_score = -1.0
-
-    search_passes = [(5.0, 0.5), (1.0, 0.1)]  # (range_mm, step_mm)
-
-    for pass_idx, (sr_mm, ss_mm) in enumerate(search_passes):
-        sr_px = int(sr_mm * SCALE)            # search radius in pixels
-        ss_px = max(1, int(ss_mm * SCALE))     # step in pixels
-        pass_best_score = -1.0
-
-        for dy_px in range(best_dy_px - sr_px, best_dy_px + sr_px + 1, ss_px):
-            for dx_px in range(best_dx_px - sr_px, best_dx_px + sr_px + 1, ss_px):
-                dx_mm = dx_px / SCALE
-                dy_mm = dy_px / SCALE
-                score = _score_straight_edge_align(front_edges, back_mirrored,
-                                                    dx_mm, dy_mm)
-                if score > pass_best_score:
-                    pass_best_score = score
-                    best_dx_px = dx_px
-                    best_dy_px = dy_px
-
-        if pass_idx == 0:
-            centroid_score = pass_best_score
-        logger.info("Align pass %d (range=±%.1fmm step=%.1fmm): "
-                    "best_edge_score=%.1f at (%.2f, %.2f) mm",
-                    pass_idx + 1, sr_mm, ss_mm, pass_best_score,
-                    best_dx_px / SCALE, best_dy_px / SCALE)
-
-    # Apply optimal translation to BOTH simplified (alignment) and raw (mask)
-    best_dx_mm = best_dx_px / SCALE
-    best_dy_mm = best_dy_px / SCALE
-    back_mirrored[:, 0] += best_dx_mm
-    back_mirrored[:, 1] += best_dy_mm
-    back_raw_mir[:, 0] += best_dx_mm
-    back_raw_mir[:, 1] += best_dy_mm
-
-    total_tx_mm = float(init_tx[0]) + best_dx_mm
-    total_ty_mm = float(init_tx[1]) + best_dy_mm
-    logger.info("Align: centroid edge_score=%.1f → optimal+(%.2f, %.2f) mm "
-                "edge_score=%.1f (total=%.2f, %.2f) mm",
-                centroid_score, best_dx_mm, best_dy_mm,
-                pass_best_score, total_tx_mm, total_ty_mm)
-
-    # ── 3. Draw final aligned back mask for consensus — from RAW points ──
-    bm = _draw_mask(back_raw_mir)
-
-    # ── 4. Base consensus: intersection + minimal CLOSE ──
-    inter = cv2.bitwise_and(fm, bm)
-    union = cv2.bitwise_or(fm, bm)
-    union_area_mm2 = float(np.sum(union > 0)) / (SCALE * SCALE)
-
-    # Fill sub-pixel alignment gaps (0.3mm kernel)
-    close_kpx = max(3, int(0.3 * SCALE))
-    if close_kpx % 2 == 0:
-        close_kpx += 1
-    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_kpx, close_kpx))
-    inter = cv2.morphologyEx(inter, cv2.MORPH_CLOSE, k_close)
-    inter = cv2.bitwise_and(inter, union)  # clamp
-    inter = cv2.bitwise_or(inter, cv2.bitwise_and(fm, bm))
-
-    # ── 5. Full 2D difference: XOR of the two aligned masks ──
-    diff = cv2.bitwise_xor(fm, bm)
-
-    # ── 6. Compute convex hull of intersection ──
-    #    Any difference pixel INSIDE the hull is one side's indentation
-    #    that the other side fills → shadow burr candidate.
-    inter_cnts, _ = cv2.findContours(inter, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not inter_cnts:
-        return front_ol
-
-    inter_cnt = max(inter_cnts, key=cv2.contourArea)
-    hull_mask = np.zeros((ch, cw), dtype=np.uint8)
-    hull_pts = cv2.convexHull(inter_cnt)
-    cv2.fillPoly(hull_mask, [hull_pts], 255)
-
-    # diff inside hull → indentations that one side fills → burr candidates
-    diff_burrs = cv2.bitwise_and(diff, hull_mask)
-
-    # ── 7. Connected-component analysis on burr candidates ──
-    #    Small isolated components: shadow burr → fill
-    #    Large components: possibly misalignment → warn, keep
-    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(diff_burrs, connectivity=4)
-
-    burr_max_area_mm2 = max(union_area_mm2 * 0.015, 6.0)  # adaptive: ≥6mm², scales with board
-    burr_max_area_px = int(burr_max_area_mm2 * SCALE * SCALE)
-    fill_mask = np.zeros((ch, cw), dtype=np.uint8)
-    small_burrs = 0
-    large_diffs = 0
-
-    for label_id in range(1, n_labels):  # skip background (0)
-        area_px = stats[label_id, cv2.CC_STAT_AREA]
-        if area_px <= burr_max_area_px:
-            fill_mask[labels == label_id] = 255
-            small_burrs += 1
-        else:
-            area_mm2 = area_px / (SCALE * SCALE)
-            logger.warning("Large diff region (%.1fmm²) inside hull — possible misalignment", area_mm2)
-            large_diffs += 1
-
-    # ── 8. Fill burrs → result = inter + filled burr areas ──
-    if small_burrs > 0:
-        result = cv2.bitwise_or(inter, fill_mask)
-        # Small CLOSE to smooth filled boundaries
-        smooth_kpx = max(3, int(0.3 * SCALE))
-        if smooth_kpx % 2 == 0:
-            smooth_kpx += 1
-        k_smooth = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (smooth_kpx, smooth_kpx))
-        result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, k_smooth)
-        result = cv2.bitwise_and(result, union)
-    else:
-        result = inter
-
-    # ── 8b. Morphological OPEN to trim thin protrusions ──
-    # After consensus, narrow leftover protrusions (thin "spikes") may remain
-    # on the boundary from single-side shadow artifacts.  Use a SMALL 0.5mm
-    # kernel: the intersection already removes one-sided burrs, so this only
-    # cleans up tiny intersection artifacts.  A large kernel (e.g. 2.0mm)
-    # would round genuine sharp corners (r≈0.3mm) into ~1mm arcs, which the
-    # downstream geometry refinement then mis-detects as large corner radii.
-    open_kpx = max(3, int(0.5 * SCALE))
-    if open_kpx % 2 == 0:
-        open_kpx += 1
-    k_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_kpx, open_kpx))
-    result = cv2.morphologyEx(result, cv2.MORPH_OPEN, k_open)
-    result = cv2.bitwise_and(result, union)  # clamp to union
-
-    # ── 9. Extract clean polygon + hull burr prune ──
-    poly = _extract_clean_polygon(result, SCALE, w_mm, h_mm, raw_pts=False)
-    if len(poly) >= 5:
-        poly = _prune_hull_burrs(poly)
-
-    # ── Log metrics ──
-    f_area = np.sum(fm > 0) / (SCALE * SCALE)
-    b_area = np.sum(bm > 0) / (SCALE * SCALE)
-    u_area = np.sum(union > 0) / (SCALE * SCALE)
-    i_area = np.sum(cv2.bitwise_and(fm, bm) > 0) / (SCALE * SCALE)
-    r_area = np.sum(result > 0) / (SCALE * SCALE)
-    overlap_pct = (i_area / max(u_area, 1)) * 100.0
-
-    logger.info(
-        "Front/back 2D consensus: front=%.1fmm² back=%.1fmm², "
-        "overlap=%.0f%%, burrs_filled=%d large_diffs=%d "
-        "→ merged=%.1fmm², %d vertices",
-        f_area, b_area, overlap_pct, small_burrs, large_diffs, r_area, len(poly))
-
-    if len(poly) == 0:
-        # Return raw areas from contourArea as fallback
-        f_fallback = float(abs(cv2.contourArea(front_pts.reshape(-1, 1, 2).astype(np.float32))))
-        b_fallback = float(abs(cv2.contourArea(back_pts.reshape(-1, 1, 2).astype(np.float32))))
-        return front_ol, f_fallback, b_fallback, f_fallback
-
-    outline = [{"x_mm": round(float(x), 3), "y_mm": round(float(y), 3)}
-               for x, y in poly.tolist()]
-    return outline, round(f_area, 1), round(b_area, 1), round(r_area, 1)
-
-
-def _extract_clean_polygon(mask, SCALE, w_mm, h_mm, raw_pts=False):
-    """Extract a clean, simplified polygon from a binary mask.
-
-    Uses moderate epsilon + collinear removal to produce a clean polygon
-    with minimal vertices while preserving rounded corners and notches.
-    """
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return np.array([])
-    cnt = max(cnts, key=cv2.contourArea)
-    if raw_pts:
-        return cnt.reshape(-1, 2) / SCALE
-    peri = cv2.arcLength(cnt, True)
-    eps = peri * 0.0008  # moderate: preserves rounded corners (r≥2mm) and notches
-    poly = cv2.approxPolyDP(cnt, eps, True).reshape(-1, 2) / SCALE
-    poly = _remove_collinear_pts(poly, angle_tol_deg=5.0)
-    return poly
-
-
 def _compare_front_back_contours(steps):
     """Compare front and back PCB outlines — they must be identical (same physical board).
 
@@ -3126,14 +2558,28 @@ def _compare_front_back_contours(steps):
     AREA_THRESHOLD_PCT = 10.0  # 10% tolerance
 
     # ── Merge front + back into refined consensus outline ──
-    # Uses mask-based consensus in a shared canvas (same SCALE, same mm
-    # reference).  Returns areas computed from the mask — i.e. the SAME
-    # processing pipeline for all three numbers, unlike raw contour areas
-    # which come from a different computation path.
     w_mm = steps[0].get("frame_w_mm", 40.0) if steps else 40.0
     h_mm = steps[0].get("frame_h_mm", 25.0) if steps else 25.0
-    merged_outline, f_area, b_area, merged_area = _merge_front_back_outlines(
-        front_ol, back_ol, w_mm, h_mm, front_ppm, back_ppm)
+
+    front_result = {
+        "outline": front_ol,
+        "pixels_per_mm": front_ppm,
+        "width_mm": w_mm,
+        "height_mm": h_mm,
+    }
+    back_result = {
+        "outline": back_ol,
+        "pixels_per_mm": back_ppm,
+        "width_mm": w_mm,
+        "height_mm": h_mm,
+    }
+    cross_result = PCBRecognitionPipeline.cross_validate_front_back(
+        front_result, back_result
+    )
+    merged_outline = cross_result["outline"]
+    f_area = cross_result["front_area_mm2"]
+    b_area = cross_result["back_area_mm2"]
+    merged_area = cross_result["consensus_area_mm2"]
 
     if f_area <= 0 or b_area <= 0:
         return {"ok": False, "message": "无法计算PCB面积", "mismatch_area_pct": 0}

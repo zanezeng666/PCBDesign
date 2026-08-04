@@ -10,6 +10,7 @@ work/
 output/
 *.erc
 *.log
+logs/
 # temp debug files
 _*.*
 debug_crops/

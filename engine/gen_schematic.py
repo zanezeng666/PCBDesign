@@ -4,6 +4,9 @@ from pathlib import Path
 from datetime import datetime
 
 from .circuit_helpers import export_sch_png_direct, export_sch_png
+from .logger import get_logger
+
+_log = get_logger(__name__)
 
 
 def uid(): return str(uuid.uuid4())
@@ -510,8 +513,8 @@ if __name__ == "__main__":
     wires = sch_content.count('(wire ')
     labels = sch_content.count('(label ')
     junctions = sch_content.count('(junction ')
-    print(f"原理图: {sch_file}")
-    print(f"{wires} wires, {labels} labels, {junctions} junctions")
+    _log.info(f"原理图: {sch_file}")
+    _log.info(f"{wires} wires, {labels} labels, {junctions} junctions")
 
     # 导出 PNG
     png_file = out_dir / "schematic.png"

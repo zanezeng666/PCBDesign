@@ -8,6 +8,9 @@ import json
 from pathlib import Path
 
 from .config import KICAD_BIN, KICAD_CLI
+from .logger import get_logger
+
+_log = get_logger(__name__)
 
 def create_pcb_from_netlist(netlist_path: str, output_dir: str, 
                              width_mm: float = 40, height_mm: float = 15) -> dict:
@@ -20,9 +23,9 @@ def create_pcb_from_netlist(netlist_path: str, output_dir: str,
     
     pcb_file = os.path.join(output_dir, "board.kicad_pcb")
     
-    print(f"网表: {netlist_path}")
-    print(f"输出: {pcb_file}")
-    print(f"板尺寸: {width_mm}x{height_mm}mm")
+    _log.info(f"网表: {netlist_path}")
+    _log.info(f"输出: {pcb_file}")
+    _log.info(f"板尺寸: {width_mm}x{height_mm}mm")
     
     # 方案A: 用 kicad-cli 从网表创建 PCB（如果支持）
     # kicad-cli pcb import netlist 在新版中可能支持
@@ -47,7 +50,7 @@ def create_pcb_from_netlist(netlist_path: str, output_dir: str,
         
         # 保存模板
         board.Save(pcb_file)
-        print(f"PCB 模板已创建: {pcb_file}")
+        _log.info(f"PCB 模板已创建: {pcb_file}")
         
         # 导入网表
         netlist = pcbnew.NETLIST()
@@ -67,13 +70,13 @@ def create_pcb_from_netlist(netlist_path: str, output_dir: str,
                                                    y + (i // 4) * spacing))
         
         board.Save(pcb_file)
-        print(f"元件已放置, PCB 已保存: {pcb_file}")
+        _log.info(f"元件已放置, PCB 已保存: {pcb_file}")
         
         return {"pcb_path": pcb_file, "status": "ok"}
         
     except Exception as e:
-        print(f"pcbnew API 方式失败: {e}")
-        print("尝试使用 kicad-cli 方式...")
+        _log.warning(f"pcbnew API 方式失败: {e}")
+        _log.info("尝试使用 kicad-cli 方式...")
         return _create_pcb_via_cli(netlist_path, output_dir, pcb_file)
 
 
@@ -89,7 +92,7 @@ def _create_pcb_via_cli(netlist_path, output_dir, pcb_file):
     with open(pcb_file, 'w') as f:
         f.write(pcb_content)
     
-    print(f"已用降级方案生成 PCB: {pcb_file}")
+    _log.info(f"已用降级方案生成 PCB: {pcb_file}")
     return result
 
 
@@ -107,7 +110,7 @@ def export_gerber(pcb_path: str, gerber_dir: str):
     gerber_dir = str(Path(gerber_dir).absolute())
     Path(gerber_dir).mkdir(parents=True, exist_ok=True)
     
-    print(f"\n导出 Gerber 到: {gerber_dir}")
+    _log.info(f"\n导出 Gerber 到: {gerber_dir}")
     
     # 导出 Gerber
     result_gerber = subprocess.run(
@@ -116,9 +119,9 @@ def export_gerber(pcb_path: str, gerber_dir: str):
     )
     
     if result_gerber.returncode == 0:
-        print("   Gerber 导出成功")
+        _log.info("   Gerber 导出成功")
     else:
-        print(f"   Gerber 导出失败: {result_gerber.stderr}")
+        _log.error(f"   Gerber 导出失败: {result_gerber.stderr}")
     
     # 导出钻孔
     result_drill = subprocess.run(
@@ -127,9 +130,9 @@ def export_gerber(pcb_path: str, gerber_dir: str):
     )
     
     if result_drill.returncode == 0:
-        print("   钻孔文件导出成功")
+        _log.info("   钻孔文件导出成功")
     else:
-        print(f"   钻孔文件导出失败: {result_drill.stderr}")
+        _log.error(f"   钻孔文件导出失败: {result_drill.stderr}")
     
     return gerber_dir
 

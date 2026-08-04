@@ -5,9 +5,12 @@ import os
 from pathlib import Path
 
 from .config import CUSTOM_SYM_LIB, KICAD_CLI
+from .logger import get_logger
 
 import skidl
 from skidl import Net, Part, KICAD9, SchLib
+
+_log = get_logger(__name__)
 
 
 def init_skidl() -> SchLib | None:
@@ -99,7 +102,7 @@ def export_sch_png(sch_path: Path, png_path: Path, width: int = 1600) -> bool:
         capture_output=True, text=True,
     )
     if r.returncode != 0:
-        print(f"SVG export failed: {r.stderr[:200]}")
+        _log.error(f"SVG export failed: {r.stderr[:200]}")
         return False
 
     import cairosvg
@@ -120,8 +123,8 @@ def export_sch_png_direct(sch_path: Path, png_path: Path) -> bool:
         capture_output=True, text=True,
     )
     if r.returncode == 0:
-        print(f"PNG: {png_path} ({os.path.getsize(png_path)} bytes)")
+        _log.info(f"PNG: {png_path} ({os.path.getsize(png_path)} bytes)")
         return True
 
-    print(f"PNG export failed: {r.stderr[:200]}")
+    _log.error(f"PNG export failed: {r.stderr[:200]}")
     return False

@@ -7,6 +7,9 @@ import yaml
 from pathlib import Path
 
 from .circuit_helpers import init_skidl, build_circuit_from_yaml, create_nets_from_yaml
+from .logger import get_logger
+
+_log = get_logger(__name__)
 
 
 def generate_from_yaml(yaml_path: str, output_dir: str) -> dict:
@@ -15,20 +18,20 @@ def generate_from_yaml(yaml_path: str, output_dir: str) -> dict:
 
     custom_lib = init_skidl()
 
-    print(f"[1/3] 解析电路: {circuit['name']}")
-    print(f"       类型: {circuit['type']} | "
+    _log.info(f"[1/3] 解析电路: {circuit['name']}")
+    _log.info(f"       类型: {circuit['type']} | "
           f"板尺寸: {circuit.get('board', {}).get('width_mm', '?')}x"
           f"{circuit.get('board', {}).get('height_mm', '?')}mm")
-    print(f"       元件数: {len(circuit['parts'])}, 网络数: {len(circuit['nets'])}")
+    _log.info(f"       元件数: {len(circuit['parts'])}, 网络数: {len(circuit['nets'])}")
 
     # 创建元件
-    print("\n[2/3] 创建元件...")
+    _log.info("\n[2/3] 创建元件...")
     parts = build_circuit_from_yaml(circuit, custom_lib)
     for pid, p in parts.items():
-        print(f"       {pid}: {p.value} ({p.footprint})")
+        _log.debug(f"       {pid}: {p.value} ({p.footprint})")
 
     # 创建网络
-    print("\n[3/3] 创建网络连接...")
+    _log.info("\n[3/3] 创建网络连接...")
     nets = create_nets_from_yaml(circuit, parts)
 
     # 直接生成网表（最可靠的输出）
@@ -38,18 +41,18 @@ def generate_from_yaml(yaml_path: str, output_dir: str) -> dict:
 
     import skidl
     netlist_file = output_path / f"{sch_name}.net"
-    print(f"\n生成网表: {netlist_file}")
+    _log.info(f"\n生成网表: {netlist_file}")
     skidl.generate_netlist(filepath=str(netlist_file))
 
     # 也试图生成原理图（可选）
     sch_file = output_path / f"{sch_name}.kicad_sch"
-    print(f"生成原理图: {sch_file}")
+    _log.info(f"生成原理图: {sch_file}")
     generated_sch = False
     try:
         skidl.generate_schematic(filepath=str(sch_file))
         generated_sch = True
     except Exception as e:
-        print(f"       (原理图自动布局跳过: {type(e).__name__})")
+        _log.warning(f"       (原理图自动布局跳过: {type(e).__name__})")
 
     result = {
         "netlist_path": str(netlist_file),
@@ -62,9 +65,9 @@ def generate_from_yaml(yaml_path: str, output_dir: str) -> dict:
         "net_count": len(nets),
     }
 
-    print(f"\n[完成] 网表: {result['netlist_path']}")
+    _log.info(f"\n[完成] 网表: {result['netlist_path']}")
     if result["sch_path"]:
-        print(f"[完成] 原理图: {result['sch_path']}")
+        _log.info(f"[完成] 原理图: {result['sch_path']}")
 
     return result
 
