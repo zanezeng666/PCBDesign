@@ -161,21 +161,27 @@ def extract_pcb(rectified_png: bytes, width_mm: float, height_mm: float,
         debug_steps.append({"step": "02_paper_model", "label": f"纸张底色模型(H{paper_model['h_lo']}-{paper_model['h_hi']})",
                             "paper_model": {k: v for k, v in paper_model.items() if isinstance(v, (int, float, str))}})
 
-    # ── Step 2b: Paper-model shadow subtraction ──
-    # Remove pixels from pcb_mask whose HSV values match the paper colour model.
-    # Shadow regions near the PCB edge often have paper-like hue/saturation but
-    # get captured by the broad HSV green range.  Subtracting them here cleans
-    # the mask BEFORE outline refinement, eliminating shadow burrs.
+    # ── Step 2b: Paper-model shadow subtraction (edge-band only) ──
+    # Remove edge-shadow pixels whose HSV matches the paper colour model.
+    # Key: ONLY subtract within a narrow edge band (dilate XOR erode) to avoid
+    # removing internal solder pads that share paper-like HSV (silver/gold pads
+    # are high-V, low-S — indistinguishable from white paper in HSV).
     if paper_model:
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         paper_colour = cv2.inRange(hsv,
             np.array([paper_model["h_lo"], paper_model["s_lo"], paper_model["v_lo"]]),
             np.array([paper_model["h_hi"], paper_model["s_hi"], paper_model["v_hi"]]))
         before_nz = cv2.countNonZero(pcb_mask)
-        pcb_mask = cv2.bitwise_and(pcb_mask, cv2.bitwise_not(paper_colour))
+        # Narrow edge band: dilate XOR erode = strip along the contour only
+        k_band = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+        edge_band = cv2.bitwise_xor(
+            cv2.dilate(pcb_mask, k_band, iterations=1),
+            cv2.erode(pcb_mask, k_band, iterations=1))
+        paper_in_edge = cv2.bitwise_and(paper_colour, edge_band)
+        pcb_mask = cv2.bitwise_and(pcb_mask, cv2.bitwise_not(paper_in_edge))
         after_nz = cv2.countNonZero(pcb_mask)
         removed_pct = (before_nz - after_nz) / max(before_nz, 1) * 100
-        _log.info("Paper shadow subtraction: removed %d px (%.1f%%)", before_nz - after_nz, removed_pct)
+        _log.info("Paper shadow subtraction (edge-only): removed %d px (%.1f%%)", before_nz - after_nz, removed_pct)
         # Re-fill small holes created by subtraction
         if after_nz > 100:
             inv = cv2.bitwise_not(pcb_mask)

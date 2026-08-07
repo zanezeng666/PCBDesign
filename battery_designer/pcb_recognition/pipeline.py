@@ -4,11 +4,19 @@
 
 流程：
   1. 方向检测+强制横屏 (OrientationDetector)
-  2. 黑色方框检测 (BlackFrameDetector)
-  3. 透视校正 (PerspectiveCalibrator)
-  4. HSV PCB提取 (HSVPCBExtractor)
+  2. 黑色方框检测 (BlackFrameDetector) → 提供标定信息
+  3. 透视校正 (PerspectiveCalibrator) → 提供校正后图片
+  4. PCB轮廓提取 (HSVPCBExtractor) - 绿色环边界检测：
+     4.1 HSV色彩空间检测绿色像素 (H∈[35,100], S>25, V>15)
+     4.2 取最大连通域（排除噪声）
+     4.3 形态学闭运算填补缝隙，形成完整闭环
+     4.4 填充外轮廓内部 → PCB mask
+     4.5 形态学清理 + 最大连通域 + 轮廓光滑
   5. 纸色模型构建 (PaperModelBuilder)
   6. 透明PNG生成 (TransparentPNGGenerator)
+
+核心思路：PCB边缘一定是绿色阻焊层，形成连续的绿色环（覆盖率97-99.7%），
+         直接通过绿色环即可确定PCB边界，无需复杂的纸张/阴影分离。
 
 注：凹槽检测已移至 vision.py 中通过纸色验证+mask回写实现，
     确保透明PNG保留PCB的凹槽/缺口几何信息。
@@ -20,7 +28,7 @@ import base64
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -30,7 +38,9 @@ from .perspective_calibrator import PerspectiveCalibrator
 from .hsv_pcb_extractor import HSVPCBExtractor
 from .paper_model_builder import PaperModelBuilder
 from .transparent_png_generator import TransparentPNGGenerator
-from .cross_validator import CrossValidator
+
+if TYPE_CHECKING:
+    from .cross_validator import CrossValidator
 
 from ..logger import get_logger
 
@@ -58,6 +68,7 @@ class PCBRecognitionPipeline:
         image_bytes: bytes,
         frame_width_mm: float,
         frame_height_mm: float,
+        debug_dir=None,
     ) -> dict[str, Any]:
         """执行完整的PCB轮廓识别流程
 
@@ -144,7 +155,9 @@ class PCBRecognitionPipeline:
             steps_result["frame_detection"] = result_frame
             corners = result_frame["corners"]
             pixels_per_mm = result_frame["pixels_per_mm"]
-            _log.info("[OK] 方框检测: 密度=%.2f px/mm", pixels_per_mm)
+            frame_border_mm = result_frame.get("frame_border_mm", 1.5)
+            _log.info("[OK] 方框检测: 密度=%.2f px/mm, 线宽=%.2fmm",
+                      pixels_per_mm, frame_border_mm)
 
         except Exception as e:
             _log.error("[FAIL] 方框检测失败: %s", e)
@@ -169,10 +182,15 @@ class PCBRecognitionPipeline:
             _log.error("[FAIL] 透视校正失败: %s", e)
             raise
 
-        # ── Step 4: HSV PCB提取 ──
-        _log.info("Step 4/6: HSV PCB提取")
+        # ── Step 4: PCB提取（绿色环边界检测） ──
+        _log.info("Step 4/6: PCB提取（绿色环边界检测）")
         try:
-            result_extract = self.pcb_extractor.extract(rectified_bytes)
+            result_extract = self.pcb_extractor.extract(
+                rectified_bytes,
+                pixels_per_mm=pixels_per_mm,
+                frame_border_mm=frame_border_mm,
+                debug_dir=debug_dir,
+            )
             steps_result["pcb_extraction"] = result_extract
             pcb_contour = result_extract["pcb_contour"]
             _log.info("[OK] PCB提取: 面积占比=%.1f%%", result_extract["pcb_area_ratio"] * 100)
@@ -227,6 +245,8 @@ class PCBRecognitionPipeline:
         return {
             "calibration_id": calibration_id,
             "pixels_per_mm": pixels_per_mm,
+            "pcb_color": steps_result["pcb_extraction"]["color_name"],
+            "paper_color": steps_result["paper_model"]["paper_color"],
             "width_mm": frame_width_mm,
             "height_mm": frame_height_mm,
             "outline": outline_mm,
@@ -253,7 +273,12 @@ class PCBRecognitionPipeline:
         outline_mm = []
 
         for point in contour:
-            x_px, y_px = point[0]
+            if hasattr(point, "__len__") and len(point) >= 1 and hasattr(point[0], "__len__"):
+                # OpenCV contour format: (N, 1, 2) → point shape is (1, 2)
+                x_px, y_px = point[0]
+            else:
+                # Flat format: (N, 2)
+                x_px, y_px = point[0], point[1]
             x_mm = round(x_px / pixels_per_mm, 3)
             y_mm = round(y_px / pixels_per_mm, 3)
             outline_mm.append({"x_mm": x_mm, "y_mm": y_mm})
@@ -264,6 +289,8 @@ class PCBRecognitionPipeline:
     def cross_validate_front_back(
         front_result: dict[str, Any],
         back_result: dict[str, Any],
+        width_mm: float | None = None,
+        height_mm: float | None = None,
     ) -> dict[str, Any]:
         """正反面交叉校验（Step 7）
 
@@ -272,6 +299,8 @@ class PCBRecognitionPipeline:
         Args:
             front_result: 正面 pipeline.run() 结果
             back_result: 背面 pipeline.run() 结果
+            width_mm: PCB 宽度 (mm)，若未提供则从 result 提取或使用默认值
+            height_mm: PCB 高度 (mm)，若未提供则从 result 提取或使用默认值
 
         Returns:
             {
@@ -283,7 +312,10 @@ class PCBRecognitionPipeline:
                 "transparent_pcb_b64": 从共识轮廓生成的透明 PNG,
             }
         """
-        return CrossValidator.validate(front_result, back_result)
+        # 延迟导入避免循环依赖
+        from .cross_validator import CrossValidator
+        
+        return CrossValidator.validate(front_result, back_result, width_mm, height_mm)
 
 
 # ── 测试代码 ──
