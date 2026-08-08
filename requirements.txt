@@ -9,3 +9,4 @@ pytest==9.1.1
 CairoSVG==2.9.0
 dashscope>=1.24.6
 pytesseract>=0.3.13
+shapely>=2.0.0

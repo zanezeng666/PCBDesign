@@ -10,8 +10,8 @@ Get-Process python -ErrorAction SilentlyContinue | Where-Object {
 Start-Sleep -Seconds 1
 
 Write-Host "[2/3] Clearing cache..." -ForegroundColor Yellow
-Remove-Item -Recurse -Force "$PSScriptRoot\..\battery_designer\__pycache__" -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force "$PSScriptRoot\..\engine\__pycache__" -ErrorAction SilentlyContinue
+Get-ChildItem -Path "$PSScriptRoot\.." -Recurse -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "[3/3] Starting service..." -ForegroundColor Yellow
 Set-Location "$PSScriptRoot\.."

@@ -111,6 +111,13 @@ def configure_logging(
     
     # 控制台 handler
     if console:
+        # Windows 控制台默认 GBK 编码，无法输出 mm² 等字符，强制 UTF-8
+        if hasattr(sys.stdout, 'reconfigure'):
+            try:
+                sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+                sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+            except Exception:
+                pass
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(level)
         console_handler.setFormatter(formatter)

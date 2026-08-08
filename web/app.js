@@ -1,1416 +1,722 @@
-/* ──────────────────────────────────────────────────
- *  Battery Designer  —  Frontend App Logic
- *  FLOW:
- *    Step 1: Frame dims → Upload → Preview Frame → Scan Frame → Compare
- *    Step 2: Get PCB per side → Combined Extract Outlines → Holes/Pads/Components → Contour Match
- *    Step 3: Generate KiCad
- * ────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+ * Battery Designer — 前端逻辑（简化版三步流程）
+ *
+ * Step 1: 黑框尺寸 + 正反面图片 → recognize-pcb → 展示识别结果
+ * Step 2: 焊盘识别（detect-terminals）
+ * Step 3: 元器件识别（detect-components）
+ * Step 4: 设计参数 & 生成 KiCad
+ * ═══════════════════════════════════════════════════════════════ */
 
-const $ = (sel, ctx = document) => ctx.querySelector(sel);
-const $$ = (sel, ctx = document) => Array.from(ctx.querySelectorAll(sel));
-
-// ── Global state ──
-const STATE = {
-  autoTest: false,
-  frameW: 60, frameH: 30,
-  uploaded: { front: false, back: false },
-  // Original image blob URLs for toggle preview
-  origSrc: { front: null, back: null },
-  // Calibration data per side
-  cal: { front: null, back: null },
-  // Frame detection per side (from preview-black-frame)
-  scanned: { front: null, back: null },
-  // Extract-pcb results per side
-  extract: { front: null, back: null },
-  // Holes & pads results per side
-  holes: { front: null, back: null },
-  pads: { front: null, back: null },
-  // Component detection results per side
-  components: { front: null, back: null },
-  // Rectify toggle state per side (step 1)
-  rectShow: { front: true, back: true },
-  // Raw File objects for deferred calibration (step 2)
-  rawFile: { front: null, back: null },
-  // Step 3: design parameters
-  cellParams: null,   // AI cell lookup result
-  icDevice: null,     // resolved IC device package
-  inferredTopology: null,  // 'common' | 'separate' from pad labels
+// ── 全局状态 ──
+const state = {
+  frontFile: null,
+  backFile: null,
+  // recognize-pcb 结果
+  recognizeResult: null,
+  // calibration_id (front/back)
+  frontCalibrationId: null,
+  backCalibrationId: null,
+  // 前反面纠正后图片 base64
+  frontRectifiedB64: "",
+  backRectifiedB64: "",
+  // 焊盘结果
+  padsFront: null,
+  padsBack: null,
+  // 元器件结果
+  componentsFront: null,
+  componentsBack: null,
 };
 
-// ── Helpers ──
-function setBadge(stepId, text, cls) {
-  const b = $(`#badge-${stepId}`);
-  if (!b) return;
-  b.textContent = text;
-  b.className = `step-badge ${cls}`;
-}
-function show(el) { el.hidden = false; }
-function hide(el) { el.hidden = true; }
-function setHTML(el, html) { el.innerHTML = html; }
-function toggle(el, visible) { el.hidden = !visible; }
+// ── DOM helpers ──
+const $ = (id) => document.getElementById(id);
+const show = (el) => el && (el.hidden = false);
+const hide = (el) => el && (el.hidden = true);
+const setBadge = (badgeId, text, ok) => {
+  const el = $(badgeId);
+  if (!el) return;
+  el.textContent = text;
+  el.className = "step-badge " + (ok ? "ready" : "waiting");
+};
 
-// ══════════════════════════════════════════════════════════
-//  INITIALIZATION
-// ══════════════════════════════════════════════════════════
-async function init() {
-  // Read frame dimensions from inputs
-  const fw = $('#frame-w'), fh = $('#frame-h');
-  STATE.frameW = parseFloat(fw.value) || 40;
-  STATE.frameH = parseFloat(fh.value) || 25;
-  fw.addEventListener('input', () => { STATE.frameW = parseFloat(fw.value) || 40; });
-  fh.addEventListener('input', () => { STATE.frameH = parseFloat(fh.value) || 25; });
+/* ═══════════════════════════════════════════════════════════════
+ * Step 1: PCB 轮廓识别
+ * ═══════════════════════════════════════════════════════════════ */
 
-  setupUploadZones();
+// ── 文件上传：拖放 & 点击 ──
+function setupDropZone(zoneId, dropId, fileId, statusId, fileKey) {
+  const drop = $(dropId);
+  const fileInput = $(fileId);
+  const status = $(statusId);
 
-  // Step 1: rectify toggle inside upload zones
-  $('#rect-toggle-front').addEventListener('change', e => {
-    STATE.rectShow.front = e.target.checked;
-    drawUploadCanvas('front');
+  drop.addEventListener("click", () => fileInput.click());
+  drop.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    drop.classList.add("drag-over");
   });
-  $('#rect-toggle-back').addEventListener('change', e => {
-    STATE.rectShow.back = e.target.checked;
-    drawUploadCanvas('back');
+  drop.addEventListener("dragleave", () => drop.classList.remove("drag-over"));
+  drop.addEventListener("drop", (e) => {
+    e.preventDefault();
+    drop.classList.remove("drag-over");
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0], status, fileKey);
   });
-
-  // Scan black frame button
-  $('#btn-scan-frame').addEventListener('click', scanBlackFrame);
-
-  // Step 2: calibrate buttons per side
-  $('#btn-cal-front').addEventListener('click', () => calibrateSide('front'));
-  $('#btn-cal-back').addEventListener('click', () => calibrateSide('back'));
-
-  // Step 2: combined extract outlines
-  $('#btn-extract-both').addEventListener('click', extractBoth);
-
-  // Step 2: detect all (holes + pads + components) for both sides
-  $('#btn-detect-all').addEventListener('click', detectAll);
-
-  // Step 3: design parameter buttons
-  $('#btn-cell-lookup').addEventListener('click', lookupCell);
-  $('#btn-ic-resolve').addEventListener('click', resolveIc);
-  $('#btn-generate').addEventListener('click', generateProject);
-
-  // Auto-test: check if input/front.jpg and input/back.jpg exist
-  try {
-    const resp = await fetch('/api/health');
-    if (!resp.ok) throw new Error('server not ready');
-    const imgFront = new Image();
-    imgFront.src = '/static/../input/front.jpg?' + Date.now();
-    await new Promise((resolve, reject) => {
-      imgFront.onload = resolve;
-      imgFront.onerror = reject;
-      setTimeout(() => reject(new Error('timeout')), 2000);
-    });
-    STATE.autoTest = true;
-    console.log('Auto-test mode: input images found');
-    $('#btn-scan-frame').disabled = false;
-  } catch {
-    STATE.autoTest = false;
-    console.log('Upload mode: no pre-placed images');
-  }
-}
-
-// ══════════════════════════════════════════════════════════
-//  STEP 1 — Upload & Rectify Preview
-// ══════════════════════════════════════════════════════════
-function setupUploadZones() {
-  ['front', 'back'].forEach(side => {
-    const drop = $(`#drop-${side}`);
-    const input = $(`#file-${side}`);
-    const status = $(`#status-${side}`);
-
-    drop.addEventListener('click', () => input.click());
-    drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('drag-over'); });
-    drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
-    drop.addEventListener('drop', e => {
-      e.preventDefault();
-      drop.classList.remove('drag-over');
-      if (e.dataTransfer.files.length) handleUpload(side, e.dataTransfer.files[0]);
-    });
-    input.addEventListener('change', () => {
-      if (input.files.length) handleUpload(side, input.files[0]);
-    });
+  fileInput.addEventListener("change", () => {
+    if (fileInput.files.length) handleFile(fileInput.files[0], status, fileKey);
   });
 }
 
-async function handleUpload(side, file) {
-  const status = $(`#status-${side}`);
-  setHTML(status, '<span class="spinner"></span> 上传中...');
-
-  // Store original image for toggle preview (blob URL)
-  if (STATE.origSrc[side]) URL.revokeObjectURL(STATE.origSrc[side]);
-  STATE.origSrc[side] = URL.createObjectURL(file);
-
-  // Store file reference for later calibration (step 2)
-  STATE.rawFile[side] = file;
-
-  try {
-    STATE.uploaded[side] = true;
-    setHTML(status, `<span class="ok">已上传 (${(file.size / 1024).toFixed(0)} KB)</span>`);
-
-    // Enable scan button
-    $('#btn-scan-frame').disabled = false;
-    setBadge('step1', '可扫描', 'ready');
-
-    // Preview black frame to get detection data (no calibration yet)
-    const pForm = new FormData();
-    pForm.append('file', file);
-    pForm.append('frame_w_mm', STATE.frameW);
-    pForm.append('frame_h_mm', STATE.frameH);
-    try {
-      const pResp = await fetch('/api/vision/preview-black-frame', { method: 'POST', body: pForm });
-      if (pResp.ok) {
-        const pData = await pResp.json();
-        STATE.scanned[side] = {
-          frame_detected: pData.found,
-          detected_aspect_ratio: pData.aspect_ratio || 0,
-          avg_width_px: pData.avg_width_px || 0,
-          avg_height_px: pData.avg_height_px || 0,
-        };
-      }
-    } catch { /* preview failure is non-fatal */ }
-
-    // Show original uploaded image immediately
-    show($(`#rectify-row-${side}`));
-    show($(`#canvas-wrap-${side}`));
-    $(`#rect-toggle-${side}`).checked = false;
-    STATE.rectShow[side] = false;
-    drawUploadCanvas(side);
-
-  } catch (err) {
-    setHTML(status, `<span class="ng">${err.message}</span>`);
-  }
-}
-
-/**
- * Draw the upload-zone canvas (step 1).
- * Toggle between original image (from blob URL) and rectified image (from base64).
- */
-function drawUploadCanvas(side) {
-  const canvas = $(`#canvas-${side}`);
-  if (!canvas) return;
-
-  const showRect = STATE.rectShow[side];
-  const cal = STATE.cal[side];
-  const orig = STATE.origSrc[side];
-
-  let src = null;
-  if (cal) {
-    const rect = cal.rect_b64 ? `data:image/png;base64,${cal.rect_b64}` : '';
-    src = (showRect && rect) ? rect : (orig || rect);
-  } else {
-    // No calibration yet – show original uploaded image
-    src = orig;
-  }
-  if (!src) return;
-
-  const img = new Image();
-  img.onload = () => {
-    const maxW = 900, maxH = 520;
-    const scale = Math.min(maxW / img.width, maxH / img.height);
-    canvas.width = Math.round(img.width * scale);
-    canvas.height = Math.round(img.height * scale);
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-  };
-  img.src = src;
-}
-
-// ══════════════════════════════════════════════════════════
-//  STEP 1 — Scan Black Frame & Compare
-// ══════════════════════════════════════════════════════════
-async function scanBlackFrame() {
-  const btn = $('#btn-scan-frame');
-  btn.disabled = true;
-  btn.textContent = '扫描中...';
-
-  // Auto-test mode: call /api/simulate (reads input/*.jpg)
-  if (STATE.autoTest) {
-    try {
-      const fm = new FormData();
-      fm.append('frame_w_mm', STATE.frameW);
-      fm.append('frame_h_mm', STATE.frameH);
-      const resp = await fetch('/api/simulate', { method: 'POST', body: fm });
-      const data = await resp.json();
-      console.log('Scan result:', data);
-
-      data.steps.forEach(s => {
-        STATE.scanned[s.side] = s;
-        if (s.calibration_success) {
-          STATE.cal[s.side] = {
-            id: s.calibration_id,
-            ppm: s.pixels_per_mm,
-            rect_b64: s.rectified_png_base64,
-            transparent_pcb_b64: s.transparent_pcb_base64 || '',
-            transparent_pcb_outline: s.transparent_pcb_outline_mm || [],
-            w_mm: s.rectified_w_mm || STATE.frameW,
-            h_mm: s.rectified_h_mm || STATE.frameH,
-            frameW: s.frame_w_mm || STATE.frameW,
-            frameH: s.frame_h_mm || STATE.frameH,
-          };
-          STATE.uploaded[s.side] = true;
-        }
-      });
-      STATE.contourMatch = data.contour_match || null;
-
-      const allOk = data.steps.every(s => s.calibration_success);
-      if (allOk) {
-        setHTML($('#frame-info'), '<span class="ok">方框检测成功</span>');
-        setBadge('step1', '已完成', 'ready');
-      } else {
-        const badSide = data.steps.find(s => !s.calibration_success);
-        setHTML($('#frame-info'), `<span class="ng">${badSide?.side || ''} 方框检测失败</span>`);
-        setBadge('step1', '需修正', 'waiting');
-      }
-    } catch (err) {
-      btn.textContent = '矫正预览';
-      btn.disabled = false;
-      setHTML($('#frame-info'), `<span class="ng">扫描失败: ${err.message}</span>`);
-      return;
-    }
-  }
-
-  // Upload mode: actually calibrate both sides at once
-  if (!STATE.autoTest) {
-    const bothOk = STATE.uploaded.front && STATE.uploaded.back;
-    if (bothOk) {
-      try {
-        await Promise.all([
-          calibrateSide('front'),
-          calibrateSide('back'),
-        ]);
-        setHTML($('#frame-info'), '<span class="ok">矫正预览完成</span>');
-        setBadge('step1', '已完成', 'ready');
-      } catch (err) {
-        setHTML($('#frame-info'), `<span class="ng">矫正失败: ${err.message}</span>`);
-        setBadge('step1', '需修正', 'waiting');
-        btn.textContent = '矫正预览';
-        btn.disabled = false;
-        return;
-      }
-    } else {
-      setHTML($('#frame-info'), '<span class="ng">请先上传正反面图片</span>');
-      setBadge('step1', '需修正', 'waiting');
-      btn.textContent = '矫正预览';
-      btn.disabled = false;
-      return;
-    }
-  }
-
-  // Show frame comparison results (per side, in step 1)
-  updateFrameCompare();
-
-  // Auto-test mode: show canvases with rectified images
-  if (STATE.autoTest) {
-    ['front', 'back'].forEach(side => {
-      if (STATE.cal[side]) {
-        show($(`#rectify-row-${side}`));
-        show($(`#canvas-wrap-${side}`));
-        $(`#rect-toggle-${side}`).checked = true;
-        STATE.rectShow[side] = true;
-        drawUploadCanvas(side);
-      }
-    });
-
-    // Auto-test mode: enable step 2 (upload mode handles via calibrateSide)
-    show($('#step-detect'));
-    setBadge('step2', '可获取', 'ready');
-    enableCalButtons();
-    checkExtractReady();
-    checkGenerateReady();
-  } else {
-    // Upload mode: show step 2 (calibrateSide already enabled cal buttons etc.)
-    show($('#step-detect'));
-  }
-
-  btn.textContent = STATE.autoTest ? '重新扫描' : '矫正预览';
-  btn.disabled = false;
-}
-
-function updateFrameCompare() {
-  const hasData = STATE.scanned.front || STATE.scanned.back;
-  toggle($('#frame-compare-grid'), hasData);
-  if (STATE.scanned.front) displayFrameScanResult('front');
-  if (STATE.scanned.back) displayFrameScanResult('back');
-}
-
-function displayFrameScanResult(side) {
-  const data = STATE.scanned[side];
-  if (!data) return;
-  const container = $(`#frame-comp-${side}-content`);
-  if (!container) return;
-
-  const frameDetected = data.frame_detected ?? data.calibration_success;
-  if (frameDetected) {
-    const ar = data.detected_aspect_ratio || 0;
-    const expectedAR = STATE.frameW / STATE.frameH;
-    const errPct = expectedAR > 0 ? Math.abs(ar - expectedAR) / expectedAR * 100 : 0;
-    const cls = errPct <= 25 ? 'ok' : 'ng';
-    setHTML(container, `
-      <span class="${cls}">方框已检测</span><br>
-      检测尺寸: ${(data.avg_width_px || 0).toFixed(0)} &times; ${(data.avg_height_px || 0).toFixed(0)} px<br>
-      宽高比: ${ar.toFixed(3)} (期望 ${expectedAR.toFixed(3)}, 误差 ${errPct.toFixed(1)}%)<br>
-      设定: ${STATE.frameW} &times; ${STATE.frameH} mm
-    `);
-  } else {
-    setHTML(container, '<span class="ng">未检测到方框</span>');
-  }
-}
-
-// ══════════════════════════════════════════════════════════
-//  STEP 2 — Get PCB per side
-// ══════════════════════════════════════════════════════════
-function enableCalButtons() {
-  ['front', 'back'].forEach(side => {
-    const btn = $(`#btn-cal-${side}`);
-    if (STATE.uploaded[side]) {
-      btn.disabled = false;
-      btn.textContent = side === 'front' ? '获取PCB正面' : '获取PCB反面';
-    } else {
-      btn.disabled = true;
-    }
-  });
-}
-
-async function calibrateSide(side) {
-  const btn = $(`#btn-cal-${side}`);
-  btn.textContent = '处理中...';
-  btn.disabled = true;
-  btn.classList.remove('btn-done');
-
-  // Read file from stored reference
-  const file = STATE.rawFile[side];
-  if (!file) {
-    btn.textContent = '未上传文件';
-    btn.disabled = false;
+function handleFile(file, statusEl, fileKey) {
+  if (!file.type.startsWith("image/")) {
+    statusEl.innerHTML = '<span class="ng">请上传图片文件</span>';
     return;
   }
+  state[fileKey] = file;
+  statusEl.innerHTML =
+    `✓ ${file.name} <span style="color:#94a3b8">(${(file.size / 1024).toFixed(0)} KB)</span>`;
 
-  const form = new FormData();
-  form.append('file', file);
-  form.append('frame_w_mm', STATE.frameW);
-  form.append('frame_h_mm', STATE.frameH);
-
-  try {
-    // ── Phase 1: Black frame calibration (perspective rectification) ──
-    const resp = await fetch('/api/vision/calibrate-black-frame', {
-      method: 'POST',
-      body: form,
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-      throw new Error(err.detail || err.message || '校准失败');
-    }
-    const data = await resp.json();
-
-    // Store calibration result (basic HSV extraction as fallback)
-    STATE.cal[side] = {
-      id: data.calibration_id,
-      ppm: data.pixels_per_mm,
-      rect_b64: data.rectified_png_base64,
-      transparent_pcb_b64: data.transparent_pcb_b64 || '',
-      transparent_pcb_outline: data.transparent_pcb_outline_mm || [],
-      w_mm: data.rectified_w_mm || STATE.frameW,
-      h_mm: data.rectified_h_mm || STATE.frameH,
-      frameW: data.rectified_w_mm || STATE.frameW,
-      frameH: data.rectified_h_mm || STATE.frameH,
-    };
-
-    // Show rectify toggle + rectified canvas in upload zone
-    show($(`#rectify-row-${side}`));
-    show($(`#canvas-wrap-${side}`));
-    STATE.rectShow[side] = true;
-    $(`#rect-toggle-${side}`).checked = true;
-    drawUploadCanvas(side);
-
-    // ── Phase 2: Paper model shadow removal + refined transparent PCB ──
-    // This is the original "标定" logic: build paper background model,
-    // subtract shadows, produce clean transparent PCB with accurate outline.
-    btn.textContent = '去除阴影中...';
-    try {
-      const fm2 = new FormData();
-      fm2.append('calibration_id', data.calibration_id);
-      const resp2 = await fetch('/api/vision/extract-pcb', { method: 'POST', body: fm2 });
-      if (resp2.ok) {
-        const edata = await resp2.json();
-        // Overwrite with paper-model shadow-removed transparent PCB
-        if (edata.transparent_pcb_b64) {
-          STATE.cal[side].transparent_pcb_b64 = edata.transparent_pcb_b64;
-        }
-        if (edata.outline && edata.outline.length > 0) {
-          STATE.cal[side].transparent_pcb_outline = edata.outline;
-        }
-        // Show paper model success label
-        if (edata.paper_model) {
-          show($('#paper-model'));
-          setHTML($('#paper-model-content'), `
-            <span style="font-size:0.78rem;color:#64748b;">
-              ${side === 'front' ? '正面' : '反面'} - 阴影去除完成（纸张底色建模）
-            </span>
-          `);
-        }
-      }
-    } catch (e) {
-      // Non-fatal: continue with basic HSV extraction from Phase 1
-      console.warn(`Shadow removal for ${side} (non-fatal):`, e);
-    }
-
-    // Show calibration canvas with shadow-removed transparent PCB
-    show($(`#cal-canvas-wrap-${side}`));
-    drawCalCanvas(side);
-
-    checkExtractReady();
-    checkGenerateReady();
-
-    btn.textContent = '获取完成';
-    btn.classList.add('btn-done');
-
-    // Check if both sides calibrated
-    if (STATE.cal.front && STATE.cal.back) {
-      setBadge('step2', '可识别', 'ready');
-    }
-  } catch (err) {
-    btn.textContent = '获取失败';
-    btn.disabled = false;
-    console.error(`calibrateSide ${side}:`, err);
+  // 显示图片预览缩略图
+  const previewId = fileKey === "frontFile" ? "preview-front" : "preview-back";
+  const previewImg = $(previewId);
+  const dropZone = previewImg.closest(".zone-drop");
+  if (previewImg) {
+    previewImg.src = URL.createObjectURL(file);
+    dropZone.classList.add("has-preview");
   }
+  checkRecognizeReady();
 }
 
-/**
- * Draw calibration canvas in step 2 (shows rectified image)
- */
-function drawCalCanvas(side) {
-  const cal = STATE.cal[side];
-  if (!cal) return;
+function checkRecognizeReady() {
+  const ready = state.frontFile && state.backFile;
+  $("btn-recognize").disabled = !ready;
+  setBadge("badge-step1", ready ? "可以识别" : "等待输入", false);
+}
 
-  const canvas = $(`#cal-canvas-${side}`);
-  if (!canvas) return;
+// ── 调用 recognize-pcb ──
+// 三阶段（正面→背面→交叉验证），每阶段包含若干子步骤
+const RECOGNIZE_PHASES = [
+  {
+    name: "正面识别",
+    steps: ["方向检测", "黑框检测", "透视校正", "轮廓提取", "纸色模型", "透明PNG"],
+    estSec: 10,
+  },
+  {
+    name: "背面识别",
+    steps: ["方向检测", "黑框检测", "透视校正", "轮廓提取", "纸色模型", "透明PNG"],
+    estSec: 10,
+  },
+  {
+    name: "交叉验证",
+    steps: ["轮廓匹配", "生成共识图"],
+    estSec: 4,
+  },
+];
 
-  // If pads detected with PCB image, use PCB-only image as background
-  const pads = STATE.pads[side];
-  const usePcbImg = pads?.pcb_image_b64;
+function buildProgressHtml() {
+  let html = '<div class="recognize-progress">';
+  html += '<div class="recog-timer"><span class="spinner"></span> 已用时 <strong id="recog-elapsed">0</strong> 秒</div>';
+  html += '<div class="recog-bar-track"><div class="recog-bar-fill" id="recog-bar"></div></div>';
+  html += '<div class="recog-phases">';
+  RECOGNIZE_PHASES.forEach((phase, pi) => {
+    html += `<div class="recog-phase" data-phase="${pi}">`;
+    html += `  <div class="recog-phase-head"><span class="recog-phase-icon"></span>${phase.name}</div>`;
+    html += `  <div class="recog-phase-steps">`;
+    phase.steps.forEach((s, si) => {
+      html += `<span class="step-chip" data-phase="${pi}" data-step="${si}">○ ${s}</span>`;
+    });
+    html += `  </div>`;
+    html += `</div>`;
+  });
+  html += '</div>';
+  html += '<div class="recog-overtime" id="recog-overtime">⏳ 处理时间超出预期，请耐心等待...</div>';
+  html += '</div>';
+  return html;
+}
 
-  const src = usePcbImg
-    ? `data:image/png;base64,${pads.pcb_image_b64}`
-    : (cal.transparent_pcb_b64
-      ? `data:image/png;base64,${cal.transparent_pcb_b64}`
-      : `data:image/png;base64,${cal.rect_b64}`);
+function updateProgressUI(elapsed) {
+  const totalEst = RECOGNIZE_PHASES.reduce((s, p) => s + p.estSec, 0);
 
-  const img = new Image();
-  img.onload = () => {
-    const maxW = 900, maxH = 520;
-    const scale = Math.min(maxW / img.width, maxH / img.height);
-    canvas.width = Math.round(img.width * scale);
-    canvas.height = Math.round(img.height * scale);
-    const ctx = canvas.getContext('2d');
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  // 计算当前阶段和阶段内进度
+  let cumSec = 0;
+  let curPhase = 0;
+  let phaseFrac = 0;
+  for (let pi = 0; pi < RECOGNIZE_PHASES.length; pi++) {
+    if (elapsed < cumSec + RECOGNIZE_PHASES[pi].estSec) {
+      curPhase = pi;
+      phaseFrac = (elapsed - cumSec) / RECOGNIZE_PHASES[pi].estSec;
+      break;
+    }
+    cumSec += RECOGNIZE_PHASES[pi].estSec;
+    curPhase = pi;
+    phaseFrac = 1;
+  }
 
-    // Draw pad markers if pads have been detected
-    const candidates = pads?.candidates || [];
-    if (!candidates.length) return;
+  // 进度条：线性推进，封顶 95%
+  const pct = Math.min(95, (elapsed / totalEst) * 95);
+  const bar = $("recog-bar");
+  if (bar) bar.style.width = pct.toFixed(0) + "%";
 
-    // ppm: use PCB coordinate system if available (PCB-relative coords)
-    const ppm = usePcbImg && pads.coordinate_system
-      ? img.width / pads.coordinate_system.pcb_width_mm
-      : (cal.ppm || (img.width / (cal.frameW || 60)));
-    const colors = ['#ef4444', '#3b82f6', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899'];
-    candidates.forEach((c, idx) => {
-      const color = colors[idx % colors.length];
-      const vr = c.visible_region || c;
-      const polygon = vr.polygon;
-      const bbox = vr.bbox || {};
-      const cx = vr.center?.x_mm ?? (bbox.x_mm + (bbox.width_mm || 0) / 2);
-      const cy = vr.center?.y_mm ?? (bbox.y_mm + (bbox.height_mm || 0) / 2);
+  // 更新各阶段状态
+  RECOGNIZE_PHASES.forEach((phase, pi) => {
+    const phaseEl = document.querySelector(`.recog-phase[data-phase="${pi}"]`);
+    if (!phaseEl) return;
+    phaseEl.classList.remove("done", "active");
+    const chips = phaseEl.querySelectorAll(".step-chip");
 
-      // mm → canvas px helper
-      const toX = (mm) => mm * ppm * scale;
-      const toY = (mm) => mm * ppm * scale;
-
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 2;
-
-      // Draw symmetric rounded rect (PCB pads are symmetric)
-      // Compute bbox from polygon, then symmetrize around center.
-      // Damage (e.g. chipped copper) makes polygon asymmetric;
-      // the intact side's max extent determines the true pad size.
-      let bx1, by1, bx2, by2;
-      if (polygon && polygon.length >= 3) {
-        const pxs = polygon.map(p => toX(p.x_mm));
-        const pys = polygon.map(p => toY(p.y_mm));
-        const cxp = toX(cx), cyp = toY(cy);
-        // Max half-extent from center on each axis (symmetry repair)
-        let hw = 0, hh = 0;
-        for (let i = 0; i < pxs.length; i++) {
-          hw = Math.max(hw, Math.abs(pxs[i] - cxp));
-          hh = Math.max(hh, Math.abs(pys[i] - cyp));
-        }
-        bx1 = cxp - hw; by1 = cyp - hh;
-        bx2 = cxp + hw; by2 = cyp + hh;
-      } else {
-        const bw = (bbox.width_mm || 3) * ppm * scale;
-        const bh = (bbox.height_mm || 3) * ppm * scale;
-        bx1 = toX(cx) - bw / 2; by1 = toY(cy) - bh / 2;
-        bx2 = toX(cx) + bw / 2; by2 = toY(cy) + bh / 2;
-      }
-      const sw = bx2 - bx1, sh = by2 - by1;
-      // Corner radius: use unified corner_radius_mm from alignment if available,
-      // otherwise estimate from polygon shape with symmetry constraint.
-      let r;
-      if (c.corner_radius_mm != null) {
-        // Backend-computed unified corner radius (mm → canvas px)
-        r = c.corner_radius_mm * ppm * scale;
-      } else if (polygon && polygon.length >= 4) {
-        const short = Math.min(sw, sh);
-        const searchR = short * 0.45;
-        const corners = [[bx1,by1],[bx2,by1],[bx2,by2],[bx1,by2]];
-        const radii = [];
-        for (const [ccx, ccy] of corners) {
-          let minD = Infinity;
-          for (let i = 0; i < polygon.length; i++) {
-            const ppx = toX(polygon[i].x_mm), ppy = toY(polygon[i].y_mm);
-            if (Math.abs(ppx - ccx) > searchR || Math.abs(ppy - ccy) > searchR) continue;
-            const d = Math.hypot(ppx - ccx, ppy - ccy);
-            if (d < minD) minD = d;
-          }
-          if (minD > 0 && minD < Infinity) {
-            radii.push(minD / (Math.SQRT2 - 1));
-          }
-        }
-        if (radii.length >= 3) {
-          const sorted = [...radii].sort((a,b) => a - b);
-          const n = sorted.length;
-          const median = n % 2 === 1 ? sorted[Math.floor(n/2)]
-            : (sorted[n/2 - 1] + sorted[n/2]) / 2;
-          const good = radii.filter(v => v >= 0.6 * median && v <= 1.4 * median);
-          const avg = good.length > 0
-            ? good.reduce((a,b)=>a+b,0) / good.length
-            : median;
-          r = Math.min(avg, short / 2);
-        } else if (radii.length > 0) {
-          r = Math.min(radii.reduce((a,b)=>a+b,0) / radii.length, short / 2);
+    if (pi < curPhase) {
+      // 该阶段已完成
+      phaseEl.classList.add("done");
+      chips.forEach((c) => {
+        c.className = "step-chip done";
+        c.textContent = c.textContent.replace("○", "✓");
+      });
+    } else if (pi === curPhase) {
+      // 当前正在处理的阶段
+      phaseEl.classList.add("active");
+      const stepIdx = Math.min(phase.steps.length - 1, Math.floor(phaseFrac * phase.steps.length));
+      chips.forEach((c, si) => {
+        const label = phase.steps[si];
+        if (si < stepIdx) {
+          c.className = "step-chip done";
+          c.textContent = "✓ " + label;
+        } else if (si === stepIdx) {
+          c.className = "step-chip active";
+          c.textContent = "🔄 " + label;
         } else {
-          r = short * 0.1;
+          c.className = "step-chip";
+          c.textContent = "○ " + label;
         }
-      } else {
-        r = Math.min(sw, sh) * 0.1;
-      }
-      r = Math.max(r, 1);
+      });
+    }
+  });
 
-      // Draw rounded rectangle with estimated radius
-      ctx.beginPath();
-      ctx.moveTo(bx1 + r, by1);
-      ctx.lineTo(bx2 - r, by1);
-      ctx.arcTo(bx2, by1, bx2, by1 + r, r);
-      ctx.lineTo(bx2, by2 - r);
-      ctx.arcTo(bx2, by2, bx2 - r, by2, r);
-      ctx.lineTo(bx1 + r, by2);
-      ctx.arcTo(bx1, by2, bx1, by2 - r, r);
-      ctx.lineTo(bx1, by1 + r);
-      ctx.arcTo(bx1, by1, bx1 + r, by1, r);
-      ctx.closePath();
-      ctx.fillStyle = color + '30';
-      ctx.fill();
-      ctx.stroke();
-
-      // Label text above the pad
-      const label = c.label || `#${idx + 1}`;
-      const labelY = polygon && polygon.length >= 3
-        ? Math.min(...polygon.map(p => toY(p.y_mm))) - 4
-        : toY(cy) - (bbox.height_mm || 3) * ppm * scale / 2 - 4;
-      ctx.font = 'bold 12px sans-serif';
-      ctx.fillStyle = color;
-      ctx.textAlign = 'center';
-      ctx.fillText(label, toX(cx), labelY);
-    });
-  };
-  img.src = src;
+  // 超时提示
+  const ot = $("recog-overtime");
+  if (ot) ot.style.display = elapsed >= totalEst ? "block" : "none";
 }
 
-// ══════════════════════════════════════════════════════════
-//  STEP 2 — Combined Extract Outlines (centered button)
-// ══════════════════════════════════════════════════════════
-function checkExtractReady() {
-  const bothOk = STATE.cal.front && STATE.cal.back;
-  const btn = $('#btn-extract-both');
-  btn.disabled = !bothOk;
-  if (bothOk) {
-    setBadge('step2', '可识别', 'ready');
+async function recognizePCB() {
+  const btn = $("btn-recognize");
+  const info = $("pcb-info");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> 识别中...';
+
+  // 构建进度 UI
+  info.innerHTML = buildProgressHtml();
+
+  // 计时器 + 线性进度更新（不循环）
+  const startTime = Date.now();
+  const progressTimer = setInterval(() => {
+    const elapsed = (Date.now() - startTime) / 1000;
+    const elEl = $("recog-elapsed");
+    if (elEl) elEl.textContent = elapsed.toFixed(0);
+    updateProgressUI(elapsed);
+  }, 500);
+
+  const frameW = parseFloat($("frame-w").value) || 60;
+  const frameH = parseFloat($("frame-h").value) || 30;
+
+  const fd = new FormData();
+  fd.append("front_image", state.frontFile, "front.jpg");
+  fd.append("back_image", state.backFile, "back.jpg");
+  fd.append("frame_w_mm", frameW);
+  fd.append("frame_h_mm", frameH);
+
+  try {
+    const resp = await fetch("/api/vision/recognize-pcb", { method: "POST", body: fd });
+    const data = await resp.json();
+    clearInterval(progressTimer);
+
+    // 完成 → 进度条满格 + 全部标记完成
+    const bar = $("recog-bar");
+    if (bar) bar.style.width = "100%";
+    document.querySelectorAll(".recog-phase").forEach((el) => {
+      el.classList.remove("active");
+      el.classList.add("done");
+    });
+    document.querySelectorAll(".step-chip").forEach((c) => {
+      c.className = "step-chip done";
+      c.textContent = "✓ " + c.textContent.replace(/^[○🔄✓]\s*/, "");
+    });
+    const ot = $("recog-overtime");
+    if (ot) ot.style.display = "none";
+
+    if (!resp.ok || !data.success) {
+      throw new Error(data.detail || data.error || "识别失败");
+    }
+
+    state.recognizeResult = data;
+    state.frontCalibrationId = data.front?.calibration_id || "";
+    state.backCalibrationId = data.back?.calibration_id || "";
+    state.frontRectifiedB64 = data.front?.rectified_png_b64 || "";
+    state.backRectifiedB64 = data.back?.rectified_png_b64 || "";
+
+    displayRecognizeResults(data);
+    info.innerHTML = `✓ PCB识别成功 — 尺寸: <strong>${data.pcb_width_mm}mm × ${data.pcb_height_mm}mm</strong>，轮廓顶点: ${data.outline_vertex_count}`;
+
+    // 标记步骤1完成
+    btn.classList.add("btn-done");
+    btn.innerHTML = "✓ 识别完成";
+    setBadge("badge-step1", "已完成", true);
+
+    // 显示步骤2
+    show($("step-pads"));
+    $("btn-detect-pads").disabled = false;
+
+  } catch (err) {
+    clearInterval(progressTimer);
+    info.innerHTML = `<span class="ng">✗ ${err.message}</span>`;
+    btn.disabled = false;
+    btn.innerHTML = "识别PCB轮廓";
   }
 }
 
-async function extractBoth() {
-  const btn = $('#btn-extract-both');
+function displayRecognizeResults(data) {
+  // 正面
+  const frontHtml = buildSideResultHtml(data.front, "front");
+  $("recognize-result-front").innerHTML = frontHtml;
+  // 背面
+  const backHtml = buildSideResultHtml(data.back, "back");
+  $("recognize-result-back").innerHTML = backHtml;
+  show($("recognize-results"));
+
+  // 一致性校验
+  if (data.consensus) {
+    const c = data.consensus;
+    const consensusImg = c.transparent_pcb_b64
+      ? `<div class="img-grid" style="margin-top:8px;"><img class="zoomable-img" src="data:image/png;base64,${c.transparent_pcb_b64}" onclick="openLightbox(this.src)" title="点击放大" style="max-width:100%; border-radius:6px; border:1px solid #cbd5e1;" /></div>`
+      : "";
+    $("consensus-content").innerHTML = `
+      <p>${c.message}</p>
+      <div style="display:flex; gap:24px; margin-top:8px; font-size:0.82rem; color:#475569;">
+        <span>正面面积: ${c.front_area_mm2} mm²</span>
+        <span>背面面积: ${c.back_area_mm2} mm²</span>
+        <span>共识面积: ${c.consensus_area_mm2} mm²</span>
+        <span>偏差: ${c.deviation_pct}%</span>
+        <span class="${c.ok ? "ok" : "ng"}">${c.ok ? "✓ 匹配" : "⚠ 有偏差"}</span>
+      </div>
+      ${consensusImg}
+    `;
+    show($("consensus-section"));
+  }
+}
+
+function buildSideResultHtml(sideData, sideName) {
+  if (!sideData || !sideData.calibration_success) {
+    return `<p class="ng">识别失败: ${sideData?.error || "未知错误"}</p>`;
+  }
+  const overlay = sideData.overlay_b64
+    ? `<div class="img-grid"><img class="zoomable-img" src="data:image/png;base64,${sideData.overlay_b64}" onclick="openLightbox(this.src)" title="点击放大" style="max-width:100%; border-radius:6px; border:1px solid #cbd5e1;" /></div>`
+    : "";
+  const transparent = sideData.transparent_pcb_b64
+    ? `<div class="img-grid" style="margin-top:8px;"><img class="zoomable-img" src="data:image/png;base64,${sideData.transparent_pcb_b64}" onclick="openLightbox(this.src)" title="点击放大" style="max-width:100%; border-radius:6px; border:1px solid #cbd5e1;" /></div>`
+    : "";
+  return `
+    <div class="result-info">
+      <span>像素精度: ${sideData.pixels_per_mm} px/mm</span> |
+      <span>轮廓顶点: ${sideData.outline?.length || 0}</span>
+    </div>
+    ${overlay}
+    ${transparent}
+  `;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Step 2: 焊盘识别
+ * ═══════════════════════════════════════════════════════════════ */
+
+async function detectPads() {
+  const btn = $("btn-detect-pads");
   btn.disabled = true;
-  btn.textContent = '识别轮廓中（正反面）...';
+  btn.innerHTML = '<span class="spinner"></span> 识别焊盘中...';
 
   try {
-    // Pass 1: extract both sides independently (in parallel). This writes each
-    // side's pcb_outline.json to disk so the other side can read it.
-    const [frontData1, backData1] = await Promise.all([
-      extractPcbSide('front'),
-      extractPcbSide('back'),
+    const [frontResult, backResult] = await Promise.all([
+      detectTerminalsOneSide(state.frontCalibrationId, "front"),
+      detectTerminalsOneSide(state.backCalibrationId, "back"),
     ]);
 
-    // Pass 2: front⇄back cross-validation (mask consensus). Each side is
-    // re-extracted using the other side's outline (now on disk) to remove
-    // one-sided edge artifacts (burrs/shadows visible in only one photo).
-    let frontData = frontData1, backData = backData1;
-    const frontId = STATE.cal.front?.id, backId = STATE.cal.back?.id;
-    if (frontId && backId) {
-      try {
-        btn.textContent = '正反面交叉校验中...';
-        const [frontData2, backData2] = await Promise.all([
-          extractPcbSide('front', backId),
-          extractPcbSide('back', frontId),
-        ]);
-        frontData = frontData2;
-        backData = backData2;
-      } catch (e) {
-        console.warn('extractBoth: consensus pass failed, using pass-1 results', e);
-      }
-    }
+    state.padsFront = frontResult;
+    state.padsBack = backResult;
 
-    STATE.extract.front = frontData;
-    STATE.extract.back = backData;
+    // 渲染
+    drawPadsOnCanvas($("pads-canvas-front"), state.frontRectifiedB64, frontResult);
+    $("pads-info-front").innerHTML = formatPadsInfo(frontResult);
+    drawPadsOnCanvas($("pads-canvas-back"), state.backRectifiedB64, backResult);
+    $("pads-info-back").innerHTML = formatPadsInfo(backResult);
+    show($("pads-results"));
 
-    // Update cal state with refined transparent PCB from extract-pcb
-    // so that drawCalCanvas (used by pad detection overlay) shows the
-    // contour-extracted transparent image instead of the initial calibration one.
-    if (frontData?.transparent_pcb_b64 && STATE.cal.front) {
-      STATE.cal.front.transparent_pcb_b64 = frontData.transparent_pcb_b64;
-    }
-    if (frontData?.outline?.length > 0 && STATE.cal.front) {
-      STATE.cal.front.transparent_pcb_outline = frontData.outline;
-    }
-    if (backData?.transparent_pcb_b64 && STATE.cal.back) {
-      STATE.cal.back.transparent_pcb_b64 = backData.transparent_pcb_b64;
-    }
-    if (backData?.outline?.length > 0 && STATE.cal.back) {
-      STATE.cal.back.transparent_pcb_outline = backData.outline;
-    }
-    // Redraw canvases with updated transparent PCB
-    drawCalCanvas('front');
-    drawCalCanvas('back');
+    btn.classList.add("btn-done");
+    btn.innerHTML = "✓ 焊盘识别完成";
+    setBadge("badge-step2", "已完成", true);
 
-    // ── Run Edge Chamfer Distance contour matching ──
-    // If contourMatch was already set by /api/simulate (auto-test), keep it.
-    // Otherwise (upload mode), call the dedicated endpoint.
-    if (!STATE.contourMatch || !STATE.contourMatch.message) {
-      try {
-        const matchFm = new FormData();
-        matchFm.append('front_calibration_id', STATE.cal.front?.id || '');
-        matchFm.append('back_calibration_id', STATE.cal.back?.id || '');
-        const matchResp = await fetch('/api/vision/contour-match', {
-          method: 'POST', body: matchFm,
-        });
-        if (matchResp.ok) {
-          STATE.contourMatch = await matchResp.json();
-        }
-      } catch { /* non-fatal */ }
-    }
+    // 显示步骤3
+    show($("step-components"));
+    $("btn-detect-components").disabled = false;
 
-    // Show per-side results
-    displayExtractResult('front', frontData);
-    displayExtractResult('back', backData);
-    show($('#extract-results-grid'));
-
-    // Enable holes & pads buttons
-    enableHolesPadsButtons();
-
-    // Show contour consistency check (Chamfer-based)
-    displayContourMatch();
-
-    btn.textContent = '轮廓识别完成';
-    btn.classList.add('btn-done');
-    setBadge('step2', '识别完成', 'ready');
   } catch (err) {
-    btn.textContent = '识别失败，点击重试';
     btn.disabled = false;
-    console.error('extractBoth error:', err);
+    btn.innerHTML = "识别焊盘（正反面）";
+    alert("焊盘识别失败: " + err.message);
   }
 }
 
-async function extractPcbSide(side, otherCalibrationId) {
-  const cal = STATE.cal[side];
-  if (!cal) throw new Error(`No calibration for ${side}`);
+async function detectTerminalsOneSide(calibrationId, side) {
+  const fd = new FormData();
+  fd.append("calibration_id", calibrationId);
+  fd.append("side", side);
 
-  const fm = new FormData();
-  fm.append('calibration_id', cal.id);
-  if (otherCalibrationId) {
-    // Enable front⇄back cross-validation (mask consensus) on the backend.
-    fm.append('other_calibration_id', otherCalibrationId);
-  }
-
-  const resp = await fetch('/api/vision/extract-pcb', { method: 'POST', body: fm });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-    throw new Error(err.detail || `Extract ${side} failed`);
-  }
+  const resp = await fetch("/api/vision/detect-terminals", { method: "POST", body: fd });
   const data = await resp.json();
-
-  // Show paper model if available (step 1 area)
-  if (data.debug_steps && data.debug_steps['02_paper_model']) {
-    const pm = data.debug_steps['02_paper_model'];
-    if (pm && pm.base64) {
-      show($('#paper-model'));
-      setHTML($('#paper-model-content'), `
-        <div class="img-grid">
-          <img src="data:image/png;base64,${pm.base64}" alt="纸张底色模型" />
-        </div>
-        <p style="font-size:0.78rem;color:#64748b;margin:4px 0 0 0;">
-          ${pm.note || '纸张底色模型提取完成'}
-        </p>
-      `);
-    }
-  }
-
+  if (!resp.ok) throw new Error(data.detail || data.error || `焊盘检测失败 (${side})`);
   return data;
 }
 
-function displayExtractResult(side, data) {
-  const container = $(`#extract-result-${side}`);
-  const outline = data.outline || [];
-  const grooves = data.grooves || [];
-  const consensus = data.consensus_msg || '';
-  let imgHtml = '';
-  if (data.transparent_pcb_b64) {
-    imgHtml = `<div class="img-grid">
-      <img src="data:image/png;base64,${data.transparent_pcb_b64}" alt="${side} PCB" />
-    </div>`;
-  } else if (data.pcb_mask_b64) {
-    imgHtml = `<div class="img-grid">
-      <img src="data:image/png;base64,${data.pcb_mask_b64}" alt="${side} mask" />
-    </div>`;
-  }
-  setHTML(container, `
-    <p style="font-size:0.85rem; margin:4px 0;">
-      顶点: <strong>${outline.length}</strong> &nbsp; 槽口: <strong>${grooves.length}</strong>
-      ${consensus ? `<br><span style="color:#6366f1;">${consensus}</span>` : ''}
-    </p>
-    ${imgHtml}
-  `);
+function drawPadsOnCanvas(canvas, rectifiedB64, padResult) {
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (!rectifiedB64) return;
+
+  const img = new Image();
+  img.onload = () => {
+    const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
+    const dw = img.width * scale;
+    const dh = img.height * scale;
+    const dx = (canvas.width - dw) / 2;
+    const dy = (canvas.height - dh) / 2;
+    ctx.drawImage(img, dx, dy, dw, dh);
+
+    // 绘制焊盘
+    const terminals = padResult.terminals || padResult.pads || [];
+    const ppm = padResult.pixels_per_mm || state.recognizeResult?.front?.pixels_per_mm || 10;
+    const frameWmm = parseFloat($("frame-w").value) || 60;
+    const frameHmm = parseFloat($("frame-h").value) || 30;
+
+    terminals.forEach((t, i) => {
+      const cx = dx + (t.x_mm / frameWmm) * dw;
+      const cy = dy + (t.y_mm / frameHmm) * dh;
+      const r = Math.max(4, (t.r_mm || 0.5) * scale * ppm * 0.1 + 4);
+
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(255, 200, 0, 0.4)";
+      ctx.fill();
+      ctx.strokeStyle = "#f59e0b";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // 标签
+      ctx.fillStyle = "#dc2626";
+      ctx.font = "bold 11px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText(t.label || t.name || `P${i + 1}`, cx, cy - r - 3);
+    });
+  };
+  img.src = "data:image/png;base64," + rectifiedB64;
 }
 
-// ── Contour Consistency Check (shown after extract) ──
-// Uses Edge Chamfer Distance Matching results from backend
-function displayContourMatch() {
-  const cm = STATE.contourMatch;
-  show($('#contour-match'));
+function formatPadsInfo(result) {
+  const terminals = result.terminals || result.pads || [];
+  if (!terminals.length) return "未检测到焊盘";
+  const labels = terminals.map((t) => t.label || t.name || "?").join(", ");
+  return `检测到 ${terminals.length} 个焊盘: ${labels}`;
+}
 
-  // Use backend Chamfer data if available
-  if (cm && cm.message) {
-    const areaPct = cm.mismatch_area_pct != null ? cm.mismatch_area_pct : 0;
-    const mergedPts = cm.merged_outline_mm?.length || 0;
-    const mergedArea = cm.merged_area_mm2 || 0;
-    const ok = cm.ok;
+/* ═══════════════════════════════════════════════════════════════
+ * Step 3: 元器件识别
+ * ═══════════════════════════════════════════════════════════════ */
 
-    setHTML($('#contour-match-content'), `
-      <p>
-        <strong>Edge Chamfer 匹配</strong> —
-        <span class="${ok ? 'match-ok' : 'match-ng'}">${ok ? '通过' : '偏差较大'}</span><br>
-        ${cm.message}<br>
-        合并后轮廓: <strong>${mergedPts}</strong> 顶点 &nbsp;|&nbsp;
-        面积: <strong>${mergedArea.toFixed(0)} mm²</strong> &nbsp;|&nbsp;
-        偏差: <strong>${areaPct.toFixed(1)}%</strong>
-      </p>
-    `);
+async function detectComponents() {
+  const btn = $("btn-detect-components");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> 识别元器件中...';
+
+  try {
+    const [frontResult, backResult] = await Promise.all([
+      detectComponentsOneSide(state.frontCalibrationId, "front"),
+      detectComponentsOneSide(state.backCalibrationId, "back"),
+    ]);
+
+    state.componentsFront = frontResult;
+    state.componentsBack = backResult;
+
+    renderComponentsTable(frontResult, backResult);
+    show($("components-results"));
+
+    btn.classList.add("btn-done");
+    btn.innerHTML = "✓ 元器件识别完成";
+    setBadge("badge-step3", "已完成", true);
+
+    // 显示步骤4
+    show($("step-export"));
+    $("btn-generate").disabled = false;
+    setBadge("badge-step4", "请填写参数", false);
+
+  } catch (err) {
+    btn.disabled = false;
+    btn.innerHTML = "识别元器件（正反面）";
+    alert("元器件识别失败: " + err.message);
+  }
+}
+
+async function detectComponentsOneSide(calibrationId, side) {
+  const fd = new FormData();
+  fd.append("calibration_id", calibrationId);
+  fd.append("side", side);
+
+  const resp = await fetch("/api/vision/detect-components", { method: "POST", body: fd });
+  const data = await resp.json();
+  if (!resp.ok) throw new Error(data.detail || data.error || `元器件检测失败 (${side})`);
+  return data;
+}
+
+function renderComponentsTable(frontData, backData) {
+  const frontComps = frontData.components || [];
+  const backComps = backData.components || [];
+  const all = [
+    ...frontComps.map((c) => ({ ...c, side: "正面" })),
+    ...backComps.map((c) => ({ ...c, side: "背面" })),
+  ];
+
+  if (!all.length) {
+    $("components-table").innerHTML = '<p style="color:#94a3b8;">未检测到元器件</p>';
     return;
   }
 
-  // Fallback: no Chamfer data yet (upload mode before scan)
-  const frontOutline = STATE.extract.front?.outline || [];
-  const backOutline = STATE.extract.back?.outline || [];
-  const frontPts = frontOutline.length;
-  const backPts = backOutline.length;
-
-  if (frontPts >= 3 && backPts >= 3) {
-    const w = STATE.cal.front?.frameW || STATE.frameW;
-    const h = STATE.cal.front?.frameH || STATE.frameH;
-    setHTML($('#contour-match-content'), `
-      <p>
-        正面顶点: <strong>${frontPts}</strong> &nbsp;|&nbsp;
-        背面顶点: <strong>${backPts}</strong><br>
-        方框尺寸: ${w.toFixed(1)} &times; ${h.toFixed(1)} mm<br>
-        <span style="color:#94a3b8;font-size:0.78rem;">
-          Edge Chamfer 匹配数据待扫描后获取
-        </span>
-      </p>
-    `);
-  } else {
-    setHTML($('#contour-match-content'), `
-      <p class="match-ng">轮廓数据不完整，无法校验
-      (正面${frontPts}顶点, 背面${backPts}顶点)</p>
-    `);
-  }
-}
-
-// ══════════════════════════════════════════════════════════
-//  STEP 2 — Holes & Pads (per side)
-// ══════════════════════════════════════════════════════════
-function enableHolesPadsButtons() {
-  // 只要任意一面有轮廓提取结果就启用一键识别按钮
-  const anyExtract = !!(STATE.extract.front || STATE.extract.back);
-  $('#btn-detect-all').disabled = !anyExtract;
-}
-
-async function detectAll() {
-  const btn = $('#btn-detect-all');
-  btn.disabled = true;
-  btn.textContent = '识别中...';
-  const sides = [];
-  if (STATE.extract.front) sides.push('front');
-  if (STATE.extract.back) sides.push('back');
-  try {
-    for (const side of sides) {
-      btn.textContent = `识别${side === 'front' ? '正面' : '背面'}中...`;
-      await detectHoles(side);
-      await detectPads(side);
-      await detectComponents(side);
-    }
-    btn.textContent = '识别完成';
-    btn.classList.add('btn-done');
-  } catch (e) {
-    btn.textContent = '部分识别失败';
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function detectHoles(side) {
-  const btn = document.getElementById(`btn-holes-${side}`);  // may be null (merged into detectAll)
-  if (btn) { btn.disabled = true; btn.textContent = '检测中...'; }
-
-  const cal = STATE.cal[side];
-  const extract = STATE.extract[side];
-  if (!cal || !extract) return;
-
-  try {
-    const fm = new FormData();
-    fm.append('calibration_id', cal.id);
-    fm.append('outline_json', JSON.stringify({ outline: extract.outline }));
-
-    const resp = await fetch('/api/vision/detect-holes', { method: 'POST', body: fm });
-    if (!resp.ok) throw new Error('Holes detection failed');
-    const data = await resp.json();
-    STATE.holes[side] = data;
-
-    setHTML($(`#holes-result-${side}`), `
-      <span class="ok">孔位: ${data.hole_count || data.holes?.length || 0}</span>
-    `);
-    if (btn) { btn.textContent = '重新检测'; btn.disabled = false; }
-
-    updateResultsTables();
-  } catch (err) {
-    if (btn) { btn.textContent = '检测失败'; btn.disabled = false; }
-  }
-}
-
-async function detectPads(side) {
-  const btn = document.getElementById(`btn-pads-${side}`);  // may be null (merged into detectAll)
-  if (btn) { btn.disabled = true; btn.textContent = '识别中...'; }
-
-  const cal = STATE.cal[side];
-  if (!cal) return;
-
-  try {
-    const fm = new FormData();
-    fm.append('calibration_id', cal.id);
-    fm.append('side', side);
-    const resp = await fetch('/api/vision/detect-terminals', { method: 'POST', body: fm });
-    if (!resp.ok) throw new Error('Pad detection failed');
-    const data = await resp.json();
-    STATE.pads[side] = data;
-
-    const tc = data.candidate_count || data.candidates?.length || 0;
-    if (btn) { btn.textContent = `${tc} 焊盘`; btn.classList.add('btn-done'); btn.disabled = false; }
-
-    updateResultsTables();
-    checkGenerateReady();
-    drawCalCanvas(side);
-  } catch (err) {
-    if (btn) { btn.textContent = '识别失败'; btn.disabled = false; }
-  }
-}
-
-
-// ── Component detection (元器件识别) ──────────────────────
-const COMP_TYPE_LABELS = {
-  ic: 'IC芯片', mosfet: 'MOSFET', resistor: '电阻', capacitor: '电容',
-  diode: '二极管', ntc: 'NTC热敏', led: 'LED', other: '其他'
-};
-
-async function detectComponents(side) {
-  const btn = document.getElementById(`btn-components-${side}`);  // may be null (merged into detectAll)
-  if (btn) { btn.disabled = true; btn.textContent = '识别中...'; }
-
-  const cal = STATE.cal[side];
-  if (!cal) return;
-
-  try {
-    const fm = new FormData();
-    fm.append('calibration_id', cal.id);
-    fm.append('side', side);
-    const resp = await fetch('/api/vision/detect-components', { method: 'POST', body: fm });
-    if (!resp.ok) throw new Error('Component detection failed');
-    const data = await resp.json();
-    STATE.components[side] = data;
-
-    const comps = data.components || [];
-    if (btn) { btn.textContent = `${comps.length} 元器件`; btn.classList.add('btn-done'); btn.disabled = false; }
-
-    // Display component results
-    const resultEl = $(`#components-result-${side}`);
-    if (resultEl && comps.length > 0) {
-      let html = `<div style="margin-top:4px;"><b>${side === 'front' ? '正面' : '背面'}元器件:</b></div>`;
-      html += '<table style="font-size:0.8rem; border-collapse:collapse; width:100%; margin-top:4px;">';
-      html += '<tr style="background:#f1f5f9;"><th style="padding:2px 6px; text-align:left;">类型</th><th style="padding:2px 6px; text-align:left;">丝印</th><th style="padding:2px 6px; text-align:left;">封装</th><th style="padding:2px 6px;">置信度</th></tr>';
-      comps.forEach(c => {
-        const label = COMP_TYPE_LABELS[c.type] || c.type;
-        const silk = c.silkscreen || '<span style="color:#94a3b8;">未读取</span>';
-        const pkg = c.package || '-';
-        const conf = (c.confidence * 100).toFixed(0) + '%';
-        html += `<tr><td style="padding:2px 6px;">${label}</td><td style="padding:2px 6px; font-family:monospace; font-weight:600;">${silk}</td><td style="padding:2px 6px;">${pkg}</td><td style="padding:2px 6px; text-align:center;">${conf}</td></tr>`;
-      });
-      html += '</table>';
-      setHTML(resultEl, html);
-    }
-
-    // Auto-fill IC and MOS model fields
-    autoFillFromComponents();
-
-    updateResultsTables();
-    checkGenerateReady();
-  } catch (err) {
-    if (btn) { btn.textContent = '识别失败'; btn.disabled = false; }
-    console.error('detectComponents error:', err);
-  }
-}
-
-function autoFillFromComponents() {
-  // Scan both sides for IC and MOSFET components, auto-fill input fields
-  let icModel = null;
-  let mosModel = null;
-
-  for (const side of ['front', 'back']) {
-    const data = STATE.components[side];
-    if (!data) continue;
-    for (const comp of (data.components || [])) {
-      if (comp.type === 'ic' && comp.silkscreen && !icModel) {
-        icModel = comp.silkscreen;
-      }
-      if (comp.type === 'mosfet' && comp.silkscreen && !mosModel) {
-        mosModel = comp.silkscreen;
-      }
-    }
-  }
-
-  // Fill IC model field if empty and we found one
-  const icInput = $('#ic-model');
-  if (icModel && icInput && (!icInput.value || icInput.value === 'DW01')) {
-    icInput.value = icModel;
-    // Show a hint that it was auto-filled
-    icInput.style.borderColor = '#22c55e';
-    setTimeout(() => { icInput.style.borderColor = ''; }, 3000);
-  }
-
-  // Fill MOS model field if empty and we found one
-  const mosInput = $('#mos-model');
-  if (mosModel && mosInput && !mosInput.value) {
-    mosInput.value = mosModel;
-    mosInput.style.borderColor = '#22c55e';
-    setTimeout(() => { mosInput.style.borderColor = ''; }, 3000);
-  }
-}
-
-function updateResultsTables() {
-  show($('#results-tables'));
-  const content = $('#results-tables-content');
-  let html = '<table class="results-table"><thead><tr><th>面</th><th>轮廓顶点</th><th>槽口</th><th>孔位</th><th>焊盘</th><th>元器件</th></tr></thead><tbody>';
-  ['front', 'back'].forEach(side => {
-    const ext = STATE.extract[side];
-    const holes = STATE.holes[side];
-    const pads = STATE.pads[side];
-    const comps = STATE.components[side];
+  let html = `<table class="results-table"><thead><tr>
+    <th>面</th><th>编号</th><th>型号/丝印</th><th>封装</th>
+    <th>X (mm)</th><th>Y (mm)</th><th>旋转°</th><th>置信度</th>
+  </tr></thead><tbody>`;
+  all.forEach((c) => {
     html += `<tr>
-      <td>${side === 'front' ? '正面' : '背面'}</td>
-      <td>${ext?.outline?.length || '-'}</td>
-      <td>${ext?.grooves?.length ?? '-'}</td>
-      <td>${holes?.hole_count ?? '-'}</td>
-      <td>${pads?.candidate_count ?? pads?.candidates?.length ?? '-'}</td>
-      <td>${comps?.components?.length ?? '-'}</td>
+      <td>${c.side}</td>
+      <td>${c.designator || c.ref || "-"}</td>
+      <td>${c.value || c.model || c.silkscreen || "-"}</td>
+      <td>${c.footprint || c.package || "-"}</td>
+      <td>${(c.x_mm ?? 0).toFixed(2)}</td>
+      <td>${(c.y_mm ?? 0).toFixed(2)}</td>
+      <td>${c.rotation ?? 0}</td>
+      <td>${c.confidence ? (c.confidence * 100).toFixed(0) + "%" : "-"}</td>
     </tr>`;
   });
-  html += '</tbody></table>';
-  setHTML(content, html);
+  html += "</tbody></table>";
+  $("components-table").innerHTML = html;
 }
 
-// ══════════════════════════════════════════════════════════
-//  STEP 3 — Design Parameters & Generate KiCad
-// ══════════════════════════════════════════════════════════
+/* ═══════════════════════════════════════════════════════════════
+ * Step 4: 设计参数 & 生成
+ * ═══════════════════════════════════════════════════════════════ */
 
-// ── Cell lookup (AI) ──
-// 将AI返回的电芯参数格式化为分组展示HTML（聚焦保护板设计相关参数，null显示为'-'）
-function fmtCellParams(d) {
-  const v = (x, unit) => (x === null || x === undefined || x === '') ? '-' : `${x}${unit || ''}`;
-  const range = (a, unit) => (Array.isArray(a) && a.length === 2) ? `${a[0]}~${a[1]}${unit || ''}` : '-';
-  const L = [];
-  L.push(`<b>✅ ${d.manufacturer || ''} ${d.model || ''}</b>`);
-  L.push(`【基本】容量 ${v(d.nominal_capacity_mah, 'mAh')} ｜ 标称 ${v(d.nominal_voltage_v, 'V')} ｜ 化学 ${v(d.chemistry)} ｜ 封装 ${v(d.form_factor)}`);
-  L.push(`【电压保护】充电截止 ${v(d.charge_cutoff_voltage_v, 'V')} ｜ 放电截止 ${v(d.discharge_cutoff_voltage_v, 'V')}`);
-  L.push(`【电流保护】标准充电 ${v(d.standard_charge_current_a, 'A')} ｜ 最大充电 ${v(d.max_charge_current_a, 'A')} ｜ 标准放电 ${v(d.standard_discharge_current_a, 'A')} ｜ 持续放电 ${v(d.max_continuous_discharge_a, 'A')} ｜ 脉冲 ${v(d.max_pulse_discharge_a, 'A')} ｜ 内阻 ${v(d.internal_resistance_mohm, 'mΩ')}`);
-  L.push(`【温度保护】充电 ${range(d.operating_temp_charge_c, '℃')} ｜ 放电 ${range(d.operating_temp_discharge_c, '℃')}`);
-  if (d.notes) L.push(`<span style="color:#8a8f98">💡 ${d.notes}</span>`);
-  return L.join('<br/>');
-}
-
+// ── AI 电芯查询 ──
 async function lookupCell() {
-  const btn = $('#btn-cell-lookup');
-  const resultEl = $('#cell-result');
-  const manufacturer = $('#cell-manufacturer').value.trim();
-  const model = $('#cell-model').value.trim();
-  if (!model) {
+  const mfr = $("cell-manufacturer").value.trim();
+  const model = $("cell-model").value.trim();
+  const resultEl = $("cell-result");
+
+  if (!mfr || !model) {
     show(resultEl);
-    resultEl.className = 'param-result result-error';
-    setHTML(resultEl, '请输入电芯型号');
+    resultEl.className = "param-result result-error";
+    resultEl.textContent = "请填写厂商和型号";
     return;
   }
-  btn.disabled = true;
-  btn.textContent = 'AI查询中...';
+
+  resultEl.className = "param-result";
+  resultEl.innerHTML = '<span class="spinner"></span> 查询中...';
   show(resultEl);
-  resultEl.className = 'param-result';
-  setHTML(resultEl, '<span class="spinner"></span> 正在通过AI获取电芯参数...');
+
   try {
-    const resp = await fetch('/api/cell/lookup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ manufacturer, model }),
+    const resp = await fetch("/api/ai/cell-lookup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ manufacturer: mfr, model }),
     });
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error?.message || data.detail || '查询失败');
-    STATE.cellParams = data;
-    setHTML(resultEl, fmtCellParams(data));
+    if (!resp.ok) throw new Error(data.detail || "查询失败");
+
+    resultEl.innerHTML = formatCellParams(data);
     checkGenerateReady();
   } catch (err) {
-    STATE.cellParams = null;
-    resultEl.className = 'param-result result-error';
-    setHTML(resultEl, `❌ ${err.message}`);
+    resultEl.className = "param-result result-error";
+    resultEl.textContent = "查询失败: " + err.message;
   }
-  btn.disabled = false;
-  btn.textContent = 'AI查询参数';
 }
 
-// ── IC resolve (marking → real MPN) ──
-async function resolveIc() {
-  const btn = $('#btn-ic-resolve');
-  const resultEl = $('#ic-result');
-  const model = $('#ic-model').value.trim();
-  if (!model) return;
-  btn.disabled = true;
-  btn.textContent = '解析中...';
+function formatCellParams(data) {
+  const items = [
+    ["标称容量", data.capacity_mAh ? data.capacity_mAh + " mAh" : null],
+    ["标称电压", data.nominal_voltage_v ? data.nominal_voltage_v + " V" : null],
+    ["充电截止", data.charge_cutoff_v ? data.charge_cutoff_v + " V" : null],
+    ["放电截止", data.discharge_cutoff_v ? data.discharge_cutoff_v + " V" : null],
+    ["最大放电", data.max_discharge_a ? data.max_discharge_a + " A" : null],
+    ["内阻", data.internal_resistance_mohm ? data.internal_resistance_mohm + " mΩ" : null],
+    ["化学体系", data.chemistry || null],
+  ].filter(([, v]) => v);
+
+  if (!items.length) return '<span class="ng">未找到匹配参数</span>';
+  return "✓ " + items.map(([k, v]) => `${k}: ${v}`).join(" | ");
+}
+
+// ── IC 解析 ──
+async function resolveIC() {
+  const icModel = $("ic-model").value.trim();
+  const resultEl = $("ic-result");
+
+  if (!icModel) {
+    show(resultEl);
+    resultEl.className = "param-result result-error";
+    resultEl.textContent = "请输入IC型号";
+    return;
+  }
+
+  resultEl.className = "param-result";
+  resultEl.innerHTML = '<span class="spinner"></span> 解析中...';
   show(resultEl);
-  resultEl.className = 'param-result';
-  setHTML(resultEl, '正在解析IC型号...');
+
   try {
-    const resp = await fetch(`/api/ic/resolve?model=${encodeURIComponent(model)}`);
+    const resp = await fetch("/api/ai/resolve-ic", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ic_model: icModel, cell_count: parseInt($("cell-count").value) }),
+    });
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data.error?.message || data.detail || '解析失败');
-    STATE.icDevice = data;
-    const markingNote = data.resolved_from === 'marking'
-      ? `<br/>🔍 丝印 <b>${model}</b> → 实际型号 <b>${data.full_mpn}</b>`
-      : '';
-    setHTML(resultEl, `
-      <b>✅ ${data.full_mpn}</b> (${data.manufacturer})<br/>
-      封装: ${data.package} ｜ 支持串数: ${data.supported_series.join('/')}S ｜ 端口: ${data.port_topologies.join('/')}${markingNote}
-    `);
+    if (!resp.ok) throw new Error(data.detail || "解析失败");
+
+    resultEl.innerHTML = formatICResult(data);
     checkGenerateReady();
   } catch (err) {
-    STATE.icDevice = null;
-    resultEl.className = 'param-result result-error';
-    setHTML(resultEl, `❌ ${err.message}`);
+    resultEl.className = "param-result result-error";
+    resultEl.textContent = "解析失败: " + err.message;
   }
-  btn.disabled = false;
-  btn.textContent = '解析IC';
 }
 
-// ── Port topology inference from detected pads ──
-function inferPortTopology() {
-  const pads = STATE.pads.front?.candidates || STATE.pads.front?.pads || [];
-  const labels = pads.map(p => (p.label || '').toUpperCase());
-  const hasC = labels.includes('C+') && labels.includes('C-');
-  const hasP = labels.includes('P+') && labels.includes('P-');
-  let inferred = null;
-  if (hasP && hasC) inferred = 'separate';
-  else if (hasP && !hasC) inferred = 'common';
-  if (inferred) {
-    STATE.inferredTopology = inferred;
-    const el = $('#topology-inferred');
-    show(el);
-    setHTML(el, `🔍 根据焊盘丝印推断: <b>${inferred === 'common' ? '共口' : '分口'}</b>（${hasC ? '检测到C+/C-和P+/P-' : '仅检测到P+/P-'}），可手动覆盖`);
-  }
-  return inferred;
-}
-
-function getSelectedTopology() {
-  const sel = document.querySelector('input[name="port-topology"]:checked')?.value || 'auto';
-  if (sel !== 'auto') return sel;
-  return STATE.inferredTopology || 'common';
+function formatICResult(data) {
+  const parts = [];
+  if (data.resolved_model) parts.push(`型号: ${data.resolved_model}`);
+  if (data.manufacturer) parts.push(`厂商: ${data.manufacturer}`);
+  if (data.ovp) parts.push(`过压保护: ${data.ovp}V`);
+  if (data.uvp) parts.push(`欠压保护: ${data.uvp}V`);
+  if (data.mos_config) parts.push(`MOS: ${data.mos_config}`);
+  return parts.length ? "✓ " + parts.join(" | ") : '<span class="ng">未能解析</span>';
 }
 
 function checkGenerateReady() {
-  const recognitionOk = !!(STATE.cal.front && STATE.extract.front);
-  const cellOk = !!STATE.cellParams;
-  const icOk = !!STATE.icDevice;
-  const ok = recognitionOk && cellOk && icOk;
-  const btn = $('#btn-generate');
-  btn.disabled = !ok;
-  if (recognitionOk) {
-    show($('#step-export'));
-    inferPortTopology();
-  }
-  if (ok) {
-    setBadge('step3', '可生成', 'ready');
-  } else {
-    const missing = [];
-    if (!recognitionOk) missing.push('PCB识别');
-    if (!cellOk) missing.push('电芯参数');
-    if (!icOk) missing.push('IC解析');
-    setBadge('step3', `缺少: ${missing.join(', ')}`, 'waiting');
-  }
+  // 至少填写了电芯或IC就可以生成（用户也可以跳过）
+  $("btn-generate").disabled = false;
 }
 
-// ── Map detected pad candidates → DesignSpec terminals ──
-const LABEL_ROLES = {
-  'B+':  { roles: ['battery'], polarity: 'positive' },
-  'B-':  { roles: ['battery'], polarity: 'negative' },
-  'P+':  { roles: ['charge', 'discharge'], polarity: 'positive' },
-  'P-':  { roles: ['charge', 'discharge'], polarity: 'negative' },
-  'C+':  { roles: ['charge'], polarity: 'positive' },
-  'C-':  { roles: ['charge'], polarity: 'negative' },
-  'NTC': { roles: ['temperature'], polarity: null },
-  'TH':  { roles: ['temperature'], polarity: null },
-  'N':   { roles: ['temperature'], polarity: null },
-  'ID':  { roles: ['identification'], polarity: null },
-};
-
-function buildTerminals() {
-  // 合并正反面焊盘，side 直接使用检测结果来源面。
-  const terminals = [];
-  let idx = 0;
-  for (const side of ['front', 'back']) {
-    const padData = STATE.pads[side];
-    const pads = padData?.candidates || [];
-    // detect-terminals 返回 PCB 相对坐标（origin=焊盘裁剪框左上角），而轮廓是
-    // 全幅框架坐标；加上裁剪偏移 crop_offset_mm 统一坐标系，否则端子会落在
-    // 轮廓外导致 point_in_polygon 校验失败。
-    const off = padData?.coordinate_system?.crop_offset_mm || { x: 0, y: 0 };
-    for (const pad of pads) {
-      const label = (pad.label || '').toUpperCase().trim();
-      const mapping = LABEL_ROLES[label];
-      if (!mapping) continue;
-      const region = pad.visible_region || (pad.matched_regions || [])[0] || {};
-      const center = region.center || {};
-      const poly = region.polygon || [];
-      if (!center.x_mm && center.x_mm !== 0) continue;
-      // Estimate width/height from polygon bbox
-      let w = 2.0, h = 2.0;
-      if (poly.length >= 3) {
-        const xs = poly.map(p => p.x_mm), ys = poly.map(p => p.y_mm);
-        w = Math.max(Math.max(...xs) - Math.min(...xs), 0.5);
-        h = Math.max(Math.max(...ys) - Math.min(...ys), 0.5);
-      }
-      // Build source_region with polygon for accurate pad shape rendering
-      const sourceRegion = {
-        type: 'solder_pad',
-        visual_class: 'pad',
-        shape: 'rect',
-        center: { x_mm: center.x_mm + off.x, y_mm: center.y_mm + off.y },
-        bbox: { x_mm: center.x_mm + off.x - w / 2, y_mm: center.y_mm + off.y - h / 2, width_mm: w, height_mm: h },
-        polygon: poly.map(p => ({ x_mm: p.x_mm + off.x, y_mm: p.y_mm + off.y })),
-        source: 'vlm',
-      };
-      terminals.push({
-        id: `T${++idx}_${label.replace(/[^A-Z0-9]/g, '')}`,
-        position: { x_mm: center.x_mm + off.x, y_mm: center.y_mm + off.y },
-        roles: mapping.roles,
-        polarity: mapping.polarity,
-        side,
-        shape: 'rect',
-        width_mm: Math.min(w, 50),
-        height_mm: Math.min(h, 50),
-        source_region: sourceRegion,
-      });
-    }
-  }
-  return terminals;
-}
-
-function deriveBatteryType() {
-  const cell = STATE.cellParams;
-  if (!cell) return '18650';
-  const chem = (cell.chemistry || '').toLowerCase();
-  if (chem.includes('fepo4') || chem.includes('lfp')) return 'LFP';
-  if (chem.includes('lipo') || chem.includes('polymer') || (cell.form_factor || '').includes('软包')) return 'LiPo';
-  const ff = (cell.form_factor || '').toLowerCase();
-  if (ff.includes('21700')) return '21700';
-  return '18650';
-}
-
-async function generateProject() {
-  const btn = $('#btn-generate');
+// ── 生成 KiCad ──
+async function generateDesign() {
+  const btn = $("btn-generate");
+  const statusEl = $("gen-status");
   btn.disabled = true;
-  btn.textContent = '生成中...';
+  statusEl.innerHTML = '<span class="spinner"></span> 正在生成 KiCad 工程...';
 
-  const fId = STATE.cal.front?.id;
-  const bId = STATE.cal.back?.id;
-  const ic = STATE.icDevice?.full_mpn || $('#ic-model').value || 'DW01';
+  const r = state.recognizeResult;
+  const fd = new FormData();
+  fd.append("front_calibration_id", state.frontCalibrationId);
+  fd.append("back_calibration_id", state.backCalibrationId);
+  fd.append("outline_json", JSON.stringify(r.pcb_outline || []));
+  fd.append("pcb_width_mm", r.pcb_width_mm);
+  fd.append("pcb_height_mm", r.pcb_height_mm);
+  fd.append("frame_w_mm", r.frame_w_mm);
+  fd.append("frame_h_mm", r.frame_h_mm);
 
-  // Build outline from extraction result
-  const outlinePts = STATE.extract.front?.outline || [];
-  // Build terminals from detected pads
-  const terminals = buildTerminals();
-  const topology = getSelectedTopology();
-  const count = parseInt($('#cell-count').value) || 1;
-  const connection = $('#cell-connection').value || 'series';
-  const batteryType = deriveBatteryType();
-  const balance = document.querySelector('input[name="balance"]:checked')?.value === 'yes';
-  const targetCurrent = parseFloat($('#target-current').value) || null;
-  const mosModel = $('#mos-model').value.trim() || null;
+  // 设计参数
+  const cellMfr = $("cell-manufacturer").value.trim();
+  const cellModel = $("cell-model").value.trim();
+  const icModel = $("ic-model").value.trim();
+  const cellCount = $("cell-count").value;
+  const cellConn = $("cell-connection").value;
+  const mosModel = $("mos-model").value.trim();
+  const targetCurrent = $("target-current").value;
+  const portTopology = document.querySelector('input[name="port-topology"]:checked').value;
+  const balance = document.querySelector('input[name="balance"]:checked').value;
 
-  // ── 合并正反面元器件识别结果 ──
-  const detectedComponents = [];
-  for (const side of ['front', 'back']) {
-    const cr = STATE.components[side];
-    if (cr && Array.isArray(cr.components)) {
-      for (const c of cr.components) {
-        detectedComponents.push({
-          type: c.type || 'other',
-          silkscreen: c.silkscreen || '',
-          package: c.package || '',
-          confidence: c.confidence ?? 0.5,
-        });
-      }
-    }
-  }
-  // 从识别结果推断 mos_count：统计 type=mosfet 的个数，至少为 1，否则默认 2
-  const mosDetected = detectedComponents.filter(c => c.type === 'mosfet').length;
-  const mosCount = mosDetected >= 1 ? mosDetected : 2;
+  fd.append("cell_manufacturer", cellMfr);
+  fd.append("cell_model", cellModel);
+  fd.append("ic_model", icModel);
+  fd.append("cell_count", cellCount);
+  fd.append("cell_connection", cellConn);
+  fd.append("mos_model", mosModel);
+  fd.append("target_current", targetCurrent);
+  fd.append("port_topology", portTopology);
+  fd.append("balance", balance);
+
+  // 元器件 & 焊盘
+  fd.append("components_front_json", JSON.stringify(state.componentsFront?.components || []));
+  fd.append("components_back_json", JSON.stringify(state.componentsBack?.components || []));
+  fd.append("terminals_front_json", JSON.stringify(state.padsFront?.terminals || []));
+  fd.append("terminals_back_json", JSON.stringify(state.padsBack?.terminals || []));
 
   try {
-    const spec = {
-      name: `抄板_${ic}_${count}${connection === 'series' ? 'S' : 'P'}_${new Date().toISOString().slice(0, 10)}`,
-      protection_ic: ic,
-      battery: { count, connection, battery_type: batteryType },
-      mos_count: mosCount,
-      mos_mpn: mosModel,
-      outline: { points: outlinePts, source: 'photo', confirmed: true },
-      terminals,
-      photo_capture: {
-        front_calibration_id: fId || null,
-        back_calibration_id: bId || null,
-      },
-      detected_components: detectedComponents,
-    };
+    const resp = await fetch("/api/generate", { method: "POST", body: fd });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "生成失败");
 
-    const resp = await fetch('/api/projects', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(spec),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-      throw new Error(err.detail || err.error?.message || 'Generation failed');
-    }
-    const proj = await resp.json();
-    const projId = proj.id || proj.project_id;
-
-    let statusHtml = `<span class="ok">项目已创建: ${projId}</span>`;
-    statusHtml += ` ｜ 端口拓扑: <b>${proj.port_topology === 'common' ? '共口' : proj.port_topology === 'separate' ? '分口' : proj.port_topology}</b>`;
-    if (topology && proj.port_topology && topology !== 'auto' && proj.port_topology !== topology) {
-      statusHtml += ` <span class="ng">（与选择不一致，请检查焊盘识别）</span>`;
-    }
-    if (proj.directory) {
-      statusHtml += `<br/>项目目录: <code style="font-size:.8rem">${proj.directory}</code>`;
-    }
-    setHTML($('#gen-status'), statusHtml);
-    show($('#gen-actions'));
-    
-    if (projId) {
-      // 生成制造文件；器件为候选模板时先自动审批样板试产，再重试。
-      let mResp = await fetch(`/api/projects/${projId}/manufacturing`, { method: 'POST' });
-      if (!mResp.ok) {
-        const mErr = await mResp.json().catch(() => ({}));
-        if ((mErr.error?.code || '') === 'CANDIDATE_APPROVAL_REQUIRED') {
-          await fetch(`/api/projects/${projId}/approve-candidate`, { method: 'POST' });
-          mResp = await fetch(`/api/projects/${projId}/manufacturing`, { method: 'POST' });
-        }
-      }
-      if (mResp.ok) {
-        const mData = await mResp.json();
-        const files = mData.manifest?.files || [];
-        let dlHtml = '<h4 style="margin:0 0 6px 0">生成文件清单（共 ' + files.length + ' 个）</h4>';
-        dlHtml += files.map(f =>
-          `<a class="btn btn-outline" style="margin:3px" href="/api/projects/${projId}/artifacts/output/${f.path}" download>${f.path}</a>`
-        ).join('');
-        if (mData.package) {
-          dlHtml += `<div style="margin-top:8px"><a class="btn btn-primary" href="/api/projects/${projId}/artifacts/${mData.package}" download>⬇ 下载完整包 (ZIP)</a></div>`;
-        }
-        setHTML($('#gen-downloads'), dlHtml);
-      } else {
-        const mErr = await mResp.json().catch(() => ({}));
-        setHTML($('#gen-downloads'),
-          `<span class="ng">制造文件未生成：${mErr.error?.message || mResp.statusText}</span>`);
-      }
-    }
-
-    btn.textContent = '生成完成';
-    btn.classList.add('btn-done');
-    setBadge('step3', '已完成', 'ready');
+    statusEl.innerHTML = "✓ 生成成功！";
+    renderDownloads(data);
+    setBadge("badge-step4", "已完成", true);
   } catch (err) {
-    setHTML($('#gen-status'), `<span class="ng">${err.message}</span>`);
-    btn.textContent = '重试生成';
+    statusEl.innerHTML = `<span class="ng">✗ ${err.message}</span>`;
     btn.disabled = false;
   }
 }
 
-// ── Image Lightbox (click to zoom) ──
-function initLightbox() {
-  // Create overlay element
-  const overlay = document.createElement('div');
-  overlay.id = 'lightbox-overlay';
-  overlay.innerHTML = '<img src="" alt="放大预览" />';
-  document.body.appendChild(overlay);
-
-  // Click on any .img-grid img → open lightbox
-  document.addEventListener('click', e => {
-    const img = e.target.closest('.img-grid img');
-    if (img) {
-      overlay.querySelector('img').src = img.src;
-      overlay.classList.add('active');
-      return;
-    }
-    // Click on .cal-canvas-wrap canvas → open lightbox (convert canvas to image)
-    const canvas = e.target.closest('.cal-canvas-wrap canvas');
-    if (canvas && canvas.width > 0) {
-      overlay.querySelector('img').src = canvas.toDataURL('image/png');
-      overlay.classList.add('active');
-    }
-  });
-
-  // Click overlay → close
-  overlay.addEventListener('click', () => {
-    overlay.classList.remove('active');
-  });
-
-  // ESC → close
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') overlay.classList.remove('active');
-  });
+function renderDownloads(data) {
+  const el = $("gen-downloads");
+  const files = data.files || [];
+  if (!files.length) {
+    el.innerHTML = '<p style="color:#94a3b8;">无文件生成</p>';
+  } else {
+    let html = "";
+    files.forEach((f) => {
+      html += `<a href="${f.url}" class="btn btn-secondary btn-sm" download>${f.name}</a> `;
+    });
+    el.innerHTML = html;
+  }
+  show($("gen-actions"));
 }
 
-// ── Initialize ──
-document.addEventListener('DOMContentLoaded', () => {
-  init();
-  initLightbox();
+/* ═══════════════════════════════════════════════════════════════
+ * Lightbox (图片点击放大)
+ * ═══════════════════════════════════════════════════════════════ */
+
+function openLightbox(src) {
+  const overlay = $("lightbox-overlay");
+  const img = $("lightbox-img");
+  if (!overlay || !img) return;
+  img.src = src;
+  overlay.classList.add("active");
+}
+
+function closeLightbox() {
+  const overlay = $("lightbox-overlay");
+  if (!overlay) return;
+  overlay.classList.remove("active");
+  $("lightbox-img").src = "";
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeLightbox();
+});
+
+/* ═══════════════════════════════════════════════════════════════
+ * 初始化
+ * ═══════════════════════════════════════════════════════════════ */
+
+document.addEventListener("DOMContentLoaded", () => {
+  // 上传区域
+  setupDropZone("zone-front", "drop-front", "file-front", "status-front", "frontFile");
+  setupDropZone("zone-back", "drop-back", "file-back", "status-back", "backFile");
+
+  // 按钮
+  $("btn-recognize").addEventListener("click", recognizePCB);
+  $("btn-detect-pads").addEventListener("click", detectPads);
+  $("btn-detect-components").addEventListener("click", detectComponents);
+  $("btn-cell-lookup").addEventListener("click", lookupCell);
+  $("btn-ic-resolve").addEventListener("click", resolveIC);
+  $("btn-generate").addEventListener("click", generateDesign);
+
+  // 尺寸变化时更新状态
+  $("frame-w").addEventListener("input", checkRecognizeReady);
+  $("frame-h").addEventListener("input", checkRecognizeReady);
 });

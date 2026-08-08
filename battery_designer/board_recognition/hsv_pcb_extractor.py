@@ -155,18 +155,29 @@ class HSVPCBExtractor:
         """
         h, w = img_bgr.shape[:2]
 
-        # HSV + Lab 双重过滤
-        # HSV: 色相35-90(绿), S>=25, V>=15
-        # Lab a通道: a<128表示绿色倾向, 与亮度无关, 暗绿也能检测
-        #   (OpenCV Lab中a=128为中性, 绿色a<128, 红/暖色a>128)
-        #   比BGR的G-B差值更鲁棒: 暗绿色G-B可能<15但Lab a仍<128
+        # HSV + Lab 双重过滤（收紧阈值，排除白色阴影）
+        #
+        # 根因修复：旧阈值 S>=25 / V>=15 / a<128 过于宽容，
+        # 低饱和度白色像素因HSV色相噪声随机落入绿色区间，被误识别。
+        #
+        # 修复策略：
+        #   1. S>=45：排除近白色低饱和度像素（绿色阻焊层S通常>=50）
+        #   2. V上界<=245：排除过曝白色区域
+        #   3. 高亮低饱和联合排除：V>200且S<60 → 一定是白色，不是绿色
+        #   4. Lab a<125：比128更严格，排除中性色噪声波动
+        #   5. Lab b通道辅助：绿色区域 b 通常<145，排除偏黄白
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
         h_mask = (hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 90)
-        s_mask = hsv[:, :, 1] >= 25
-        v_mask = hsv[:, :, 2] >= 15
+        s_mask = hsv[:, :, 1] >= 45
+        v_mask = (hsv[:, :, 2] >= 15) & (hsv[:, :, 2] <= 245)
+        # 排除高亮低饱和（白色/近白色）像素
+        not_white = ~((hsv[:, :, 2] >= 200) & (hsv[:, :, 1] < 60))
         lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-        lab_green = lab[:, :, 1] < 128
-        green_mask = (h_mask & s_mask & v_mask & lab_green).astype(np.uint8) * 255
+        lab_green = lab[:, :, 1] < 125
+        lab_not_yellow = lab[:, :, 2] < 145
+        green_mask = (
+            h_mask & s_mask & v_mask & not_white & lab_green & lab_not_yellow
+        ).astype(np.uint8) * 255
 
         green_pct = cv2.countNonZero(green_mask) / (h * w) * 100
 
@@ -193,8 +204,9 @@ class HSVPCBExtractor:
         )
 
         # 形态学闭运算填补缝隙（绿色环中可能有细小断裂）
+        # iterations=2 而非3：减少白色噪声点桥连扩散
         k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        green_closed = cv2.morphologyEx(green_main, cv2.MORPH_CLOSE, k_close, iterations=3)
+        green_closed = cv2.morphologyEx(green_main, cv2.MORPH_CLOSE, k_close, iterations=2)
 
         # 找外轮廓
         contours, _ = cv2.findContours(
