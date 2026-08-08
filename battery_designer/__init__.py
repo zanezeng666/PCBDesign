@@ -2,29 +2,35 @@
 
 __version__ = "0.1.0"
 
-# 导出日志功能
-from .logger import get_logger, configure_logging, set_log_level
+# Core infrastructure
+from .core.logger import get_logger, configure_logging, set_log_level
 
-# 导出识别流程模块
-from .pcb_contour import detect_pcb_outline
-from .pcb_recognition import PCBRecognitionPipeline
-from .pad_detection import detect_pads, verify_pad_alignment
-from .component_detection import detect_components_on_pcb, identify_ic_model
+# Step 1 — PCB board recognition
+from .board_recognition import PCBRecognitionPipeline
+
+# Step 2 — Pad / terminal detection
+from .pad_detection import detect_with_vlm, detect_all_vlm, verify_pad_crop
+
+# Step 3 — Component detection
+from .component_detection import detect_components
+
+# Step 4 — Design generation
+from .design_generation import DesignGenerator, KicadPipeline
 
 __all__ = [
-    # 日志系统
     "get_logger",
     "configure_logging",
     "set_log_level",
-    # PCB轮廓识别 (已成熟，保持稳定)
-    "detect_pcb_outline",
+    # Step 1
     "PCBRecognitionPipeline",
-    # 焊盘识别 (重点优化模块)
-    "detect_pads",
-    "verify_pad_alignment",
-    # 元器件识别
-    "detect_components_on_pcb",
-    "identify_ic_model",
-    # 版本
+    # Step 2
+    "detect_with_vlm",
+    "detect_all_vlm",
+    "verify_pad_crop",
+    # Step 3
+    "detect_components",
+    # Step 4
+    "DesignGenerator",
+    "KicadPipeline",
     "__version__",
 ]
